@@ -17,6 +17,7 @@ import { RateLimiter } from './core/rate-limiter.js';
 import { VrchatApiClient } from './vrchat-api.js';
 import { WsManager } from './core/ws-manager.js';
 import { EventPipeline } from './core/event-pipeline.js';
+import { backupDatabase } from './core/backup.js';
 import { FriendStateManager } from './core/friend-state.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -24,6 +25,8 @@ const PORT = 8799;
 const COOKIE_FILE = path.join(__dirname, 'auth_cookie.txt');
 const CRED_FILE = path.join(__dirname, 'credentials.json');
 const DB_PATH = path.join(__dirname, 'vrc-monitor.sqlite3');
+const BACKUP_DIR = path.join(__dirname, 'backups');
+const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 每 24h 自动备份
 
 // ── 全局状态 ──
 let storage;
@@ -607,6 +610,14 @@ const CUSTOM_TOOLS = [
         n: { type: 'number', description: 'Max API results (default 10, max 30)' },
       },
       required: ['query'],
+    },
+  },
+  {
+    name: 'backup_database',
+    description: '[system] Immediately back up the local database (WAL online backup, no restart needed). Keeps the 2 most recent backups in backups/.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
     },
   },
   {
@@ -1347,6 +1358,16 @@ async function handleSearchWorlds({ query, n }) {
   return { query, apiCount: apiWorlds.length, localCount: local.length, count: merged.length, worlds: merged };
 }
 
+async function handleBackupDatabase() {
+  try {
+    const result = await backupDatabase(storage.db, BACKUP_DIR);
+    log(`💾 手动备份完成: ${result.path} (${result.size} bytes)`);
+    return result;
+  } catch (e) {
+    return { ok: false, error: String(e.message || e) };
+  }
+}
+
 async function handleJoinGroup({ groupId }) {
   if (!groupId) throw new Error('groupId is required');
   const r = await api._request('POST', `/groups/${groupId}/join`);
@@ -1870,6 +1891,9 @@ async function handleRpc(rpc, session, res) {
           case 'search_worlds':
             result = await rateLimiter.execute(() => handleSearchWorlds(args));
             break;
+          case 'backup_database':
+            result = await handleBackupDatabase();
+            break;
           case 'join_group':
             result = await rateLimiter.execute(() => handleJoinGroup(args));
             break;
@@ -2104,6 +2128,18 @@ async function main() {
     },
   });
   wsManager.start();
+
+  // 7b. 数据库自动备份：启动时立即做一次 + 每 24h 一次（保留最近 2 份）
+  const runAutoBackup = async () => {
+    try {
+      const r = await backupDatabase(storage.db, BACKUP_DIR);
+      log(`💾 自动备份完成: ${r.path} (${r.size} bytes)`);
+    } catch (e) {
+      log(`⚠️ 自动备份失败: ${e.message}`);
+    }
+  };
+  runAutoBackup();
+  setInterval(runAutoBackup, BACKUP_INTERVAL_MS);
 
   // 7. 启动 MCP 服务
   const server = createServer();

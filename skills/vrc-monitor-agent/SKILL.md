@@ -24,6 +24,7 @@ metadata:
 | `search_users` | 按名字搜索用户 |
 | `search_groups` | 按名字搜索群组（API 用 query 参数，不是 search） |
 | `search_worlds` | 按名字搜索世界（英文/日文走 API；中文自动加本地缓存兜底） |
+| `backup_database` | 立即备份数据库（WAL 在线备份，保留最近 2 份到 backups/）；服务启动 + 每 24h 自动备份 |
 | `get_friend_events` | 某好友的事件历史（本地库） |
 | `get_recent_events` | 最新事件流 |
 | `get_companions` | **同屏交叉查询**（指定时间窗口内同实例的好友；可查自己或任意好友） |
