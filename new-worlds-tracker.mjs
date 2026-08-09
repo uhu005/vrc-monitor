@@ -208,7 +208,7 @@ if (!DRY) {
   //     注意：候选现在只含 system_approved（新发布-推荐），所以：
   //       - 在候选里但 isJunkWorld 判垃圾的 -> 删
   //       - 不在候选里（被撤下推荐/已下架/旧 Labs 图）-> 删
-  const trackedIds = db.prepare('SELECT world_id FROM new_worlds').all().map(r => r.world_id);
+  const trackedIds = db.prepare("SELECT world_id FROM new_worlds WHERE source = 'new'").all().map(r => r.world_id);
   const trackedSet = new Set(trackedIds);
   const candidatesById = new Map(candidates.map(w => [w.id, w]));
   let purged = 0;

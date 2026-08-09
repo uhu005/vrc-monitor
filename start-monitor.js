@@ -1227,7 +1227,7 @@ async function handleScanNewWorlds({ days = 7, dryRun = false }) {
 
   // purge：清理已跟踪但不在推荐候选里（旧 Labs/已下架）或判垃圾的世界
   if (!dryRun) {
-    const trackedRows2 = storage._query('SELECT world_id FROM new_worlds');
+    const trackedRows2 = storage._query("SELECT world_id FROM new_worlds WHERE source = 'new'");
     const candidatesSet = new Set(fresh.map(w => w.id));
     const purgeStmt = storage.db.prepare('DELETE FROM new_worlds WHERE world_id = ?');
     let purged = 0;
