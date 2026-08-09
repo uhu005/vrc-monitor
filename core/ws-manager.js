@@ -12,7 +12,13 @@
 import WebSocket from 'ws';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 
-const PROXY = 'http://127.0.0.1:7892';
+// WS 代理地址：优先 VRC_MONITOR_WS_PROXY，其次标准 HTTPS_PROXY/HTTP_PROXY，最后内置默认（兼容旧部署）
+// 注意：代理可能含凭据，日志中不要打印完整 URL
+const DEFAULT_WS_PROXY = 'http://127.0.0.1:7892';
+const WS_PROXY = process.env.VRC_MONITOR_WS_PROXY
+  || process.env.HTTPS_PROXY || process.env.http_proxy
+  || process.env.HTTP_PROXY || process.env.http_proxy
+  || DEFAULT_WS_PROXY;
 
 // 重连延迟（秒），指数退避
 const RECONNECT_DELAYS = [1, 2, 4, 8, 16, 30, 60];
@@ -156,7 +162,7 @@ export class WsManager {
         // 直连失败，通过代理重试
         console.log('[WS] 直连超时，尝试代理...');
         if (this.ws) { try { this.ws.close(); } catch {} }
-        options.agent = new HttpsProxyAgent(PROXY);
+        options.agent = new HttpsProxyAgent(WS_PROXY);
         options.handshakeTimeout = 15000;
         this.ws = new WebSocket(wsUrl, options);
       }

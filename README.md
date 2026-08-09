@@ -5,6 +5,25 @@
 
 监控 VRChat 好友的上下线、世界切换、Avatar/状态变化，通过 WebSocket 实时采集入库，经 MCP 协议暴露给 AI Agent（Hermes）查询，并附带 Hermes 插件实现进程托管。
 
+> 🤖 **AI Agent 优先项目**：程序只面向 AI Agent 使用与开发，人类不直接编码。详见下方「[项目定位](#-ai-agent-优先项目定位)」与 [DEVELOPMENT.md](./DEVELOPMENT.md)。
+
+---
+
+## 🤖 AI Agent 优先（项目定位）
+
+本项目的定位是 **AI Agent 优先（AI-first）**——程序只面向 AI Agent 使用与扩展，默认不考虑人类直接使用或编码：
+
+- **只面向 AI Agent 使用**：程序通过 MCP 接口 + 文档引导面向 Agent，配置、部署、查询全部由 AI Agent 完成，不设计人类直接操作的界面。
+- **开发由 AI 完成，人类只提需求**：添加 / 修改功能不要求人类直接编码。标准流程：
+  1. 使用者（人类）向 AI Agent 提出功能需求
+  2. Agent 阅读开发规范与相关代码
+  3. Agent 实现功能并自测验证
+  4. 使用者验收
+  5. （可选）Agent 提交 PR 惠及上游
+- **fork 自由**：MIT 协议，任何人可以 fork，让 AI Agent 按自己的需求扩展，无需事先征得同意。
+- **提交 PR 有要求**：单一职责、不破坏现有行为、DB 变更带迁移、文档同步、不提交密钥等 11 条硬性要求，详见 [DEVELOPMENT.md](./DEVELOPMENT.md)。
+- 面向 AI Agent 的部署配置引导见 [AGENTS.md](./AGENTS.md)。
+
 ---
 
 ## ✨ 功能
@@ -15,7 +34,7 @@
 - ✅ **历史数据迁移** — 从 VRCX-0 导入 10 个月的 33 万条活动记录
 - ✅ **世界名缓存** — 自动解析 `wrld_xxx` 为可读世界名（懒刷新：缓存命中直接用，`forceRefresh: true` 手动刷新防改名陈旧）
 - ✅ **关注名单** — 标记核心好友，活动时特别通知
-- ✅ **MCP 工具接口** — 44 个工具供 Hermes / 任意 MCP 客户端调用
+- ✅ **MCP 工具接口** — 46 个工具供 Hermes / 任意 MCP 客户端调用
 - ✅ **数据库自动备份** — 启动 + 每 24h 自动备份（WAL 在线备份，无需停机），保留最近 2 份到 `backups/`；`backup_database` 工具可随时手动触发
 - ✅ **Hermes 插件托管** — 会话自动拉起、崩溃自愈、`vrc_status` 等管理工具
 
@@ -27,15 +46,19 @@
 
 ## 🚀 快速开始
 
+> 本节全部步骤由 **AI Agent 执行**。作为使用者，你只需要做两件事：**① 提供 VRChat 账号与邮箱 IMAP 授权码（第 1 步）**，**② 在 Agent 完成后验收结果（第 3 步）**。其余交给 Agent。
+
 ### 0. 准备
 
-- Node.js ≥ 18
-- 一个 VRChat 账号（需开启邮箱 2FA）
-- 一个支持 IMAP 的邮箱（用于接收 OTP 验证码，需生成 IMAP 授权码/专用密码）
+Agent 先检查环境（其余前置条件由使用者确认）：
+
+- Node.js ≥ 18（`node --version` 验证）
+- 一个 VRChat 账号（需开启邮箱 2FA）—— 使用者提供
+- 一个支持 IMAP 的邮箱（用于接收 OTP 验证码，需生成 IMAP 授权码/专用密码）—— 使用者提供
 
 ### 1. 配置凭据
 
-复制模板并填入真实凭据（**该文件不会入库**）：
+由 Agent 复制模板并写入真实凭据（**该文件不会入库**）：
 
 ```bash
 cp credentials.example.json credentials.json
@@ -49,24 +72,29 @@ cp credentials.example.json credentials.json
 }
 ```
 
-> IMAP 授权码获取：登录邮箱网页版 → 设置 → 开启 IMAP/SMTP → 生成授权码/专用密码。以 QQ 邮箱为例：设置 → 账号 → 开启 IMAP/SMTP → 生成授权码。
+> 🔑 **需要使用者操作（Agent 无法代办）**：IMAP 授权码必须由使用者登录邮箱网页版自行生成——设置 → 开启 IMAP/SMTP → 生成授权码/专用密码（QQ 邮箱：设置 → 账号 → 开启 IMAP/SMTP → 生成授权码）。支持任意 IMAP 邮箱（QQ/163/Gmail/Outlook 等），服务按邮箱域名自动选择服务器；可加 `imap_host` 字段手动指定。
+> Agent 在配置完成后应确认 `credentials.json` 已落盘且格式正确，并将该文件保持在 .gitignore 内（**禁止提交**）。
 
 ### 2. 启动服务
+
+由 Agent 执行并跟踪启动日志：
 
 ```bash
 cd <本仓库目录>
 node start-monitor.js
 ```
 
-首次启动会提示邮箱验证码，系统自动从 QQ 邮箱抓取并完成登录，随后保持运行。
+首次启动服务会自动从配置的邮箱（IMAP）抓取 OTP 验证码完成登录，随后保持运行。Agent 应确认日志无认证/限流错误，再进入第 3 步验收。
 
-### 3. 健康检查
+### 3. 健康检查（验收标准）
+
+Agent 执行验收：
 
 ```bash
 curl http://127.0.0.1:8799/health
 ```
 
-正常响应：`Auth: true`、`WS: connected`、在线好友数。
+**验收通过标准**：`Auth: true`、`WS: connected`、返回在线好友数。达标后向使用者报告「部署完成」，未达标则排查后重试。
 
 ## 📦 Agent Skill 安装（开箱即用）
 
@@ -129,6 +157,7 @@ cp desktop/plugin.js "$HERMES_HOME/desktop-plugins/vrc-monitor/"
 |------|--------|------|
 | `VRC_MONITOR_DIR` | 自动探测（agent 在仓库目录内运行） | 服务目录（含 start-monitor.js），未探测到时需显式设置 |
 | `VRC_MONITOR_NODE` | PATH 中的 node | Node 可执行文件路径 |
+| `VRC_MONITOR_WS_PROXY` | `http://127.0.0.1:7892` | WebSocket 直连超时后的代理回退地址（可覆盖默认值） |
 
 ### 进程托管原理
 
@@ -137,7 +166,7 @@ cp desktop/plugin.js "$HERMES_HOME/desktop-plugins/vrc-monitor/"
 - **双路检测**：状态文件 pid 存活 **或** 端口探测成功，均可识别为运行中（防状态文件丢失误判）
 - **日志**：`$HERMES_HOME/workspace/vrc-monitor/monitor.log`
 
-## 🔌 MCP 工具（38 个）
+## 🔌 MCP 工具（46 个）
 
 服务监听 `http://127.0.0.1:8799/mcp`，通过 HTTP SSE 提供 MCP 协议。Hermes 用户可在 `$HERMES_HOME/config.yaml`（Windows 为 `%LOCALAPPDATA%\hermes\config.yaml`）配置：
 
@@ -183,6 +212,13 @@ mcp_servers:
 | `get_world_history` | 世界信息变更历史（name/description/author/image_url/release_status/capacity/tags 字段级变化记录） |
 | `get_weekly_report` | 一周游戏周报（活跃天数/时长/世界 Top/同屏伙伴带昵称/自己的上线规律/群组活动/圈内活动日历；`days` 默认 7） |
 
+### 新世界追踪
+
+| 工具 | 说明 |
+|------|------|
+| `scan_new_worlds` | 扫描最近 N 天创建的新世界（默认 7，1-30），过滤测试/垃圾图后写入 `new_worlds` 表，按热度返回推荐 TOP10；`dryRun: true` 只看不写。认证复用主服务登录态 |
+| `get_new_worlds` | 只读查询已跟踪的新世界：`onlyUnvisited` 只看未逛过、`sortBy`（favorites/occupants/popularity/created_at）、`limit`（默认 10，最大 50） |
+
 ### 关注名单
 
 | 工具 | 说明 |
@@ -200,6 +236,10 @@ mcp_servers:
 | `upload_gallery_image` | 上传图片到 VRC+ **图库**（Gallery，需 VRC+） | `imagePath` | — |
 | `download_print` | 从相册下载照片到本地，返回路径（可 `MEDIA:` 发送） | `printId` | `outputDir` |
 | `download_gallery_image` | 从图库下载图片到本地，返回路径 | `fileId` | `outputDir` |
+| `get_prints` | 列出 VRC+ 相册（Prints）照片列表 | — | `limit`（默认 100）、`userId` |
+| `remove_print` | 删除相册照片（不可逆，需 `confirm: true`） | `printId` | `confirm` |
+| `get_gallery_images` | 列出 VRC+ 图库（Gallery）图片列表 | — | `limit`（默认 100） |
+| `remove_gallery_image` | 删除图库图片（不可逆，需 `confirm: true`） | `fileId` | `confirm` |
 | `send_invite` | 邀请好友加入**你当前所在房间**（拉人进房） | `userId`、`worldId`、`instanceId` | `message`（附带消息） |
 | `request_invite` | 请求好友**邀请你加入 TA 的房间**（默认消息 "Can I join you?"） | `userId` | `message` |
 | `send_friend_request` | **发送好友请求**（添加好友）：`userId` 直接加，或 `displayName` 精确匹配（不区分大小写）后加 | `userId` 或 `displayName` 至少一个 | — |
@@ -211,6 +251,7 @@ mcp_servers:
 |------|------|
 | `get_server_status` | 服务/认证状态 |
 | `get_database_stats` | 数据库统计 |
+| `backup_database` | 立即备份数据库（WAL 在线备份，无需重启；保留最近 2 份在 `backups/`） |
 
 ### 群组（2026-08-08 新增）
 
@@ -291,19 +332,10 @@ node new-worlds-tracker.mjs 7 --dry
 - 输出 JSON：`{ collected, tracked, visited, unvisited, recommended }`
 - 定时场景：cron 每天执行即可保持跟踪列表新鲜
 
-### `open-world.mjs` — 在运行中的 VRChat 内打开世界（本机辅助）
-
-通过命名管道 `\\.\pipe\VRChatURLLaunchPipe` 向**运行中**的 VRChat 客户端发送 `vrchat://launch` 请求，游戏内弹出确认菜单（不会新开进程）。仅支持 Windows + VRChat 本机运行环境。
-
-```bash
-node open-world.mjs "地图名"      # 按名字（API 搜索，精确优先）
-node open-world.mjs wrld_xxx...   # 按 worldId
-```
-
 ## 🛠 故障排查
 
 **Q: WebSocket 连不上？**
-A: 国内网络可能需代理。服务自动直连 6s 失败后回退到本地代理（默认 `127.0.0.1:7892`），无需人工干预。
+A: 国内网络可能需代理。服务自动直连 6s 失败后回退到本地代理（默认 `127.0.0.1:7892`，可用 `VRC_MONITOR_WS_PROXY` 环境变量覆盖），无需人工干预。
 
 **Q: 登录提示 OTP 但一直失败？**
 A: 检查 `credentials.json` 的 `imap_auth_code` 是否为正确的 IMAP 授权码（非登录密码）。服务会在认证失败后冷却 120s（限流 401 则 5min）自动重试，不会高频刷验证码。

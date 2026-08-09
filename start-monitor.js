@@ -19,6 +19,7 @@ import { WsManager } from './core/ws-manager.js';
 import { EventPipeline } from './core/event-pipeline.js';
 import { backupDatabase } from './core/backup.js';
 import { FriendStateManager } from './core/friend-state.js';
+import { isJunkWorld, worldScore, classifyWorlds, fetchFreshWorlds } from './core/new-worlds.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = 8799;
@@ -453,6 +454,29 @@ const CUSTOM_TOOLS = [
       type: 'object',
       properties: {
         days: { type: 'number', default: 7, description: 'Report window in days (default 7)' },
+      },
+    },
+  },
+  {
+    name: 'scan_new_worlds',
+    description: '[action] Scan VRChat for worlds created in the last N days, filter junk, write to the new_worlds table, and return a recommended list. dryRun=true only reports without writing.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        days: { type: 'number', default: 7, description: 'Lookback window in days (1-30, default 7)' },
+        dryRun: { type: 'boolean', default: false, description: 'Report only, do not write to DB' },
+      },
+    },
+  },
+  {
+    name: 'get_new_worlds',
+    description: '[query] Query tracked new worlds from the new_worlds table (read-only). Filter by visited, sort by heat, limit count.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        onlyUnvisited: { type: 'boolean', default: false, description: 'Only return worlds the user has not visited' },
+        limit: { type: 'number', default: 10, description: 'Max rows (1-50, default 10)' },
+        sortBy: { type: 'string', enum: ['favorites', 'occupants', 'popularity', 'created_at'], default: 'favorites', description: 'Sort field (descending)' },
       },
     },
   },
@@ -1124,6 +1148,158 @@ async function handleGetWeeklyReport({ days = 7 }) {
     groupActivities: groupActivities.map(a => ({ ...a, groupName: groupInfoMap[a.groupId]?.name || a.groupId, memberCount: groupInfoMap[a.groupId]?.memberCount || 0 })),
     friendGroupCalendar,
   };
+}
+
+async function handleScanNewWorlds({ days = 7, dryRun = false }) {
+  if (!days || days < 1 || days > 30) days = 7;
+  const selfUserId = serverState.authUser?.id;
+  if (!selfUserId) throw new Error('Not authenticated');
+
+  const { fresh, candidates } = await fetchFreshWorlds(api, rateLimiter, { days, maxFetch: 500 });
+
+  const visitedRows = storage._query(
+    `SELECT DISTINCT world_id FROM events
+     WHERE world_id IS NOT NULL AND world_id != ''
+       AND (
+         type = 'user-location'
+         OR (type = 'friend-location' AND user_id = @selfUserId)
+       )`,
+    { $selfUserId: selfUserId }
+  );
+  const visited = new Set(visitedRows.map(r => r.world_id));
+
+  const trackedRows = storage._query('SELECT world_id FROM new_worlds');
+  const tracked = new Set(trackedRows.map(r => r.world_id));
+
+  const { unvisited, visitedFresh, toAdd, alreadyTracked } = classifyWorlds(fresh, visited, tracked);
+
+  let written = 0;
+  let updated = 0;
+  const now = new Date().toISOString();
+
+  if (!dryRun) {
+    const upsert = storage.db.prepare(
+      `INSERT INTO new_worlds (world_id, world_name, author_name, created_at, first_seen_at, favorites, occupants, popularity, visited, visited_at, tags, description)
+       VALUES (@world_id, @world_name, @author_name, @created_at, @first_seen_at, @favorites, @occupants, @popularity, @visited, @visited_at, @tags, @description)
+       ON CONFLICT(world_id) DO UPDATE SET
+         world_name = excluded.world_name,
+         favorites = excluded.favorites,
+         occupants = excluded.occupants,
+         popularity = excluded.popularity,
+         visited = excluded.visited,
+         visited_at = excluded.visited_at,
+         tags = excluded.tags,
+         description = excluded.description`
+    );
+    const markVisited = storage.db.prepare(
+      `UPDATE new_worlds SET visited = 1, visited_at = @visited_at
+       WHERE world_id = @world_id AND visited = 0`
+    );
+
+    const tx = storage.db.transaction(() => {
+      for (const w of toAdd) {
+        upsert.run({
+          world_id: w.id,
+          world_name: w.name || '',
+          author_name: w.authorName || '',
+          created_at: w.created_at || null,
+          first_seen_at: now,
+          favorites: w.favorites || 0,
+          occupants: w.occupants || 0,
+          popularity: w.popularity || 0,
+          visited: visited.has(w.id) ? 1 : 0,
+          visited_at: visited.has(w.id) ? now : null,
+          tags: Array.isArray(w.tags) ? JSON.stringify(w.tags) : '',
+          description: w.description || '',
+        });
+        written++;
+      }
+      for (const w of fresh) {
+        if (visited.has(w.id)) {
+          const r = markVisited.run({ world_id: w.id, visited_at: now });
+          if (r.changes > 0) updated++;
+        }
+      }
+    });
+
+    tx();
+  }
+
+  // purge：清理已跟踪但不在推荐候选里（旧 Labs/已下架）或判垃圾的世界
+  if (!dryRun) {
+    const trackedRows2 = storage._query('SELECT world_id FROM new_worlds');
+    const candidatesSet = new Set(fresh.map(w => w.id));
+    const purgeStmt = storage.db.prepare('DELETE FROM new_worlds WHERE world_id = ?');
+    let purged = 0;
+    const purgeTx = storage.db.transaction(ids => {
+      for (const id of ids) { purgeStmt.run(id); purged++; }
+    });
+    const purgeIds = [];
+    const candidatesById = new Map(candidates.map(w => [w.id, w]));
+    for (const row of trackedRows2) {
+      const w = candidatesById.get(row.world_id);
+      if (w && isJunkWorld(w)) purgeIds.push(row.world_id);
+      else if (!w) purgeIds.push(row.world_id);   // 不在推荐候选里 -> 旧 Labs/已下架，清掉
+    }
+    if (purgeIds.length > 0) purgeTx(purgeIds);
+  }
+
+  const recommended = [...unvisited]
+    .sort((a, b) => worldScore(b) - worldScore(a))
+    .slice(0, 10)
+    .map(w => ({
+      name: w.name,
+      id: w.id,
+      created: (w.created_at || '').slice(0, 10),
+      favorites: w.favorites || 0,
+      occupants: w.occupants || 0,
+      popularity: w.popularity || 0,
+      author: w.authorName,
+      tags: (w.tags || []).filter(t => t.startsWith('author_tag_')).map(t => t.replace('author_tag_', '')),
+    }));
+
+  return {
+    days,
+    dryRun,
+    collected: fresh.length,
+    unvisited: unvisited.map(w => w.name),
+    visited: visitedFresh.map(w => w.name),
+    newlyTracked: toAdd.map(w => w.name),
+    alreadyTracked: alreadyTracked.map(w => w.name),
+    recommended,
+  };
+}
+
+function handleGetNewWorlds({ onlyUnvisited = false, limit = 10, sortBy = 'favorites' }) {
+  if (!['favorites', 'occupants', 'popularity', 'created_at'].includes(sortBy)) sortBy = 'favorites';
+  limit = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 50);
+
+  const total = storage._query(
+    `SELECT COUNT(*) AS cnt FROM new_worlds${onlyUnvisited ? ' WHERE visited = 0' : ''}`
+  )[0].cnt;
+
+  const rows = storage._query(
+    `SELECT world_id, world_name, author_name, created_at, first_seen_at, favorites, occupants, popularity, visited, visited_at
+     FROM new_worlds
+     ${onlyUnvisited ? 'WHERE visited = 0' : ''}
+     ORDER BY ${sortBy} DESC
+     LIMIT ${limit}`
+  );
+
+  const worlds = rows.map(r => ({
+    worldId: r.world_id,
+    worldName: r.world_name,
+    authorName: r.author_name,
+    created: r.created_at,
+    firstSeen: r.first_seen_at,
+    favorites: r.favorites,
+    occupants: r.occupants,
+    popularity: r.popularity,
+    visited: r.visited === 1,
+    visitedAt: r.visited_at,
+  }));
+
+  return { total, worlds };
 }
 
 function handleGetWatchlist() {
@@ -1851,6 +2027,14 @@ async function handleRpc(rpc, session, res) {
             break;
           case 'get_weekly_report':
             result = await rateLimiter.execute(() => handleGetWeeklyReport(args));
+            break;
+          case 'scan_new_worlds':
+            // 不包 rateLimiter：handleScanNewWorlds 内部 fetchFreshWorlds 已逐请求限流
+            // （再包一层会嵌套死锁：外层占队列时内层 _processQueue 不执行）
+            result = await handleScanNewWorlds(args);
+            break;
+          case 'get_new_worlds':
+            result = handleGetNewWorlds(args);
             break;
           case 'get_watchlist':
             result = handleGetWatchlist();

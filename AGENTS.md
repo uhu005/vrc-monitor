@@ -2,6 +2,8 @@
 
 基于 Node.js 的 VRChat 好友在线状态监控服务，配合 Hermes 插件和桌面插件使用，支持自动抓取 OTP 验证码登录。
 
+> 🤖 **AI-first 项目**：本程序只面向 AI Agent 使用与扩展，人类不直接编码；加功能 = 人类向 Agent 提需求 → Agent 实现。开发规范见 [DEVELOPMENT.md](./DEVELOPMENT.md)。
+
 **面向 AI Agent 的配置引导**：以下步骤可由 Agent 自动完成。建议 agent 在本仓库目录内运行（服务目录可自动探测，无需设置环境变量）。
 
 ## 配置步骤
@@ -79,7 +81,7 @@ cp desktop/plugin.js "$HERMES_HOME/desktop-plugins/vrc-monitor/"
 
 ### 6. 配置 MCP 接口（可选但推荐）
 
-服务通过 MCP 协议暴露 44 个工具（get_online_friends / get_friend_info / get_friend_events / get_companions / get_online_pattern / get_nicknames / set_nickname / get_world_name / set_world_note / get_world_history / get_weekly_report / get_mutual_friends / search_users / search_groups / search_worlds / backup_database / get_user_groups / get_group_info / get_group_instances / get_group_announcement / join_group / leave_group / peek_group_announcement / send_boop / get_boop_emojis / upload_emoji / upload_print / upload_gallery_image / download_print / download_gallery_image / send_friend_request / remove_friend 等，详见 README），Hermes Agent 可直接调用，无需 curl 手写 JSON-RPC。
+服务通过 MCP 协议暴露 46 个工具（get_online_friends / get_friend_info / get_friend_events / get_companions / get_online_pattern / get_nicknames / set_nickname / get_world_name / set_world_note / get_world_history / get_weekly_report / scan_new_worlds / get_new_worlds / get_mutual_friends / search_users / search_groups / search_worlds / backup_database / get_user_groups / get_group_info / get_group_instances / get_group_announcement / join_group / leave_group / peek_group_announcement / send_boop / get_boop_emojis / upload_emoji / upload_print / upload_gallery_image / download_print / download_gallery_image / send_friend_request / remove_friend 等，详见 README），Hermes Agent 可直接调用，无需 curl 手写 JSON-RPC。
 
 在 Hermes 配置文件（`$HERMES_HOME/config.yaml`，Windows 为 `%LOCALAPPDATA%\hermes\config.yaml`）中添加：
 
@@ -131,7 +133,7 @@ cp -r skills/vrc-monitor-companion-query "$HERMES_HOME/skills/"
 
 ### 代理说明
 
-如需通过代理访问 VRChat API，请在启动前设置 `HTTPS_PROXY` 或 `HTTP_PROXY` 环境变量。WebSocket 连接默认直连，6 秒超时后自动回退到 `127.0.0.1:7892` 代理。
+如需通过代理访问 VRChat API，请在启动前设置 `HTTPS_PROXY` 或 `HTTP_PROXY` 环境变量。WebSocket 连接默认直连，6 秒超时后自动回退到代理（默认 `127.0.0.1:7892`，可用 `VRC_MONITOR_WS_PROXY` 环境变量覆盖）。
 
 ### 服务目录找不到
 
