@@ -14,10 +14,11 @@ echo "════════════════════════�
 echo "  vrc-monitor 上游同步"
 echo "══════════════════════════════════════════"
 
-# 1. 检查工作区是否干净
-if [ -n "$(git status --porcelain)" ]; then
+# 1. 检查工作区是否干净（排除脚本自身——它常以未跟踪状态存在于新 clone 中）
+DIRTY=$(git status --porcelain | grep -v "^?? sync-upstream.sh$" || true)
+if [ -n "$DIRTY" ]; then
     echo "⚠️  工作区有未提交的修改，先处理它们再同步："
-    git status --short
+    echo "$DIRTY"
     echo ""
     echo "  选项："
     echo "    git add -A && git commit -m '你的提交说明'   # 提交你的修改"
