@@ -1,17 +1,21 @@
 #!/usr/bin/env node
 /**
- * VRChat 开地图脚本 (open-world.mjs)
+ * VRChat 开地图脚本 (open-world.mjs) — 本机辅助工具（个人 fork 自用）
  *
- * 功能：创建一个新房间并在 VRChat 客户端内打开指定世界
+ * 功能：创建一个新房间，并通过命名管道 IPC 在运行中的 VRChat 客户端内打开指定世界
+ *       （游戏内弹出确认菜单，不会新开 VRChat 进程）
  * 用法：
  *   node open-world.mjs wrld_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
- *   node open-world.mjs "地图名字"          # 支持按名字搜（本地缓存/线上 API）
+ *   node open-world.mjs "地图名字"          # 支持按名字搜（API 搜索，优先精确匹配）
  *
  * 原理（与 VRCX 的「创建房间并在 VRChat 内打开」一致）：
  *   1. 调 VRChat API 为指定世界创建新实例 -> 拿到 location + shortName
- *   2. 调系统打开 vrchat://launch?id=xxx&shortName=xxx（VRChat 运行中会直接跳转，
- *      未运行则会启动客户端）
- *   3. 若 API 创建失败，回退为直接 launch（默认公开实例）
+ *   2. 通过命名管道 \\.\pipe\VRChatURLLaunchPipe 发送
+ *      vrchat://launch?ref=vrcx.app&id=<完整location>&shortName=<sn>
+ *      （VRChat 运行中收到后游戏内弹确认菜单；VRChat 未运行则管道不存在，脚本退出）
+ *   3. 若 API 创建实例失败，回退为直接 launch（默认公开实例，无 shortName）
+ *
+ * 注意：仅适用于 Windows + VRChat 客户端在本机运行的环境。
  */
 import { VrchatApiClient } from './vrchat-api.js';
 import { readFileSync, existsSync } from 'node:fs';
@@ -22,7 +26,12 @@ import { execSync } from 'node:child_process';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CRED_FILE = path.join(__dirname, 'credentials.json');
 const COOKIE_FILE = path.join(__dirname, 'auth_cookie.txt');
-const VRCX_DB = process.env.VRCX_DB || 'C:/Users/Windows/AppData/Roaming/VRCX/VRCX.sqlite3';
+
+// 平台检测：本工具仅支持 Windows（命名管道机制）
+if (process.platform !== 'win32') {
+  console.error('❌ 本工具仅支持 Windows（依赖 \\\\.\\pipe\\VRChatURLLaunchPipe 命名管道）');
+  process.exit(1);
+}
 
 async function fetchOtp() {
   const creds = JSON.parse(readFileSync(CRED_FILE, 'utf-8'));
@@ -71,12 +80,14 @@ if (!/^wrld_/.test(target)) {
   } catch (e) { console.error(`[search] API 搜索失败: ${e.message}`); }
 
   if (!found) {
-    // 兜底：VRCX 本地缓存
+    // 兜底：vrc-monitor 自己的 events 表（world_name 记录，无第三方依赖）
     try {
       const Database = (await import('better-sqlite3')).default;
-      const db = new Database(VRCX_DB, { readonly: true, timeout: 10000 });
+      const db = new Database(path.join(__dirname, 'vrc-monitor.sqlite3'), { readonly: true, timeout: 10000 });
       const rows = db.prepare(
-        "SELECT world_id, world_name FROM gamelog_location WHERE world_name = ? LIMIT 1"
+        `SELECT world_id, world_name FROM events
+         WHERE world_name IS NOT NULL AND world_name != '' AND world_name = ?
+         LIMIT 1`
       ).all(target);
       if (rows.length) found = { id: rows[0].world_id, name: rows[0].world_name };
       db.close();
