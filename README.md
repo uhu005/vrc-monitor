@@ -15,7 +15,7 @@
 - ✅ **历史数据迁移** — 从 VRCX-0 导入 10 个月的 33 万条活动记录
 - ✅ **世界名缓存** — 自动解析 `wrld_xxx` 为可读世界名（懒刷新：缓存命中直接用，`forceRefresh: true` 手动刷新防改名陈旧）
 - ✅ **关注名单** — 标记核心好友，活动时特别通知
-- ✅ **MCP 工具接口** — 41 个工具供 Hermes / 任意 MCP 客户端调用
+- ✅ **MCP 工具接口** — 43 个工具供 Hermes / 任意 MCP 客户端调用
 - ✅ **Hermes 插件托管** — 会话自动拉起、崩溃自愈、`vrc_status` 等管理工具
 
 ---
@@ -153,6 +153,8 @@ mcp_servers:
 | `get_online_friends` | 当前在线好友列表（含昵称 nickname + 房型解析 locationParsed：worldId/instanceId/type/ownerId/region） |
 | `get_friend_info` | 好友详细信息 |
 | `search_users` | 按名字搜索用户 |
+| `search_groups` | 按名字搜索群组（API 用 query 参数，不是 search） |
+| `search_worlds` | 按名字搜索世界（英文/日文走 API；中文自动加本地缓存兜底） |
 
 ### 事件历史
 
@@ -286,7 +288,7 @@ A: 不需要。服务启动和 WS 重连都会自动走 OTP 取码登录，有�
 A: 系统内置 2.6s 间隔限流器。可在 `core/rate-limiter.js` 中调整 `minInterval`。
 
 **Q: 数据库文件太大？**
-A: 正常。约 28 万行事件 ≈ 200+ MB，sql.js 启动时全量加载到内存。
+A: 正常。约 30 万行事件 ≈ 300+ MB。better-sqlite3（WAL 模式）按需读取，不整库载入内存。
 
 ## ☕ Sponsor
 

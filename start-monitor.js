@@ -586,6 +586,30 @@ const CUSTOM_TOOLS = [
     },
   },
   {
+    name: 'search_groups',
+    description: '[group] Search VRChat groups by name. Returns matching groups (query param; API requires query, NOT search).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Group name keyword (supports Chinese/Japanese/English)' },
+        n: { type: 'number', description: 'Max results (default 30, max 100)' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'search_worlds',
+    description: '[query] Search VRChat worlds by name. English/Japanese search the live API; Chinese keywords fall back to local cache (API CJK search is unreliable).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'World name keyword (Chinese/English/Japanese)' },
+        n: { type: 'number', description: 'Max API results (default 10, max 30)' },
+      },
+      required: ['query'],
+    },
+  },
+  {
     name: 'join_group',
     description: '[group] Join a group. Open groups join instantly; 400 already-member is returned as alreadyMember:true (no error).',
     inputSchema: {
@@ -1271,6 +1295,58 @@ async function handleGetGroupAnnouncement({ groupId }) {
   };
 }
 
+async function handleSearchGroups({ query, n }) {
+  if (!query || typeof query !== 'string') throw new Error('query is required');
+  const limit = Math.min(Math.max(parseInt(n, 10) || 30, 1), 100);
+  const r = await api._request('GET', `/groups?query=${encodeURIComponent(query)}&n=${limit}`);
+  if (r.status !== 200) throw new Error(`API error: ${r.status}`);
+  const groups = (r.data || []).map((g) => {
+    const item = {};
+    if (g.id !== undefined && g.id !== null) item.groupId = g.id;
+    if (g.name !== undefined && g.name !== null) item.name = g.name;
+    if (g.shortCode !== undefined && g.shortCode !== null) item.shortCode = g.shortCode;
+    if (g.memberCount !== undefined && g.memberCount !== null) item.memberCount = g.memberCount;
+    if (g.isVerified !== undefined && g.isVerified !== null) item.isVerified = g.isVerified;
+    if (g.description !== undefined && g.description !== null) item.description = g.description;
+    return item;
+  });
+  return { query, count: groups.length, groups };
+}
+
+async function handleSearchWorlds({ query, n }) {
+  if (!query || typeof query !== 'string') throw new Error('query is required');
+  const limit = Math.min(Math.max(parseInt(n, 10) || 10, 1), 30);
+  const apiWorlds = [];
+  try {
+    const r = await api._request('GET', `/worlds?search=${encodeURIComponent(query)}&n=${limit}`);
+    if (r.status === 200) {
+      for (const w of (r.data || [])) {
+        apiWorlds.push({
+          worldId: w.id,
+          name: w.name,
+          authorName: w.authorName,
+          capacity: w.capacity,
+          imageUrl: w.imageUrl,
+          description: (w.description || '').slice(0, 200),
+        });
+      }
+    }
+  } catch (e) { /* API 失败时仅用本地结果 */ }
+
+  const local = storage.searchWorldsByName(query);
+
+  // 合并：API 结果优先（完整信息），本地补充（可能命中 API 搜不到的）
+  const seen = new Set(apiWorlds.map(w => w.worldId));
+  const merged = [...apiWorlds];
+  for (const lw of local) {
+    if (!seen.has(lw.worldId)) {
+      seen.add(lw.worldId);
+      merged.push({ worldId: lw.worldId, name: lw.name });
+    }
+  }
+  return { query, apiCount: apiWorlds.length, localCount: local.length, count: merged.length, worlds: merged };
+}
+
 async function handleJoinGroup({ groupId }) {
   if (!groupId) throw new Error('groupId is required');
   const r = await api._request('POST', `/groups/${groupId}/join`);
@@ -1787,6 +1863,12 @@ async function handleRpc(rpc, session, res) {
             break;
           case 'get_group_announcement':
             result = await rateLimiter.execute(() => handleGetGroupAnnouncement(args));
+            break;
+          case 'search_groups':
+            result = await rateLimiter.execute(() => handleSearchGroups(args));
+            break;
+          case 'search_worlds':
+            result = await rateLimiter.execute(() => handleSearchWorlds(args));
             break;
           case 'join_group':
             result = await rateLimiter.execute(() => handleJoinGroup(args));

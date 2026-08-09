@@ -22,6 +22,8 @@ metadata:
 | `get_online_friends` | 当前在线好友列表（含昵称 nickname + 房型解析 locationParsed：worldId/instanceId/type/ownerId/region） |
 | `get_friend_info` | 好友详细信息 |
 | `search_users` | 按名字搜索用户 |
+| `search_groups` | 按名字搜索群组（API 用 query 参数，不是 search） |
+| `search_worlds` | 按名字搜索世界（英文/日文走 API；中文自动加本地缓存兜底） |
 | `get_friend_events` | 某好友的事件历史（本地库） |
 | `get_recent_events` | 最新事件流 |
 | `get_companions` | **同屏交叉查询**（指定时间窗口内同实例的好友；可查自己或任意好友） |
@@ -157,9 +159,9 @@ curl -s http://127.0.0.1:8799/mcp -X POST -H "Content-Type: application/json" \
 
 boop 通知落库的顶层事件类型是 `notification-v2`（不是 boop），boop 在 content_json.type 里。`get_recent_events(typeFilter="boop")` 查不到，用 `typeFilter="notification-v2"`。
 
-### 注意：sql.js 内存数据库 — 外部写文件无效/会被覆盖
+### 存储引擎：better-sqlite3（WAL 模式，2026-08-09 起）
 
-服务用 sql.js（WASM 内存数据库）：启动时把 sqlite 文件读进内存，`save()` 才写回。**外部直接改数据库文件 = 服务进程看不到，且服务周期性 save 会把内存状态覆盖回文件、冲掉外部写入**。所有数据写入必须走 MCP 工具（如 `set_nickname`）。只读检查可用 sqlite3 CLI 直连文件，但可能和服务内存不一致。
+服务用 better-sqlite3（原生绑定，WAL 日志模式）：**每次写操作即时落盘，崩溃安全，支持服务运行中的并发读**。外部工具（sqlite3 CLI / Python）可直接读主库文件，看到的是最新数据（曾因 sql.js 内存库报 `database disk image is malformed`，换引擎后解决）。数据写入仍建议走 MCP 工具（SQL 封装层统一在 `core/storage.js`）。数据库文件是标准 SQLite format 3，可直接被任意 SQLite 工具打开。⚠️ WAL 模式下运行中会有 `-wal`/`-shm` 伴生文件（已 gitignore）。
 
 ### OTP 登录
 

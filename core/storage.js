@@ -1,10 +1,13 @@
 /**
  * VRChat 好友监控系统 — SQLite 存储层
  * 
- * 封装 sql.js 的所有数据库操作
+ * 封装 better-sqlite3 的所有数据库操作（2026-08-09 由 sql.js 迁移）。
+ * 为什么换：sql.js 是 WASM 内存库，_save() 整文件覆盖写，强杀进程会
+ * 截断 303MB 大文件导致数据全丢（2026-08-09 真实事故）。better-sqlite3
+ * 是原生绑定 + WAL 模式：每次写即时落盘、崩溃安全、支持并发读。
  */
-import initSqlJs from 'sql.js';
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import Database from 'better-sqlite3';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -12,50 +15,52 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DDL_PATH = path.join(__dirname, 'init-db.sql');
 
 export class Storage {
-  /** @type {import('sql.js').Database} */
+  /** @type {import('better-sqlite3').Database} */
   db = null;
   dbPath = '';
 
   async init(dbPath) {
     this.dbPath = dbPath;
-    const SQL = await initSqlJs();
-
-    if (existsSync(dbPath)) {
-      const buffer = readFileSync(dbPath);
-      this.db = new SQL.Database(buffer);
-    } else {
-      this.db = new SQL.Database();
-    }
+    this.db = new Database(dbPath);
+    this.db.pragma('journal_mode = WAL');
+    this.db.pragma('busy_timeout = 5000');
 
     const ddl = readFileSync(DDL_PATH, 'utf-8');
-    this.db.run(ddl);
+    this.db.exec(ddl);
     // 迁移：旧库 world_cache 缺 note 列
     const worldCols = this._query(`PRAGMA table_info(world_cache)`);
     if (!worldCols.some(c => c.name === 'note')) {
       this._run(`ALTER TABLE world_cache ADD COLUMN note TEXT`);
     }
-    this._save();
     return this;
   }
 
-  _save() {
-    if (this.dbPath) {
-      const data = this.db.export();
-      writeFileSync(this.dbPath, Buffer.from(data));
+  // better-sqlite3 每次写操作即时落盘（WAL），无需手动保存。
+  // 保留为 no-op 兼容旧调用方（save()/close()）。
+  _save() {}
+
+  // better-sqlite3 绑定键不带 $ 前缀（SQL 里 $x 对应对象键 x）
+  _normParams(params = {}) {
+    const out = {};
+    for (const [k, v] of Object.entries(params)) {
+      out[k.startsWith('$') ? k.slice(1) : k] = v;
     }
+    return out;
   }
 
   _query(sql, params = {}) {
-    const stmt = this.db.prepare(sql);
-    if (Object.keys(params).length > 0) stmt.bind(params);
-    const rows = [];
-    while (stmt.step()) rows.push(stmt.getAsObject());
-    stmt.free();
-    return rows;
+    if (Object.keys(params).length > 0) {
+      return this.db.prepare(sql).all(this._normParams(params));
+    }
+    return this.db.prepare(sql).all();
   }
 
   _run(sql, params = {}) {
-    this.db.run(sql, params);
+    if (Object.keys(params).length > 0) {
+      this.db.prepare(sql).run(this._normParams(params));
+    } else {
+      this.db.prepare(sql).run();
+    }
   }
 
   // ── 事件流 ──
@@ -74,16 +79,13 @@ export class Storage {
        VALUES ($type, $userId, $displayName, $contentJson, $worldId, $worldName, $createdAt, $source)`
     );
     for (const e of events) {
-      stmt.bind({
+      stmt.run(this._normParams({
         $type: e.type, $userId: e.userId, $displayName: e.displayName || '',
         $contentJson: JSON.stringify(e.contentJson || {}),
         $worldId: e.worldId || '', $worldName: e.worldName || '',
         $createdAt: e.createdAt, $source: e.source || 'migrate',
-      });
-      stmt.step();
-      stmt.reset();
+      }));
     }
-    stmt.free();
   }
 
   getEventsByUser(userId, { limit = 50, offset = 0, type } = {}) {
@@ -194,6 +196,26 @@ export class Storage {
     return rows[0] || null;
   }
 
+  searchWorldsByName(keyword) {
+    const like = `%${keyword}%`;
+    const rows = this._query(
+      `SELECT world_id, name FROM world_cache WHERE name LIKE $like ORDER BY name LIMIT 20`,
+      { $like: like }
+    );
+    const eventRows = this._query(
+      `SELECT world_id, world_name AS name FROM events WHERE world_name LIKE $like AND world_id != '' GROUP BY world_id, world_name ORDER BY world_name LIMIT 20`,
+      { $like: like }
+    );
+    const seen = new Set();
+    const merged = [];
+    for (const r of [...rows, ...eventRows]) {
+      if (!r.world_id || seen.has(r.world_id)) continue;
+      seen.add(r.world_id);
+      merged.push({ worldId: r.world_id, name: r.name || '' });
+    }
+    return merged;
+  }
+
   _recordWorldChanges(world) {
     const old = this.getWorldName(world.worldId);
     if (!old) return;
@@ -275,18 +297,15 @@ export class Storage {
         updated_at = datetime('now')`
     );
     for (const w of worlds) {
-      stmt.bind({
+      stmt.run(this._normParams({
         $worldId: w.worldId, $name: w.name || '',
         $authorId: w.authorId || '', $authorName: w.authorName || '',
         $description: w.description || '', $imageUrl: w.imageUrl || '',
         $releaseStatus: w.releaseStatus || '',
         $capacity: w.capacity || 0, $favorites: w.favorites || 0,
         $tags: JSON.stringify(w.tags || []),
-      });
-      stmt.step();
-      stmt.reset();
+      }));
     }
-    stmt.free();
   }
 
   // ── 群组缓存 ──
