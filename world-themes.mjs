@@ -108,6 +108,15 @@ const THEMES = [
       { type: 'name', kw: 'racing' }, { type: 'name', kw: 'ボウリング' },
       { type: 'desc', kw: 'game' }, { type: 'desc', kw: 'play' },
     ],
+    // 游戏图排除恐怖图：命中恐怖关键词的图不进「游戏」主题（恐怖单独立类）
+    exclude: [
+      { type: 'tag', kw: 'horror' }, { type: 'tag', kw: 'dark' }, { type: 'tag', kw: 'scary' },
+      { type: 'tag', kw: 'creepy' }, { type: 'tag', kw: 'ghost' },
+      { type: 'name', kw: '恐怖' }, { type: 'name', kw: 'horror' }, { type: 'name', kw: 'scary' },
+      { type: 'name', kw: 'creepy' }, { type: 'name', kw: 'ghost' }, { type: 'name', kw: '幽霊' },
+      { type: 'name', kw: '心霊' }, { type: 'name', kw: '怖い' }, { type: 'name', kw: 'fnaf' },
+      { type: 'desc', kw: '恐怖' }, { type: 'desc', kw: 'horror' }, { type: 'desc', kw: 'scary' },
+    ],
   },
   {
     key: '音乐', emoji: '🎵',
@@ -157,20 +166,27 @@ const THEMES = [
 ];
 
 // ── 主题匹配 ──
-function matchTheme(world, theme) {
+function matchRule(world, rule) {
   const name = (world.world_name || '').toLowerCase();
   const desc = (world.description || '').toLowerCase();
   let tags = [];
   try { tags = JSON.parse(world.tags || '[]'); } catch (e) { tags = []; }
   const tagStr = tags.map(t => t.toLowerCase()).join(' ');
-
-  for (const rule of theme.rules) {
-    const kw = rule.kw.toLowerCase();
-    if (rule.type === 'tag' && tagStr.includes(kw)) return true;
-    if (rule.type === 'name' && name.includes(kw)) return true;
-    if (rule.type === 'desc' && desc.includes(kw)) return true;
-  }
+  const kw = rule.kw.toLowerCase();
+  if (rule.type === 'tag' && tagStr.includes(kw)) return true;
+  if (rule.type === 'name' && name.includes(kw)) return true;
+  if (rule.type === 'desc' && desc.includes(kw)) return true;
   return false;
+}
+
+function matchTheme(world, theme) {
+  const hit = theme.rules.some(rule => matchRule(world, rule));
+  if (!hit) return false;
+  // 主题排除规则：命中 exclude 的图不算该主题（如游戏图排除恐怖图）
+  if (Array.isArray(theme.exclude) && theme.exclude.some(rule => matchRule(world, rule))) {
+    return false;
+  }
+  return true;
 }
 
 // ── 主逻辑 ──
