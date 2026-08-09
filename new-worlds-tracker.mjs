@@ -34,7 +34,7 @@ const SELF_USER_ID = process.env.VRC_MONITOR_USER_ID || '';
 
 const DAYS = parseInt(process.argv[2] || '7', 10);
 const DRY = process.argv.includes('--dry');
-const MAX_FETCH = 200;            // 最多拉多少条候选（翻页）
+const MAX_FETCH = 500;            // 最多拉多少条候选（翻页；approved 图较少，500 条≈覆盖 2 周）
 
 // 限流器（与主服务同参数：VRChat API ~30 次/分钟，安全间隔 2.6s）
 const rateLimiter = new RateLimiter({ minInterval: 2600, maxQueueSize: 30 });
@@ -54,20 +54,37 @@ async function fetchOtp() {
  */
 function isJunkWorld(w) {
   const name = (w.name || '').toLowerCase().trim();
+  const desc = (w.description || '').toLowerCase();
   // 子串匹配：test/test1/测试/习作/示例/临时/新建世界 等
   const junkPatterns = [
     /test/i, /测试/i, /習作/i, /习作/i, /sample/i, /示例/i,
     /placeholder/i, /wip/i, /untitled/i, /tmp/i, /temp/i,
-    /new world/i, /新建世界/i, /frist create/i, /first create/i,
+    /^new world$/i, /^新建世界$/i, /frist create/i, /first create/i,
     /^0+[0-9]{0,3}$/, /^room\d*$/i, /^a room$/i, /^\[?beta\]?$/i,
     /unity input/i, /tutorial/i, /sdk test/i, /do not use/i,
   ];
+  // 描述自述半成品/垃圾（作者自己承认的）
+  const junkDescPatterns = [
+    /un.?finish/i, /not finish/i, /incomplete/i, /no colision/i, /no collision/i,
+    /broken/i, /joke/i, /funny-er/i, /funny er/i, /just for fun/i,
+    /for the meme/i, /garbage/i, /trash/i, /shit/i, /placeholder/i,
+    /work in progress/i, /testing grounds/i, /glitch/i,
+  ];
   const hitJunk = junkPatterns.some(re => re.test(name));
+  const hitJunkDesc = junkDescPatterns.some(re => re.test(desc));
   const hasAuthor = w.authorName && w.authorName !== 'Unknown' && w.authorName !== 'unknown';
+  // 低热度过滤（带观察期）：创建超 3 天仍 0 收藏 + 访问量极小 + 无人在线
+  // => 基本没人玩的死图；刚发布的新图给 3 天观察期避免误伤
+  const created = w.created_at ? new Date(w.created_at).getTime() : 0;
+  const ageDays = created ? (Date.now() - created) / 86400000 : 0;
+  const cold = ageDays > 3 &&
+    (w.favorites || 0) === 0 && (w.visits || 0) < 50 && (w.occupants || 0) === 0;
   return (
     hitJunk ||
+    hitJunkDesc ||
     !hasAuthor ||
-    (typeof w.capacity === 'number' && w.capacity < 4)
+    (typeof w.capacity === 'number' && w.capacity < 4) ||
+    cold
   );
 }
 
@@ -88,29 +105,59 @@ try {
 }
 
 // ── 1. 拉新世界（按创建时间倒序，翻页，全部走限流器）──
+// 「新发布-推荐」：API 层用 tag=system_approved 只拉官方审核通过的世界
+//（对应游戏内绿圈「新发布-推荐」；普通「新发布」全是 system_labs 测试图，垃圾多）
 const cutoff = new Date(Date.now() - DAYS * 24 * 3600 * 1000);
 const candidates = [];
 for (let offset = 0; offset < MAX_FETCH; offset += 100) {
   const r = await rateLimiter.execute(() =>
-    api._request('GET', `/worlds?sort=created&order=descending&n=100&offset=${offset}`));
+    api._request('GET', `/worlds?sort=created&order=descending&tag=system_approved&n=100&offset=${offset}`));
   if (r.status !== 200 || !Array.isArray(r.data) || r.data.length === 0) break;
   candidates.push(...r.data);
   if (r.data.length < 100) break;
 }
-console.error(`[fetch] 候选世界 ${candidates.length} 个`);
+console.error(`[fetch] 推荐候选世界 ${candidates.length} 个（system_approved，非 Labs 测试图）`);
 
 const fresh = candidates
   .filter(w => {
     const created = new Date(w.created_at);
-    const isFresh = created >= cutoff;
-    const tagged = Array.isArray(w.tags) && w.tags.includes('system_created_recently');
-    // 必须同时满足：创建时间在窗口内 + 有 recent 标签（避免捞到旧图/测试图）
-    return isFresh && tagged;
+    // 只用创建时间窗口筛选：候选已带 tag=system_approved（正式发布），
+    // system_created_recently 标签有 TTL（几天后消失），会砍掉窗口内的合法图
+    return created >= cutoff;
   })
   .filter(w => w.releaseStatus === 'public')   // 只要公开世界
   .filter(w => !isJunkWorld(w));               // 过滤测试图/垃圾图
 
 console.error(`[filter] 窗口内新世界 ${fresh.length} 个`);
+
+// ── 1.5 补查详情：列表接口不含 description/visits，对已跟踪 + 低热度候选
+//     补查详情接口（/worlds/{id}）拿描述，供垃圾图判定（限流器控制频率）──
+{
+  // 已跟踪的世界 ID（优先补查，purge 判定依赖描述）
+  let trackedSet = new Set();
+  try {
+    const dbProbe = new Database(DB_PATH, { readonly: true, timeout: 8000 });
+    trackedSet = new Set(dbProbe.prepare('SELECT world_id FROM new_worlds').all().map(r => r.world_id));
+    dbProbe.close();
+  } catch (e) { /* 库不存在则跳过 */ }
+  // 已跟踪的补查：只查低热度嫌疑的（favorites=0 或 occupants=0），有热度的跳过
+  // 未跟踪的低热度候选最多补查 20 个。总名额 50 控制限流耗时（50×2.6s≈130s）
+  const trackedFresh = fresh.filter(w =>
+    trackedSet.has(w.id) && ((w.favorites || 0) === 0 || (w.occupants || 0) === 0)
+  ).slice(0, 30);
+  const lowHeat = fresh.filter(w => !trackedSet.has(w.id) && (w.favorites || 0) === 0).slice(0, 20);
+  const needDetail = [...trackedFresh, ...lowHeat];
+  for (const w of needDetail) {
+    try {
+      const r = await rateLimiter.execute(() => api._request('GET', `/worlds/${w.id}`));
+      if (r.status === 200 && r.data) {
+        w.description = r.data.description || '';
+        w.visits = r.data.visits || 0;
+      }
+    } catch (e) { /* 单条失败跳过 */ }
+  }
+  console.error(`[detail] 已补查 ${needDetail.length} 个候选的详情描述（已跟踪低热度 ${trackedFresh.length} + 未跟踪低热度 ${lowHeat.length}）`);
+}
 
 // ── 2. 读本仓库数据库：visited（events.user-location）+ 已跟踪（new_worlds）──
 let db;
@@ -156,17 +203,43 @@ const recommended = [...unvisited].sort((a, b) => score(b) - score(a)).slice(0, 
 let written = 0;
 let updated = 0;
 if (!DRY) {
+  // 4a. 清理已跟踪但当前判定为垃圾/半成品的世界（如挂羊头的 FNAF 玩笑图）
+  //     用本次拉取的全量候选重新验证（候选含所有最近创建的世界）
+  //     注意：候选现在只含 system_approved（新发布-推荐），所以：
+  //       - 在候选里但 isJunkWorld 判垃圾的 -> 删
+  //       - 不在候选里（被撤下推荐/已下架/旧 Labs 图）-> 删
+  const trackedIds = db.prepare('SELECT world_id FROM new_worlds').all().map(r => r.world_id);
+  const trackedSet = new Set(trackedIds);
+  const candidatesById = new Map(candidates.map(w => [w.id, w]));
+  let purged = 0;
+  const purgeStmt = db.prepare('DELETE FROM new_worlds WHERE world_id = ?');
+  const purgeTx = db.transaction(ids => {
+    for (const id of ids) { purgeStmt.run(id); purged++; }
+  });
+  const purgeIds = [];
+  for (const id of trackedSet) {
+    const w = candidatesById.get(id);
+    if (w && isJunkWorld(w)) purgeIds.push(id);
+    else if (!w) purgeIds.push(id);   // 不在推荐候选里 -> 旧 Labs/已下架，清掉
+  }
+  if (purgeIds.length > 0) {
+    purgeTx(purgeIds);
+    console.error(`[purge] 已移除 ${purgeIds.length} 个垃圾/非推荐世界（含旧 Labs 图、挂羊头图）`);
+  }
+
   const now = new Date().toISOString();
   const upsert = db.prepare(
-    `INSERT INTO new_worlds (world_id, world_name, author_name, created_at, first_seen_at, favorites, occupants, popularity, visited, visited_at)
-     VALUES (@world_id, @world_name, @author_name, @created_at, @first_seen_at, @favorites, @occupants, @popularity, @visited, @visited_at)
+    `INSERT INTO new_worlds (world_id, world_name, author_name, created_at, first_seen_at, favorites, occupants, popularity, visited, visited_at, tags, description)
+     VALUES (@world_id, @world_name, @author_name, @created_at, @first_seen_at, @favorites, @occupants, @popularity, @visited, @visited_at, @tags, @description)
      ON CONFLICT(world_id) DO UPDATE SET
        world_name = excluded.world_name,
        favorites = excluded.favorites,
        occupants = excluded.occupants,
        popularity = excluded.popularity,
        visited = excluded.visited,
-       visited_at = excluded.visited_at`
+       visited_at = excluded.visited_at,
+       tags = excluded.tags,
+       description = excluded.description`
   );
   const markVisited = db.prepare(
     `UPDATE new_worlds SET visited = 1, visited_at = @visited_at
@@ -186,6 +259,8 @@ if (!DRY) {
         popularity: w.popularity || 0,
         visited: visited.has(w.id) ? 1 : 0,
         visited_at: visited.has(w.id) ? now : null,
+        tags: JSON.stringify(w.tags || []),
+        description: w.description || '',
       });
       written++;
     }

@@ -41,11 +41,33 @@ async function fetchOtp() {
   return execSync(cmd, { timeout: 15000, encoding: 'utf-8' }).trim();
 }
 
-// ── 解析参数：worldId 或地图名 ──
+// ── 解析参数：worldId / 地图名 / 主题词（开个XX的图）──
 let target = process.argv[2];
 if (!target) {
-  console.error('用法: node open-world.mjs <worldId 或 地图名>');
+  console.error('用法: node open-world.mjs <worldId 或 地图名 或 主题词>');
+  console.error('主题词: 夏天 海 雪 恐怖 太空 森林自然 游戏 音乐 社交 放松 夜晚星空');
   process.exit(1);
+}
+
+// 主题词识别：如果参数是主题（或其关键词），用 world-themes.mjs 随机抽一个未逛的
+const THEME_HINTS = ['夏天', '夏', '海', '雪', '恐怖', '太空', '宇宙', '森林', '自然',
+  '游戏', '音乐', '社交', '放松', '夜晚', '星空', '月', 'summer', 'beach', 'snow',
+  'horror', 'space', 'forest', 'game', 'music', 'chill', 'relax', 'night', 'moon'];
+const isThemeHint = THEME_HINTS.some(h => target.includes(h));
+if (isThemeHint && !/^wrld_/.test(target)) {
+  const { execSync } = await import('node:child_process');
+  try {
+    const out = execSync(`node world-themes.mjs "${target}" --random`, {
+      cwd: __dirname, timeout: 15000, encoding: 'utf-8',
+    });
+    const pick = JSON.parse(out.slice(out.indexOf('{')));
+    if (pick.world?.id) {
+      target = pick.world.id;
+      console.error(`[theme] ${pick.emoji} 主题「${pick.theme}」随机抽中: ${pick.world.name} (${pick.world.id})`);
+    }
+  } catch (e) {
+    console.error(`[theme] 主题解析失败（按地图名处理）: ${e.message}`);
+  }
 }
 
 // ── 认证 ──

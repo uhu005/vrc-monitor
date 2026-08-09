@@ -110,6 +110,8 @@ CREATE TABLE IF NOT EXISTS new_worlds (
   occupants INTEGER DEFAULT 0,   -- 在线人数
   popularity INTEGER DEFAULT 0,
   visited INTEGER DEFAULT 0,     -- 用户是否逛过（1=逛过）
-  visited_at TEXT                -- 逛过的时间（若已逛）
+  visited_at TEXT,               -- 逛过的时间（若已逛）
+  tags TEXT DEFAULT '',          -- 作者标签 JSON 数组（author_tag_*，主题分类用）
+  description TEXT DEFAULT ''    -- 世界描述（主题关键词匹配用）
 );
 CREATE INDEX IF NOT EXISTS idx_new_worlds_visited ON new_worlds(visited);

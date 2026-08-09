@@ -29,3 +29,7 @@ downloads/
 backups/
 *.sqlite3-wal
 *.sqlite3-shm
+
+# ── 大文件备份（不入库）──
+*.bak-*
+*.bak
