@@ -26,6 +26,20 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BASE = 'http://127.0.0.1:8799/mcp';
 
+// 读取本地 .env（若存在）——仅加载 VRC_MONITOR_* 变量，避免覆盖已有环境变量
+// .env 被 .gitignore 忽略，个人配置不上传 GitHub
+try {
+  const envPath = path.join(__dirname, '.env');
+  if (existsSync(envPath)) {
+    for (const line of readFileSync(envPath, 'utf-8').split(/\r?\n/)) {
+      const m = line.match(/^([A-Z_]+)=(.*)$/);
+      if (m && m[1].startsWith('VRC_MONITOR_') && process.env[m[1]] === undefined) {
+        process.env[m[1]] = m[2];
+      }
+    }
+  }
+} catch { /* .env 不存在或不可读则忽略 */ }
+
 async function mcp(name, args, sid) {
   const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } });
   const res = await fetch(BASE, {
