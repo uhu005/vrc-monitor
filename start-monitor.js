@@ -732,6 +732,22 @@ const CUSTOM_TOOLS = [
     description: '[配置·推荐偏好] 查询当前「推荐加入」的评分偏好（含解析结果与设置时间）。',
     inputSchema: { type: 'object', properties: {} },
   },
+  {
+    name: 'record_join_choice',
+    description: '[配置·选择学习] 记录一次「从推荐列表中选择加入」的行为（用户选择谁/哪张图）。服务端自动从最近一次 recommend_join 的快照补全上下文（人数/类型/熟悉度/排名/列表基线），写入 join_choices 表；积累 ≥5 次后自动分析用户偏好（选人少→避人潮、总选熟人→熟悉度加权等）并应用到推荐权重。用法：先运行 recommend_join 拉列表，再从列表里选一个人记录：传 userId 或 displayName（模糊匹配）。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        userId: { type: 'string', description: '被选择好友的 userId（usr_...）' },
+        displayName: { type: 'string', description: '被选择好友的显示名（模糊匹配，与 userId 二选一）' },
+      },
+    },
+  },
+  {
+    name: 'get_join_learning',
+    description: '[配置·选择学习] 查看推荐选择学习状态：累计选择数、自动分析出的偏好（人数倾向/熟悉度加权/安静图倾向）与生效中的权重调整。',
+    inputSchema: { type: 'object', properties: {} },
+  },
 ];
 
 // ── 工具处理器 ──
@@ -1126,18 +1142,126 @@ async function handleGetJoinPreference() {
   }
 }
 
+// ── 推荐选择学习：记录用户从推荐列表的选择，积累后自动分析偏好调整权重 ──
+let lastRecommendSnapshot = null; // 最近一次推荐列表快照（record_join_choice 补全上下文用）
+
+function computeListBaseline(top) {
+  const rows = top.filter(f => f.instanceUsers !== undefined && f.instanceUsers !== null);
+  if (rows.length === 0) return { list_count: top.length, list_avg_users: 0, list_avg_fill: 0, list_quiet_ratio: 0 };
+  const avgUsers = rows.reduce((s, f) => s + (f.instanceUsers || 0), 0) / rows.length;
+  const avgFill = rows.reduce((s, f) => s + (f.fillRatio || 0), 0) / rows.length;
+  const quietRatio = rows.filter(f => f.isQuietWorld).length / rows.length;
+  return {
+    list_count: top.length,
+    list_avg_users: Math.round(avgUsers * 10) / 10,
+    list_avg_fill: Math.round(avgFill * 100) / 100,
+    list_quiet_ratio: Math.round(quietRatio * 100) / 100,
+  };
+}
+
+function analyzeJoinLearning() {
+  const MIN_SAMPLES = 5;
+  const rows = storage._query('SELECT * FROM join_choices ORDER BY id DESC LIMIT 20');
+  if (rows.length < MIN_SAMPLES) {
+    return { enabled: false, samples: rows.length, minSamples: MIN_SAMPLES, crowd: null, familiarityMult: 1, quietBias: false };
+  }
+  const avg = (arr) => (arr.length ? arr.reduce((s, v) => s + v, 0) / arr.length : 0);
+  const avgChosenUsers = avg(rows.map(r => r.instance_users));
+  const avgListUsers = avg(rows.map(r => r.list_avg_users));
+  const avgFam = avg(rows.map(r => r.familiarity_score));
+  const quietRatio = rows.filter(r => r.is_quiet_world).length / rows.length;
+  // 人数倾向：选择平均人数 vs 当时列表平均人数（<60% 避人潮，>130% 爱热闹）
+  let crowd = null;
+  if (avgListUsers > 3 && avgChosenUsers < avgListUsers * 0.6) crowd = 'avoid';
+  else if (avgListUsers > 3 && avgChosenUsers > avgListUsers * 1.3) crowd = 'love';
+  // 熟悉度倾向：60% 以上选择熟悉度>=15 的好友 → 熟悉度加权
+  const famPrefer = avgFam >= 15 && rows.filter(r => r.familiarity_score >= 15).length >= Math.ceil(rows.length * 0.6);
+  // 安静图倾向：50% 以上选择安静图 → 安静图偏好
+  const quietBias = quietRatio >= 0.5;
+  const learning = {
+    enabled: true,
+    samples: rows.length,
+    crowd,
+    familiarityMult: famPrefer ? 1.2 : 1,
+    quietBias,
+    stats: {
+      avgChosenUsers: Math.round(avgChosenUsers * 10) / 10,
+      avgListUsers: Math.round(avgListUsers * 10) / 10,
+      avgFamiliarity: Math.round(avgFam * 10) / 10,
+      quietRatio: Math.round(quietRatio * 100) / 100,
+    },
+    updatedAt: new Date().toISOString(),
+  };
+  storage.setConfig('join_learning', JSON.stringify(learning));
+  return learning;
+}
+
+async function handleRecordJoinChoice({ userId, displayName } = {}) {
+  if (!lastRecommendSnapshot) throw new Error('还没有推荐列表——请先运行 recommend_join 再记录选择');
+  const top = lastRecommendSnapshot.top || [];
+  if (top.length === 0) throw new Error('最近一次推荐列表为空，无法记录');
+  let hit = null;
+  if (userId) hit = top.find(f => f.userId === userId);
+  if (!hit && displayName) {
+    const dn = String(displayName).toLowerCase();
+    hit = top.find(f => (f.displayName || '').toLowerCase().includes(dn));
+  }
+  if (!hit) throw new Error(`推荐列表中没有找到「${displayName || userId}」——请先运行 recommend_join 并从中选择`);
+  const rank = top.indexOf(hit) + 1;
+  const baseline = lastRecommendSnapshot.baseline;
+  storage._run(
+    `INSERT INTO join_choices (user_id, display_name, world_id, world_name, instance_type, instance_users, instance_capacity, fill_ratio, familiarity_score, is_quiet_world, recommend_score, rank_in_list, list_count, list_avg_users, list_avg_fill, list_quiet_ratio)
+     VALUES ($userId, $displayName, $worldId, $worldName, $instanceType, $instanceUsers, $instanceCapacity, $fillRatio, $familiarityScore, $isQuietWorld, $recommendScore, $rank, $listCount, $listAvgUsers, $listAvgFill, $listQuietRatio)`,
+    {
+      $userId: hit.userId, $displayName: hit.displayName, $worldId: hit.worldId || '',
+      $worldName: hit.worldName || '', $instanceType: hit.instanceType || '',
+      $instanceUsers: hit.instanceUsers || 0, $instanceCapacity: hit.instanceCapacity || 0,
+      $fillRatio: hit.fillRatio || 0, $familiarityScore: (hit.familiarity && hit.familiarity.score) || 0,
+      $isQuietWorld: hit.isQuietWorld ? 1 : 0, $recommendScore: hit.recommendScore || 0,
+      $rank: rank, $listCount: baseline.list_count, $listAvgUsers: baseline.list_avg_users,
+      $listAvgFill: baseline.list_avg_fill, $listQuietRatio: baseline.list_quiet_ratio,
+    },
+  );
+  const learning = analyzeJoinLearning();
+  return {
+    success: true,
+    recorded: { userId: hit.userId, displayName: hit.displayName, worldName: hit.worldName, rank },
+    learning,
+  };
+}
+
+async function handleGetJoinLearning() {
+  try {
+    const raw = storage.getConfig('join_learning');
+    const learning = raw ? JSON.parse(raw) : analyzeJoinLearning();
+    const count = storage._query('SELECT COUNT(*) AS c FROM join_choices')[0].c;
+    return { choicesCount: count, learning };
+  } catch (e) {
+    return { error: `读取失败: ${e.message}` };
+  }
+}
+
 async function handleRecommendJoin({ limit = 10, minScore = 0 } = {}) {
-  // 0. 推荐偏好（config 表持久化，实时生效）
+  // 0. 权重来源：显式偏好(join_prefs) > 自动学习(join_learning) > 默认
   let joinPrefs = { crowd: 'normal' };
   try {
     const rawPref = storage.getConfig('join_prefs');
     if (rawPref) joinPrefs = { ...joinPrefs, ...JSON.parse(rawPref) };
   } catch (e) { /* 偏好解析失败按默认 */ }
-  const CROWD = joinPrefs.crowd || 'normal';
+  let learning = null;
+  if (!joinPrefs.crowd || joinPrefs.crowd === 'normal') {
+    try {
+      const rawLearn = storage.getConfig('join_learning');
+      if (rawLearn) { const l = JSON.parse(rawLearn); if (l && l.enabled) learning = l; }
+    } catch (e) { /* 学习结果解析失败按默认 */ }
+  }
+  const isExplicitPref = joinPrefs.crowd && joinPrefs.crowd !== 'normal';
+  const CROWD = joinPrefs.crowd || (learning && learning.crowd) || 'normal';
+  const famMult = isExplicitPref ? 1 : (learning ? learning.familiarityMult : 1);
   const crowdMult = CROWD === 'avoid' ? 1.5 : (CROWD === 'love' ? 4 : 3);
   const fullPenalty = CROWD === 'avoid' ? 80 : (CROWD === 'love' ? 20 : 40);
   const coldPenalty = CROWD === 'avoid' ? 0 : (CROWD === 'love' ? 15 : 10);
-  const prefTag = CROWD === 'normal' ? '' : `偏好[${CROWD === 'avoid' ? '避人潮' : '爱热闹'}]`;
+  const prefTag = CROWD === 'normal' ? '' : (isExplicitPref ? `偏好[${CROWD === 'avoid' ? '避人潮' : '爱热闹'}]` : `学习[${CROWD === 'avoid' ? '避人潮' : '爱热闹'}]`);
 
   // 1. 全部在线好友
   const onlineR = await rateLimiter.execute(() => api._request('GET', '/auth/user/friends?offline=false'));
@@ -1263,8 +1387,9 @@ async function handleRecommendJoin({ limit = 10, minScore = 0 } = {}) {
     const reasons = [];
     if (isContact) { score -= 40; reasons.push('活动联系人-40'); }
     else {
-      score += Math.min(fam.score, 100);
-      reasons.push(`熟悉度${fam.score}(30天${fam.recentMatchCount}次)`);
+      const famScore = famMult !== 1 ? Math.min(Math.round(fam.score * famMult), 100) : Math.min(fam.score, 100);
+      score += famScore;
+      reasons.push(`熟悉度${famScore}${famMult !== 1 ? `(学习加权×${famMult})` : ''}(30天${fam.recentMatchCount}次)`);
       if (groupName) {
         const bonus = Math.min(groupWeight, 10);
         if (bonus !== 0) { score += bonus; reasons.push(`[${groupName}]+${bonus}`); }
@@ -1275,8 +1400,9 @@ async function handleRecommendJoin({ limit = 10, minScore = 0 } = {}) {
     if (instanceUsers !== undefined) {
       if (isQuietWorld) {
         // 安静图：人少是理想状态，人多反而打扰（破坏氛围/电灯泡）
+        const quietBonus = learning && learning.quietBias ? 25 : 15;
         if (instanceUsers === 0) { reasons.push(`安静图空房可进`); }
-        else if (instanceUsers <= 3) { score += 15; reasons.push(`安静图${instanceUsers}人正合适+15`); }
+        else if (instanceUsers <= 3) { score += quietBonus; reasons.push(`安静图${instanceUsers}人正合适+${quietBonus}`); }
         else if (instanceUsers <= 6) { score += 0; reasons.push(`安静图${instanceUsers}人适中`); }
         else { score -= 50; reasons.push(`安静图${instanceUsers}人太多-50`); }
       } else {
@@ -1314,12 +1440,16 @@ async function handleRecommendJoin({ limit = 10, minScore = 0 } = {}) {
 
   detailed.sort((a, b) => (b.recommendScore || 0) - (a.recommendScore || 0));
   const filtered = minScore > 0 ? detailed.filter(d => d.recommendScore >= minScore) : detailed;
+  // 存推荐快照（record_join_choice 用它补全选择上下文）
+  const baseline = computeListBaseline(filtered.slice(0, limit));
+  lastRecommendSnapshot = { at: Date.now(), top: filtered.slice(0, limit), baseline };
   return {
     totalOnline: onlineFriends.length,
     joinable: detailed.length,
     top: filtered.slice(0, limit),
     method: 'familiarity+group+scene+instance',
-    preference: CROWD === 'normal' ? null : { crowd: CROWD, label: joinPrefs.label || '' },
+    preference: isExplicitPref ? { crowd: CROWD, label: joinPrefs.label || '' } : null,
+    learning: (!isExplicitPref && learning) ? { crowd: learning.crowd, familiarityMult: learning.familiarityMult, quietBias: learning.quietBias, samples: learning.samples } : null,
   };
 }
 
@@ -2683,6 +2813,12 @@ async function handleRpc(rpc, session, res) {
             break;
           case 'get_join_preference':
             result = await handleGetJoinPreference();
+            break;
+          case 'record_join_choice':
+            result = await handleRecordJoinChoice(args);
+            break;
+          case 'get_join_learning':
+            result = await handleGetJoinLearning();
             break;
           default:
             throw new Error(`Unknown tool: ${name}`);
