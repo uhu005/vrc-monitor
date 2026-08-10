@@ -29,6 +29,20 @@ const DB_PATH = path.join(__dirname, 'vrc-monitor.sqlite3');
 const BACKUP_DIR = path.join(__dirname, 'backups');
 const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 每 24h 自动备份
 
+// ── .env 加载（只取 VRC_MONITOR_*，不覆盖进程已有环境变量）──
+// 个人配置（分组权重/联系人名单等）放仓库根 .env（.gitignore 已忽略），不硬编码进代码
+try {
+  const envFile = path.join(__dirname, '.env');
+  if (existsSync(envFile)) {
+    for (const line of readFileSync(envFile, 'utf-8').split(/\r?\n/)) {
+      const m = /^([A-Z_]+)=(.*)$/.exec(line.trim());
+      if (m && m[1].startsWith('VRC_MONITOR_')) {
+        process.env[m[1]] = m[2];
+      }
+    }
+  }
+} catch (e) { /* .env 加载失败不阻断 */ }
+
 // ── 全局状态 ──
 let storage;
 let api;
@@ -1061,7 +1075,7 @@ async function handleRecommendJoin({ limit = 10, minScore = 0 } = {}) {
   const onlineFriends = Array.isArray(onlineR.data) ? onlineR.data : [];
 
   // 2. 收藏夹分组（熟悉度补充信号，权重可配置）
-  const groupWeights = {};
+  let groupWeights = {};
   const contactGroups = new Set();
   try {
     if (process.env.VRC_MONITOR_GROUP_WEIGHTS) groupWeights = JSON.parse(process.env.VRC_MONITOR_GROUP_WEIGHTS);
@@ -1114,6 +1128,10 @@ async function handleRecommendJoin({ limit = 10, minScore = 0 } = {}) {
     const sw = storage._query ? storage._query('SELECT world_id FROM new_worlds WHERE sleep_ok=1') : [];
     for (const r of sw) sleepWorlds.add(r.world_id);
   } catch (e) {}
+
+  // 安静图判定：sleep_ok=1 或世界名命中安静关键词（人少更好，人多打扰）
+  const QUIET_RE = /(寝|眠|睡眠|睡觉|睡|sleep|quiet|静か|静寂|calm|relax|リラックス|ゆったり|安らぎ|癒し|冥想|meditation)/i;
+  const isQuietWorldName = (name) => typeof name === 'string' && QUIET_RE.test(name);
 
   const detailed = [];
   for (const f of onlineFriends) {
@@ -1183,17 +1201,22 @@ async function handleRecommendJoin({ limit = 10, minScore = 0 } = {}) {
       }
     }
     const isSleepWorld = loc.worldId && sleepWorlds.has(loc.worldId);
-    if (isSleepWorld && instanceUsers !== undefined) {
-      if (instanceUsers < 5) { score -= 60; reasons.push(`💤睡觉图仅${instanceUsers}人-60`); }
-      else { score -= 20; reasons.push(`💤睡觉聚会${instanceUsers}人-20`); }
-    } else if (!isSleepWorld && instanceUsers !== undefined && instanceUsers < 3 && instanceUsers > 0) {
-      score -= 15; reasons.push(`人少${instanceUsers}人可能私聊-15`);
-    }
+    const isQuietWorld = isSleepWorld || isQuietWorldName(worldName);
     if (instanceUsers !== undefined) {
-      if (fillRatio >= 0.3 && fillRatio <= 0.8) { score += 50; reasons.push(`黄金区${Math.round(fillRatio*100)}%+50`); }
-      else if (fillRatio > 0.9) { score -= 40; reasons.push(`爆满-40`); }
-      else if (fillRatio < 0.1) { score -= 10; reasons.push(`冷清-10`); }
-      score += instanceUsers * 3; reasons.push(`人数${instanceUsers}`);
+      if (isQuietWorld) {
+        // 安静图：人少是理想状态，人多反而打扰（破坏氛围/电灯泡）
+        if (instanceUsers === 0) { reasons.push(`安静图空房可进`); }
+        else if (instanceUsers <= 3) { score += 15; reasons.push(`安静图${instanceUsers}人正合适+15`); }
+        else if (instanceUsers <= 6) { score += 0; reasons.push(`安静图${instanceUsers}人适中`); }
+        else { score -= 50; reasons.push(`安静图${instanceUsers}人太多-50`); }
+      } else {
+        // 热闹图：人多正向，黄金区最理想
+        if (instanceUsers < 3 && instanceUsers > 0) { score -= 15; reasons.push(`人少${instanceUsers}人可能私聊-15`); }
+        if (fillRatio >= 0.3 && fillRatio <= 0.8) { score += 50; reasons.push(`黄金区${Math.round(fillRatio*100)}%+50`); }
+        else if (fillRatio > 0.9) { score -= 40; reasons.push(`爆满-40`); }
+        else if (fillRatio < 0.1) { score -= 10; reasons.push(`冷清-10`); }
+        score += instanceUsers * 3; reasons.push(`人数${instanceUsers}`);
+      }
     }
     if (loc.type === 'public') { score += 20; reasons.push('public+20'); }
     else if (loc.type === 'friends' || loc.type === 'hidden') { score += 10; reasons.push(loc.type === 'hidden' ? 'friend++10' : 'friends+10'); }
@@ -1211,6 +1234,7 @@ async function handleRecommendJoin({ limit = 10, minScore = 0 } = {}) {
       region: loc.region || '',
       status: f.status,
       isSleepWorld,
+      isQuietWorld,
       familiarity: fam,
       relation: { group: groupName, isContact, note: isContact ? '活动联系人(非好友)' : (groupName ? `收藏夹[${groupName}]` : '普通好友') },
       recommendScore: Math.round(score),
