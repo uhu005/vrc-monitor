@@ -24,24 +24,23 @@ import { openInstance } from './core/vrchat-launch.js';
 import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execSync } from 'node:child_process';
+import { execSync, execFileSync } from 'node:child_process';
+import { RateLimiter } from './core/rate-limiter.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CRED_FILE = path.join(__dirname, 'credentials.json');
 const COOKIE_FILE = path.join(__dirname, 'auth_cookie.txt');
 
-// 平台检测：本工具仅支持 Windows（命名管道机制）
-if (process.platform !== 'win32') {
-  console.error('❌ 本工具仅支持 Windows（依赖 \\\\.\\pipe\\VRChatURLLaunchPipe 命名管道）');
-  process.exit(1);
-}
+// 平台说明：命名管道增强仅 Windows（core/vrchat-launch.js 内平台门控）；
+// 非 Windows / VRChat 未运行时自动回退 API 邀请（不在此处退出）
 
 async function fetchOtp() {
   const creds = JSON.parse(readFileSync(CRED_FILE, 'utf-8'));
   const authCode = creds.imap_auth_code || creds.qqmail_auth_code || '';
-  let cmd = `python "${path.join(__dirname, 'fetch-otp.py')}" "${creds.email}" "${authCode}"`;
-  if (creds.imap_host) cmd += ` "${creds.imap_host}"`;
-  return execSync(cmd, { timeout: 15000, encoding: 'utf-8' }).trim();
+  // execFile 数组传参，避免授权码含引号/特殊字符破坏命令
+  const args = [path.join(__dirname, 'fetch-otp.py'), creds.email, authCode];
+  if (creds.imap_host) args.push(creds.imap_host);
+  return execFileSync('python', args, { timeout: 15000, encoding: 'utf-8' }).trim();
 }
 
 // ── 解析参数：worldId / 地图名 / 主题词（开个XX的图）/ --instance ──
@@ -69,24 +68,29 @@ const THEME_HINTS = ['夏天', '夏', '海', '雪', '恐怖', '太空', '宇宙'
   'horror', 'space', 'forest', 'game', 'music', 'chill', 'relax', 'night', 'moon'];
 const isThemeHint = THEME_HINTS.some(h => target.includes(h));
 if (isThemeHint && !/^wrld_/.test(target)) {
-  const { execSync } = await import('node:child_process');
-  try {
-    const out = execSync(`node world-themes.mjs "${target}" --random`, {
-      cwd: __dirname, timeout: 15000, encoding: 'utf-8',
-    });
-    const pick = JSON.parse(out.slice(out.indexOf('{')));
-    if (pick.world?.id) {
-      target = pick.world.id;
-      console.error(`[theme] ${pick.emoji} 主题「${pick.theme}」随机抽中: ${pick.world.name} (${pick.world.id})`);
+  // 主题词解析依赖 world-themes.mjs（可选增强：本仓库存在才启用，否则按地图名处理）
+  if (!existsSync(path.join(__dirname, 'world-themes.mjs'))) {
+    console.error('[theme] world-themes.mjs 不存在，跳过主题解析（按地图名处理）');
+  } else {
+    try {
+      const out = execSync(`node world-themes.mjs "${target}" --random`, {
+        cwd: __dirname, timeout: 15000, encoding: 'utf-8',
+      });
+      const pick = JSON.parse(out.slice(out.indexOf('{')));
+      if (pick.world?.id) {
+        target = pick.world.id;
+        console.error(`[theme] ${pick.emoji} 主题「${pick.theme}」随机抽中: ${pick.world.name} (${pick.world.id})`);
+      }
+    } catch (e) {
+      console.error(`[theme] 主题解析失败（按地图名处理）: ${e.message}`);
     }
-  } catch (e) {
-    console.error(`[theme] 主题解析失败（按地图名处理）: ${e.message}`);
   }
 }
 
 // ── 认证 ──
 const creds = JSON.parse(readFileSync(CRED_FILE, 'utf-8'));
 const api = new VrchatApiClient(creds.email, creds.password);
+const rateLimiter = new RateLimiter({ minInterval: 2600 });
 if (existsSync(COOKIE_FILE)) api.loadCookieFromFile(COOKIE_FILE);
 try {
   const user = await api.ensureAuthWithAutoOtp(fetchOtp);
@@ -125,7 +129,7 @@ if (!/^wrld_/.test(target)) {
   let found = null;
   // 优先 API 搜索（精确 > 开头 > 包含 > 第一个）
   try {
-    const r = await api._request('GET', `/worlds?search=${encodeURIComponent(target)}&n=15`);
+    const r = await rateLimiter.execute(() => api._request('GET', `/worlds?search=${encodeURIComponent(target)}&n=15`));
     if (r.status === 200 && Array.isArray(r.data) && r.data.length) {
       const low = target.toLowerCase();
       const exact = r.data.find(w => (w.name || '').toLowerCase() === low);
@@ -163,7 +167,7 @@ if (!/^wrld_/.test(target)) {
 // 获取世界名（展示用）
 let worldName = worldId;
 try {
-  const r = await api._request('GET', `/worlds/${worldId}`);
+    const r = await rateLimiter.execute(() => api._request('GET', `/worlds/${worldId}`));
   if (r.status === 200 && r.data?.name) worldName = r.data.name;
 } catch { /* 用 id 兜底 */ }
 
@@ -173,7 +177,7 @@ console.error(`[world] ${worldName} (${worldId})`);
 let shortName = null;
 let instanceLocation = null;
 try {
-  const r = await api._request('POST', `/instances`, { worldId, region: 'jp', type: 'public', platform: 'standalonewindows' });
+    const r = await rateLimiter.execute(() => api._request('POST', `/instances`, { worldId, region: 'jp', type: 'public', platform: 'standalonewindows' }));
   if (r.status === 200 && r.data?.location) {
     instanceLocation = r.data.location;
     shortName = r.data.shortName || r.data.secureName || null;
