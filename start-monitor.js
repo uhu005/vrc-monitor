@@ -716,6 +716,22 @@ const CUSTOM_TOOLS = [
       },
     },
   },
+  {
+    name: 'set_join_preference',
+    description: '[配置·推荐偏好] 用自然语言设置「推荐加入」的评分偏好，持久化到 config 表，下次推荐自动生效。例：「我不喜欢人太多」→ 爆满惩罚加重(80)、人数权重降低(×1.5)、冷清不罚；「喜欢热闹」→ 人数权重加强(×4)、爆满轻罚(20)；「恢复默认」→ 清除偏好。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        preference: { type: 'string', description: '自然语言偏好，如「我不喜欢人太多」「喜欢热闹」「恢复默认」' },
+      },
+      required: ['preference'],
+    },
+  },
+  {
+    name: 'get_join_preference',
+    description: '[配置·推荐偏好] 查询当前「推荐加入」的评分偏好（含解析结果与设置时间）。',
+    inputSchema: { type: 'object', properties: {} },
+  },
 ];
 
 // ── 工具处理器 ──
@@ -1068,7 +1084,61 @@ async function handleGetFavoriteFriendsLocations({ groupName, favoriteGroupId, s
   };
 }
 
+// ── 推荐偏好：自然语言 → 权重调整（持久化到 config 表 join_prefs）──
+function parseJoinPreference(text) {
+  const t = String(text || '').trim();
+  if (!t) return { error: 'preference 不能为空' };
+  // 重置
+  if (/(恢复|取消|重置|默认|清空|不要偏好)/.test(t)) {
+    return { reset: true, message: '已恢复默认（无偏好）' };
+  }
+  let crowd = 'normal';
+  // 爱热闹（优先匹配，避免「喜欢人多」被误判为避人潮）
+  if (/(喜欢|爱|希望|想).*(热闹|人多|扎堆)|人越多越好|热闹一点|人多热闹/.test(t)) crowd = 'love';
+  // 避人潮
+  else if (/(不喜欢|讨厌|怕|不想|别).*(人多|热闹|挤|扎堆)|人.*太多|太挤|人少.*好|避开.*人群|清净/.test(t)) crowd = 'avoid';
+  if (crowd === 'normal' && !/(热闹|人多|爆满|挤|人群)/.test(t)) {
+    return { error: `未能识别偏好「${t}」——可试试「我不喜欢人太多」「喜欢热闹」「恢复默认」` };
+  }
+  const labels = { avoid: '避人潮（爆满重罚-80、人数权重×1.5、冷清不罚）', love: '爱热闹（人数权重×4、爆满轻罚-20）', normal: '默认' };
+  return { crowd, label: labels[crowd] };
+}
+
+async function handleSetJoinPreference({ preference } = {}) {
+  const parsed = parseJoinPreference(preference);
+  if (parsed.error) throw new Error(parsed.error);
+  if (parsed.reset) {
+    storage.setConfig('join_prefs', '');
+    return { success: true, reset: true, message: parsed.message };
+  }
+  const prefs = { crowd: parsed.crowd, label: parsed.label, updatedAt: new Date().toISOString() };
+  storage.setConfig('join_prefs', JSON.stringify(prefs));
+  return { success: true, ...prefs, message: `已保存：${parsed.label}` };
+}
+
+async function handleGetJoinPreference() {
+  try {
+    const raw = storage.getConfig('join_prefs');
+    if (!raw) return { preference: null, message: '当前无偏好（默认：人数×3、爆满-40、冷清-10）' };
+    return { preference: JSON.parse(raw) };
+  } catch (e) {
+    return { preference: null, error: `读取失败: ${e.message}` };
+  }
+}
+
 async function handleRecommendJoin({ limit = 10, minScore = 0 } = {}) {
+  // 0. 推荐偏好（config 表持久化，实时生效）
+  let joinPrefs = { crowd: 'normal' };
+  try {
+    const rawPref = storage.getConfig('join_prefs');
+    if (rawPref) joinPrefs = { ...joinPrefs, ...JSON.parse(rawPref) };
+  } catch (e) { /* 偏好解析失败按默认 */ }
+  const CROWD = joinPrefs.crowd || 'normal';
+  const crowdMult = CROWD === 'avoid' ? 1.5 : (CROWD === 'love' ? 4 : 3);
+  const fullPenalty = CROWD === 'avoid' ? 80 : (CROWD === 'love' ? 20 : 40);
+  const coldPenalty = CROWD === 'avoid' ? 0 : (CROWD === 'love' ? 15 : 10);
+  const prefTag = CROWD === 'normal' ? '' : `偏好[${CROWD === 'avoid' ? '避人潮' : '爱热闹'}]`;
+
   // 1. 全部在线好友
   const onlineR = await rateLimiter.execute(() => api._request('GET', '/auth/user/friends?offline=false'));
   if (onlineR.status !== 200) throw new Error(`API error: ${onlineR.status}`);
@@ -1210,12 +1280,12 @@ async function handleRecommendJoin({ limit = 10, minScore = 0 } = {}) {
         else if (instanceUsers <= 6) { score += 0; reasons.push(`安静图${instanceUsers}人适中`); }
         else { score -= 50; reasons.push(`安静图${instanceUsers}人太多-50`); }
       } else {
-        // 热闹图：人多正向，黄金区最理想
+        // 热闹图：人多正向，黄金区最理想（人数权重/爆满/冷清受偏好调节）
         if (instanceUsers < 3 && instanceUsers > 0) { score -= 15; reasons.push(`人少${instanceUsers}人可能私聊-15`); }
         if (fillRatio >= 0.3 && fillRatio <= 0.8) { score += 50; reasons.push(`黄金区${Math.round(fillRatio*100)}%+50`); }
-        else if (fillRatio > 0.9) { score -= 40; reasons.push(`爆满-40`); }
-        else if (fillRatio < 0.1) { score -= 10; reasons.push(`冷清-10`); }
-        score += instanceUsers * 3; reasons.push(`人数${instanceUsers}`);
+        else if (fillRatio > 0.9) { score -= fullPenalty; reasons.push(`${prefTag}爆满-${fullPenalty}`); }
+        else if (fillRatio < 0.1) { score -= coldPenalty; reasons.push(`${prefTag}冷清-${coldPenalty}`); }
+        score += instanceUsers * crowdMult; reasons.push(`人数${instanceUsers}${CROWD === 'normal' ? '' : `×${crowdMult}`}`);
       }
     }
     if (loc.type === 'public') { score += 20; reasons.push('public+20'); }
@@ -1249,6 +1319,7 @@ async function handleRecommendJoin({ limit = 10, minScore = 0 } = {}) {
     joinable: detailed.length,
     top: filtered.slice(0, limit),
     method: 'familiarity+group+scene+instance',
+    preference: CROWD === 'normal' ? null : { crowd: CROWD, label: joinPrefs.label || '' },
   };
 }
 
@@ -2606,6 +2677,12 @@ async function handleRpc(rpc, session, res) {
             break;
           case 'recommend_join':
             result = await handleRecommendJoin(args);
+            break;
+          case 'set_join_preference':
+            result = await handleSetJoinPreference(args);
+            break;
+          case 'get_join_preference':
+            result = await handleGetJoinPreference();
             break;
           default:
             throw new Error(`Unknown tool: ${name}`);
