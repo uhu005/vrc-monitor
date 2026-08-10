@@ -4,12 +4,12 @@
  *
  * 推荐算法（综合关系深浅 + 房间场景 + 实例可加入性）：
  * 1. 数据源：全部在线好友（get_online_friends），private 实例自动排除
- * 2. 关系深浅：
- *    - 收藏夹分组映射（从 get_favorite_friends_locations 拿分组内成员）
- *    - join 分组 = 常一起玩（最亲，+20）
- *    - new 分组 = 新加好友（+5）
- *    - 活动店员分组 = 活动联系人，不算好友（-40，标注 contact=true）
- *    - 不在任何收藏夹 = 普通好友（0）
+ * 2. 关系深浅（可配置，见下方环境变量）：
+ *    - 默认：所有收藏夹分组统一 +5 弱加分（不区分亲密度，通用行为）
+ *    - 可用 VRC_MONITOR_GROUP_WEIGHTS 自定义各分组权重：
+ *        VRC_MONITOR_GROUP_WEIGHTS='{"join":20,"new":5,"活动店员":-40}'
+ *    - 可用 VRC_MONITOR_CONTACT_GROUPS 指定「联系人分组」（不算好友，降权+标注）：
+ *        VRC_MONITOR_CONTACT_GROUPS='活动店员'
  * 3. 房间场景（用 sleep_ok 标记识别睡觉图）：
  *    - 睡觉图 + 人少(<5) = 电灯泡/在睡觉（-60，标注 risk=sleeping）
  *    - 睡觉图 + 人多(>=5) = 睡觉聚会（-20，可考虑但提示）
@@ -41,22 +41,34 @@ async function mcp(name, args, sid) {
   return JSON.parse(d.result.content[0].text);
 }
 
-// ── 1. 收藏夹分组 -> 成员映射（关系深浅信号）──
+// ── 1. 收藏夹分组 -> 成员映射（关系深浅信号，可配置）──
 const groupMap = new Map(); // groupName -> { ids: Set, weight, contact }
-const groupDefs = [
-  { name: 'join', weight: 20, contact: false, desc: '常一起玩' },
-  { name: 'new', weight: 5, contact: false, desc: '新加好友' },
-  { name: '活动店员', weight: -40, contact: true, desc: '活动联系人(非好友)' },
-];
+// 环境变量配置（个人化权重/联系人分组，不硬编码到仓库）
+//   VRC_MONITOR_GROUP_WEIGHTS: JSON，分组名->权重，如 {"join":20,"new":5,"活动店员":-40}
+//   VRC_MONITOR_CONTACT_GROUPS: 逗号分隔的联系人分组名，如 "活动店员"
+let groupWeights = {};
+let contactGroups = new Set();
+try {
+  if (process.env.VRC_MONITOR_GROUP_WEIGHTS) {
+    groupWeights = JSON.parse(process.env.VRC_MONITOR_GROUP_WEIGHTS);
+  }
+} catch (e) { console.error('[warn] VRC_MONITOR_GROUP_WEIGHTS 解析失败:', e.message); }
+if (process.env.VRC_MONITOR_CONTACT_GROUPS) {
+  contactGroups = new Set(process.env.VRC_MONITOR_CONTACT_GROUPS.split(',').map(s => s.trim()).filter(Boolean));
+}
+
 const ov = await mcp('get_favorite_friends_locations', {}, 'rec-v2-ov');
 for (const g of ov.groups || []) {
-  const def = groupDefs.find(d => d.name === g.groupName);
-  if (!def) continue;
   const r = await mcp('get_favorite_friends_locations', { groupName: g.groupName }, 'rec-v2-g');
   const ids = new Set();
   for (const f of (r.friends || [])) ids.add(f.userId);
   for (const f of (r.offline || [])) ids.add(f.userId);
-  groupMap.set(g.groupName, { ids, weight: def.weight, contact: def.contact, desc: def.desc });
+  // 权重：配置了用配置值；否则默认 +5（弱加分，通用行为）；contact 分组默认 -40
+  const isContact = contactGroups.has(g.groupName);
+  const weight = groupWeights[g.groupName] !== undefined
+    ? groupWeights[g.groupName]
+    : (isContact ? -40 : 5);
+  groupMap.set(g.groupName, { ids, weight, contact: isContact, desc: g.groupName });
 }
 
 // ── 2. 睡觉图名单 ──
