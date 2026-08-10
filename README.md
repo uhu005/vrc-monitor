@@ -278,10 +278,12 @@ mcp_servers:
 │   ├── ws-manager.js       # WebSocket 管理
 │   ├── event-pipeline.js   # 事件处理管道
 │   ├── friend-state.js     # 好友状态管理
-│   └── rate-limiter.js     # API 限流
+│   ├── rate-limiter.js     # API 限流
+│   └── vrchat-launch.js    # 打开实例统一入口（管道探测 + API 回退）
 ├── vrchat-api.js           # VRChat API 客户端
 ├── fetch-otp.py            # 邮箱 IMAP OTP 自动抓取
 ├── migrate-vrcx0.mjs       # VRCX-0 数据迁移脚本
+├── open-world.mjs          # 本机辅助：创建房间并在 VRChat 内打开（管道/API 双通道）
 ├── hermes-plugin/          # Hermes 托管插件
 │   ├── plugin.yaml
 │   ├── __init__.py
@@ -331,6 +333,21 @@ node new-worlds-tracker.mjs 7 --dry
 - API 调用走 `core/rate-limiter.js` 限流
 - 输出 JSON：`{ collected, tracked, visited, unvisited, recommended }`
 - 定时场景：cron 每天执行即可保持跟踪列表新鲜
+
+### `open-world.mjs` — 创建房间并在 VRChat 客户端内打开（探测式本机增强）
+
+创建一个新房间，并在**运行中的 VRChat 客户端**内打开指定世界（游戏内弹确认菜单，不会新开进程）：
+
+```bash
+node open-world.mjs wrld_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx   # 按世界 ID 开图
+node open-world.mjs "地图名字"                                   # 按名字搜索开图
+node open-world.mjs --instance <完整location>                    # 直接加入指定实例
+```
+
+- **原理**：核心逻辑在 `core/vrchat-launch.js`（统一入口 `openInstance`）：
+  1. **本机增强（仅 Windows）**：探测 VRChat 命名管道 `\\.\pipe\VRChatURLLaunchPipe`，存在则直发 `vrchat://launch` URL——已运行的客户端在游戏内**一步弹出加入菜单**（VRCX VRCIPC 同款协议，不新开进程）；
+  2. **跨平台回退**：管道探测失败（VRChat 未运行 / 非 Windows）**静默回退**为 API 邀请自己传送（`POST /invite/myself/to/{worldId}:{instanceId}`）——客户端收到邀请通知，接受后传送，功能不缺失。
+- **依赖**：仓库根目录 `credentials.json`（VRChat 登录凭据）；纯本机工具，不参与服务主流程，非 Windows 平台自动走 API 邀请。
 
 ## 🛠 故障排查
 

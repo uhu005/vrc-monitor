@@ -1,24 +1,26 @@
 #!/usr/bin/env node
 /**
- * VRChat 开地图脚本 (open-world.mjs) — 本机辅助工具（个人 fork 自用）
+ * VRChat 开地图脚本 (open-world.mjs) — 本机辅助工具
  *
- * 功能：创建一个新房间，并通过命名管道 IPC 在运行中的 VRChat 客户端内打开指定世界
- *       （游戏内弹出确认菜单，不会新开 VRChat 进程）
+ * 功能：创建一个新房间，并在运行中的 VRChat 客户端内打开指定世界
+ *      （游戏内弹出确认菜单，不会新开 VRChat 进程）
  * 用法：
  *   node open-world.mjs wrld_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
  *   node open-world.mjs "地图名字"          # 支持按名字搜（API 搜索，优先精确匹配）
  *   node open-world.mjs --instance <完整location>   # 直接加入指定实例（弹世界房间菜单）
  *
- * 原理（与 VRCX 的「创建房间并在 VRChat 内打开」一致）：
+ * 原理（探测式本机增强，core/vrchat-launch.js 统一入口）：
  *   1. 调 VRChat API 为指定世界创建新实例 -> 拿到 location + shortName
- *   2. 通过命名管道 \\.\pipe\VRChatURLLaunchPipe 发送
+ *   2. 探测本机 VRChat 命名管道 \\.\pipe\VRChatURLLaunchPipe：存在则管道直发
  *      vrchat://launch?ref=vrcx.app&id=<完整location>&shortName=<sn>
- *      （VRChat 运行中收到后游戏内弹确认菜单；VRChat 未运行则管道不存在，脚本退出）
- *   3. 若 API 创建实例失败，回退为直接 launch（默认公开实例，无 shortName）
+ *      （游戏内弹确认菜单，一步直达，不新开进程）
+ *   3. 管道探测失败（VRChat 未运行）→ 静默回退 API 邀请自己传送
+ *      （POST /invite/myself/to/{worldId}:{instanceId}，客户端收到邀请通知）
  *
- * 注意：仅适用于 Windows + VRChat 客户端在本机运行的环境。
+ * 注意：管道增强仅 Windows；API 邀请回退全平台可用。
  */
 import { VrchatApiClient } from './vrchat-api.js';
+import { openInstance } from './core/vrchat-launch.js';
 import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -98,44 +100,20 @@ try {
 // ── 模式分发：--instance 直接发 URL（跳过世界解析与建房间）──
 // 注：--user 模式已废弃（VRChat 官方无 vrchat://user 协议，无法弹用户主页）
 if (INSTANCE_MODE) {
-  let launchUrl;
-  let display;
   // 直接加入指定实例（弹世界房间菜单，不新建房间）
-  launchUrl = `vrchat://launch?ref=vrcx.app&id=${target}`;
-  display = target;
+  // 统一入口：本机管道直发 → 探测失败静默回退 API 邀请
   console.error(`[instance] 直接加入实例: ${target}`);
-
-  console.error(`[launch] ${launchUrl}`);
   try {
-    // 命名管道 IPC 直发（与下方主流程相同协议）
-    const pipePath = '\\\\.\\pipe\\VRChatURLLaunchPipe';
-    const net = await import('node:net');
-    const result = await new Promise((resolve, reject) => {
-      const client = net.createConnection(pipePath);
-      const timer = setTimeout(() => { client.destroy(); reject(new Error('IPC 连接超时（VRChat 未运行或未监听管道）')); }, 1500);
-      client.on('connect', () => {
-        client.write(Buffer.from(launchUrl, 'utf-8'));
-      });
-      client.on('data', (buf) => {
-        clearTimeout(timer);
-        client.end();
-        resolve(buf[0] === 1);
-      });
-      client.on('error', (err) => {
-        clearTimeout(timer);
-        reject(err);
-      });
-    });
-
-    if (result) {
-      console.error('[launch] ✅ 已通过 IPC 发送到运行中的 VRChat（游戏内应弹出对应菜单）');
-      console.log(JSON.stringify({ ok: true, via: 'vrcipc', mode: 'instance', target, display, url: launchUrl }));
+    const res = await openInstance({ location: target, api });
+    if (res.success) {
+      console.error(`[launch] ✅ ${res.detail}`);
+      console.log(JSON.stringify({ ok: true, via: res.method, mode: 'instance', target, display: target, notificationId: res.notificationId || null }));
     } else {
-      throw new Error('VRChat IPC 返回失败');
+      throw new Error(res.error || '打开失败');
     }
   } catch (e) {
-    console.error(`❌ IPC 打开失败: ${e.message}`);
-    console.log(JSON.stringify({ ok: false, error: e.message, url: launchUrl }));
+    console.error(`❌ 打开失败: ${e.message}`);
+    console.log(JSON.stringify({ ok: false, error: e.message, url: target }));
     process.exit(1);
   }
   process.exit(0);
@@ -208,48 +186,19 @@ try {
 }
 
 // ── 2. 打开 VRChat ──
-// VRCX 源码（src/stores/launch.js）: id 参数是完整 location（含实例号），
-// 如 wrld_xxx:01277~region(jp)，不是 worldId！只有带实例号 VRChat 才能定位房间
-const launchUrl = instanceLocation
-  ? (shortName
-      ? `vrchat://launch?ref=vrcx.app&id=${instanceLocation}&shortName=${encodeURIComponent(shortName)}`
-      : `vrchat://launch?ref=vrcx.app&id=${instanceLocation}`)
-  : `vrchat://launch?ref=vrcx.app&id=${worldId}`;
-
-console.error(`[launch] ${launchUrl}`);
-try {
-  // 通过 VRChat 命名管道 IPC 直发（VRCX VRCIPC 同款协议）：
-  //   管道: \\.\pipe\VRChatURLLaunchPipe
-  //   协议: 写 UTF-8 URL -> 读 1 字节响应 (1=成功)
-  // VRChat 运行时监听此管道，收到 URL 在游戏内弹确认菜单（不会新开进程）
-  const pipePath = '\\\\.\\pipe\\VRChatURLLaunchPipe';
-  const net = await import('node:net');
-  const result = await new Promise((resolve, reject) => {
-    const client = net.createConnection(pipePath);
-    const timer = setTimeout(() => { client.destroy(); reject(new Error('IPC 连接超时（VRChat 未运行或未监听管道）')); }, 1500);
-    client.on('connect', () => {
-      client.write(Buffer.from(launchUrl, 'utf-8'));
-    });
-    client.on('data', (buf) => {
-      clearTimeout(timer);
-      client.end();
-      resolve(buf[0] === 1);
-    });
-    client.on('error', (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
-  });
-
-  if (result) {
-    console.error('[launch] ✅ 已通过 IPC 发送到运行中的 VRChat（游戏内应弹出确认菜单）');
-    console.log(JSON.stringify({ ok: true, via: 'vrcipc', worldId, worldName, instance: instanceLocation, url: launchUrl }));
-  } else {
-    console.error('[launch] ⚠️ IPC 返回失败，尝试 Steam 启动回退');
-    throw new Error('VRChat IPC 返回失败');
-  }
-} catch (e) {
-  console.error(`❌ IPC 打开失败: ${e.message}`);
-  console.log(JSON.stringify({ ok: false, error: e.message, url: launchUrl }));
+// 统一入口（core/vrchat-launch.js）：本机管道直发（一步直达）→ 探测失败静默回退 API 邀请
+// 注意：id 必须是完整 location（含实例号），裸 worldId 游戏内无反应（实测）
+if (!instanceLocation) {
+  console.error('❌ 创建实例失败且无可用 location，无法打开（裸 worldId 实测无效）');
+  console.log(JSON.stringify({ ok: false, error: 'instance creation failed', worldId }));
+  process.exit(1);
+}
+const res = await openInstance({ location: instanceLocation, shortName, api });
+if (res.success) {
+  console.error(`[launch] ✅ ${res.detail}`);
+  console.log(JSON.stringify({ ok: true, via: res.method, worldId, worldName, instance: instanceLocation, notificationId: res.notificationId || null }));
+} else {
+  console.error(`❌ 打开失败: ${res.error}`);
+  console.log(JSON.stringify({ ok: false, error: res.error, worldId }));
   process.exit(1);
 }
