@@ -7,6 +7,8 @@
  * 用法：
  *   node open-world.mjs wrld_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
  *   node open-world.mjs "地图名字"          # 支持按名字搜（API 搜索，优先精确匹配）
+ *   node open-world.mjs --user usr_xxx     # 打开用户个人主页菜单（从主页点加入）
+ *   node open-world.mjs --instance <完整location>   # 直接加入指定实例（弹世界房间菜单）
  *
  * 原理（与 VRCX 的「创建房间并在 VRChat 内打开」一致）：
  *   1. 调 VRChat API 为指定世界创建新实例 -> 拿到 location + shortName
@@ -41,12 +43,25 @@ async function fetchOtp() {
   return execSync(cmd, { timeout: 15000, encoding: 'utf-8' }).trim();
 }
 
-// ── 解析参数：worldId / 地图名 / 主题词（开个XX的图）──
+// ── 解析参数：worldId / 地图名 / 主题词（开个XX的图）/ --user / --instance ──
+const USER_MODE = process.argv.includes('--user');
+const INSTANCE_MODE = process.argv.includes('--instance');
 let target = process.argv[2];
 if (!target) {
   console.error('用法: node open-world.mjs <worldId 或 地图名 或 主题词>');
+  console.error('      node open-world.mjs --user <usr_xxx>    # 打开用户个人主页');
+  console.error('      node open-world.mjs --instance <完整location>  # 加入指定实例');
   console.error('主题词: 夏天 海 雪 恐怖 太空 森林自然 游戏 音乐 社交 放松 夜晚星空');
   process.exit(1);
+}
+// 模式定位：--user/--instance 后面跟的值
+if (USER_MODE || INSTANCE_MODE) {
+  const idx = process.argv.indexOf(USER_MODE ? '--user' : '--instance');
+  target = process.argv[idx + 1];
+  if (!target) {
+    console.error(`❌ ${USER_MODE ? '--user' : '--instance'} 缺少参数`);
+    process.exit(1);
+  }
 }
 
 // 主题词识别：如果参数是主题（或其关键词），用 world-themes.mjs 随机抽一个未逛的
@@ -81,6 +96,68 @@ try {
 } catch (e) {
   console.error('[auth] 失败:', e.message);
   process.exit(1);
+}
+
+// ── 模式分发：--user / --instance 直接发 URL（跳过世界解析与建房间）──
+if (USER_MODE || INSTANCE_MODE) {
+  let launchUrl;
+  let display;
+  if (USER_MODE) {
+    // 打开用户个人主页：vrchat://user/usr_xxx（VRChat 客户端弹用户主页，可点「加入」）
+    if (!/^usr_/.test(target)) {
+      // 支持名字 -> 先解析成 userId
+      try {
+        const r = await api._request('GET', `/users?search=${encodeURIComponent(target)}&n=5`);
+        if (r.status === 200 && Array.isArray(r.data) && r.data.length) {
+          target = r.data[0].id;
+          display = r.data[0].displayName;
+        }
+      } catch (e) { /* fallthrough */ }
+    }
+    launchUrl = `vrchat://user/${target}`;
+    display = display || target;
+    console.error(`[user] 打开个人主页: ${display} (${target})`);
+  } else {
+    // 直接加入指定实例（弹世界房间菜单，不新建房间）
+    launchUrl = `vrchat://launch?ref=vrcx.app&id=${target}`;
+    display = target;
+    console.error(`[instance] 直接加入实例: ${target}`);
+  }
+
+  console.error(`[launch] ${launchUrl}`);
+  try {
+    // 命名管道 IPC 直发（与下方主流程相同协议）
+    const pipePath = '\\\\.\\pipe\\VRChatURLLaunchPipe';
+    const net = await import('node:net');
+    const result = await new Promise((resolve, reject) => {
+      const client = net.createConnection(pipePath);
+      const timer = setTimeout(() => { client.destroy(); reject(new Error('IPC 连接超时（VRChat 未运行或未监听管道）')); }, 1500);
+      client.on('connect', () => {
+        client.write(Buffer.from(launchUrl, 'utf-8'));
+      });
+      client.on('data', (buf) => {
+        clearTimeout(timer);
+        client.end();
+        resolve(buf[0] === 1);
+      });
+      client.on('error', (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+
+    if (result) {
+      console.error('[launch] ✅ 已通过 IPC 发送到运行中的 VRChat（游戏内应弹出对应菜单）');
+      console.log(JSON.stringify({ ok: true, via: 'vrcipc', mode: USER_MODE ? 'user' : 'instance', target, display, url: launchUrl }));
+    } else {
+      throw new Error('VRChat IPC 返回失败');
+    }
+  } catch (e) {
+    console.error(`❌ IPC 打开失败: ${e.message}`);
+    console.log(JSON.stringify({ ok: false, error: e.message, url: launchUrl }));
+    process.exit(1);
+  }
+  process.exit(0);
 }
 
 // ── 解析世界 ID（支持名字）──
