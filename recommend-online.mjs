@@ -5,7 +5,7 @@
  * 推荐算法（综合关系深浅 + 房间场景 + 实例可加入性）：
  * 1. 数据源：全部在线好友（get_online_friends），private 实例自动排除
  * 2. 关系深浅（可配置，见下方环境变量）：
- *    - 默认：所有收藏夹分组统一 +5 弱加分（不区分亲密度，通用行为）
+ *    - 默认：所有收藏夹分组统一 +5 弱加分（不区分熟悉度，通用行为）
  *    - 可用 VRC_MONITOR_GROUP_WEIGHTS 自定义各分组权重：
  *        VRC_MONITOR_GROUP_WEIGHTS='{"join":20,"new":5,"活动店员":-40}'
  *    - 可用 VRC_MONITOR_CONTACT_GROUPS 指定「联系人分组」（不算好友，降权+标注）：
@@ -22,9 +22,11 @@
 import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import Database from 'better-sqlite3';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BASE = 'http://127.0.0.1:8799/mcp';
+const NOW = Date.now();  // 脚本启动时间（熟悉度窗口统一基准，保证缓存命中）
 
 // 读取本地 .env（若存在）——仅加载 VRC_MONITOR_* 变量，避免覆盖已有环境变量
 // .env 被 .gitignore 忽略，个人配置不上传 GitHub
@@ -55,11 +57,67 @@ async function mcp(name, args, sid) {
   return JSON.parse(d.result.content[0].text);
 }
 
-// ── 1. 收藏夹分组 -> 成员映射（关系深浅信号，可配置）──
+// ── 2. 熟悉度：基于 events 表的共玩统计（近期30天 + 历史一年）──
+// 比收藏夹分组更真实：直接统计与好友共玩次数/天数
+const db = new Database(path.join(__dirname, 'vrc-monitor.sqlite3'), { readonly: true, timeout: 10000 });
+const sleepWorlds = new Set(db.prepare('SELECT world_id FROM new_worlds WHERE sleep_ok=1').all().map(r => r.world_id));
+
+// 当前用户（从服务 health 拿，或环境变量；默认读库里的 user-location 事件归属）
+let SELF_ID = '';
+try {
+  const h = await fetch('http://127.0.0.1:8799/health').then(r => r.json());
+  SELF_ID = h.auth?.user?.id || '';
+} catch { /* ignore */ }
+if (!SELF_ID) {
+  const row = db.prepare("SELECT DISTINCT user_id FROM events WHERE type='user-location' LIMIT 1").get();
+  SELF_ID = row?.user_id || '';
+}
+
+// 熟悉度评分：基于 MCP 现成的 get_companions（同屏交叉统计）——近期30天 + 历史一年
+// 复用服务端已实现的 findCompanions（SQL 交叉引用），避免重复造轮子
+// 每个窗口只调一次 get_companions 拿全部同屏好友，缓存供后续好友复用
+const companionCache = new Map(); // `${startMs}|${endMs}` -> Map(userId -> matchCount)
+
+async function getCompanionsMap(startMs, endMs) {
+  const cacheKey = `${startMs}|${endMs}`;
+  if (companionCache.has(cacheKey)) return companionCache.get(cacheKey);
+
+  const r = await mcp('get_companions', {
+    startTime: new Date(startMs).toISOString(),
+    endTime: new Date(endMs).toISOString(),
+  }, 'rec-v2-comp');
+  const map = new Map();
+  if (!r.__error__ && Array.isArray(r.companions)) {
+    for (const c of r.companions) {
+      map.set(c.userId, { matchCount: c.matchCount || 0, firstSeen: c.firstSeen || '' });
+    }
+  }
+  companionCache.set(cacheKey, map);
+  return map;
+}
+
+async function familiarityScore(userId) {
+  const DAY = 86400000;
+  const now = NOW;  // 脚本启动时取一次（保证缓存 key 一致）
+  const recentMap = await getCompanionsMap(now - 30 * DAY, now);
+  const histMap = await getCompanionsMap(now - 365 * DAY, now);
+  const recent = recentMap.get(userId) || { matchCount: 0 };
+  const hist = histMap.get(userId) || { matchCount: 0 };
+  // 近期：每次共玩 +2，出现即 +10（30天封顶 60 分）
+  const recentScore = Math.min(recent.matchCount * 2, 60) + (recent.matchCount > 0 ? 10 : 0);
+  // 历史：每次共玩 +0.5（一年封顶 30 分），衰减系数 0.6
+  const histScore = Math.min(hist.matchCount * 0.5, 30) * 0.6;
+  return {
+    score: Math.round(recentScore + histScore),
+    recentMatchCount: recent.matchCount,
+    recentDays: recent.matchCount > 0 ? 1 : 0, // get_companions 不返回天数，用出现标记
+    histMatchCount: hist.matchCount,
+    histDays: hist.matchCount > 0 ? 1 : 0,
+  };
+}
+
+// 收藏夹分组权重（环境变量配置，见 .env；默认统一 +5）
 const groupMap = new Map(); // groupName -> { ids: Set, weight, contact }
-// 环境变量配置（个人化权重/联系人分组，不硬编码到仓库）
-//   VRC_MONITOR_GROUP_WEIGHTS: JSON，分组名->权重，如 {"join":20,"new":5,"活动店员":-40}
-//   VRC_MONITOR_CONTACT_GROUPS: 逗号分隔的联系人分组名，如 "活动店员"
 let groupWeights = {};
 let contactGroups = new Set();
 try {
@@ -71,25 +129,19 @@ if (process.env.VRC_MONITOR_CONTACT_GROUPS) {
   contactGroups = new Set(process.env.VRC_MONITOR_CONTACT_GROUPS.split(',').map(s => s.trim()).filter(Boolean));
 }
 
+// 收藏夹分组成员映射（补充信号；权重默认 +5，contact 默认 -40）
 const ov = await mcp('get_favorite_friends_locations', {}, 'rec-v2-ov');
 for (const g of ov.groups || []) {
   const r = await mcp('get_favorite_friends_locations', { groupName: g.groupName }, 'rec-v2-g');
   const ids = new Set();
   for (const f of (r.friends || [])) ids.add(f.userId);
   for (const f of (r.offline || [])) ids.add(f.userId);
-  // 权重：配置了用配置值；否则默认 +5（弱加分，通用行为）；contact 分组默认 -40
   const isContact = contactGroups.has(g.groupName);
   const weight = groupWeights[g.groupName] !== undefined
     ? groupWeights[g.groupName]
     : (isContact ? -40 : 5);
   groupMap.set(g.groupName, { ids, weight, contact: isContact, desc: g.groupName });
 }
-
-// ── 2. 睡觉图名单 ──
-const Database = (await import('better-sqlite3')).default;
-const db = new Database(path.join(__dirname, 'vrc-monitor.sqlite3'), { readonly: true, timeout: 10000 });
-const sleepWorlds = new Set(db.prepare('SELECT world_id FROM new_worlds WHERE sleep_ok=1').all().map(r => r.world_id));
-db.close();
 
 // ── 3. 在线好友 ──
 const online = await mcp('get_online_friends', {}, 'rec-v2-online');
@@ -173,9 +225,21 @@ for (const f of online.friends || []) {
   let score = 0;
   const reasons = [];
 
-  // 关系深浅
-  if (isContact) { score -= 40; reasons.push('活动联系人-40'); }
-  else if (groupName) { score += groupWeight; reasons.push(`[${groupName}]+${groupWeight}`); }
+  // 关系深浅：熟悉度（基于实际交往数据）为主 + 收藏夹分组为辅
+  const familiarity = await familiarityScore(f.userId);
+  entry.familiarity = familiarity;
+  if (isContact) {
+    score -= 40; reasons.push('活动联系人-40');
+  } else {
+    // 熟悉度分：近期共玩次数/天数 + 历史共玩（封顶 100）
+    score += Math.min(familiarity.score, 100);
+    reasons.push(`熟悉度${familiarity.score}(30天${familiarity.recentMatchCount}次/${familiarity.recentDays}天)`);
+    // 收藏夹分组补充（权重小，避免与熟悉度重复计分）
+    if (groupName && !isContact) {
+      const bonus = Math.min(groupWeight, 10); // 收藏夹最多 +10
+      if (bonus !== 0) { score += bonus; reasons.push(`[${groupName}]+${bonus}`); }
+    }
+  }
 
   // 房间场景（电灯泡/睡觉风险）
   const users = entry.instanceUsers;

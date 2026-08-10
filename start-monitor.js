@@ -691,6 +691,17 @@ const CUSTOM_TOOLS = [
       },
     },
   },
+  {
+    name: 'recommend_join',
+    description: '[query·推荐加入] 查看全部在线好友在做什么，按推荐度排序给出可加入的推荐。综合评分：熟悉度（最近30天+历史一年共玩次数，来自本地 events 同屏统计）+ 收藏夹分组权重（可配置）+ 房间场景（睡觉图人少=电灯泡风险降权）+ 实例人数/容量比 + 实例类型（public/friends/friend+/group 可加入，private 排除）。返回 TopN 推荐及理由。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', default: 10, description: '返回数量（默认 10）' },
+        minScore: { type: 'number', default: 0, description: '最低推荐分过滤（默认 0，负分=电灯泡/联系人风险）' },
+      },
+    },
+  },
 ];
 
 // ── 工具处理器 ──
@@ -1040,6 +1051,180 @@ async function handleGetFavoriteFriendsLocations({ groupName, favoriteGroupId, s
     excludedPrivate: onlineCount - joinableCount,
     friends: detailed,
     offline: members.filter(m => !m.online).map(m => ({ userId: m.userId })),
+  };
+}
+
+async function handleRecommendJoin({ limit = 10, minScore = 0 } = {}) {
+  // 1. 全部在线好友
+  const onlineR = await rateLimiter.execute(() => api._request('GET', '/auth/user/friends?offline=false'));
+  if (onlineR.status !== 200) throw new Error(`API error: ${onlineR.status}`);
+  const onlineFriends = Array.isArray(onlineR.data) ? onlineR.data : [];
+
+  // 2. 收藏夹分组（熟悉度补充信号，权重可配置）
+  const groupWeights = {};
+  const contactGroups = new Set();
+  try {
+    if (process.env.VRC_MONITOR_GROUP_WEIGHTS) groupWeights = JSON.parse(process.env.VRC_MONITOR_GROUP_WEIGHTS);
+  } catch (e) {}
+  if (process.env.VRC_MONITOR_CONTACT_GROUPS) {
+    for (const g of process.env.VRC_MONITOR_CONTACT_GROUPS.split(',')) contactGroups.add(g.trim());
+  }
+  const groupMap = new Map();
+  try {
+    const groupsR = await rateLimiter.execute(() => api._request('GET', '/favorite/groups?type=friend&n=100'));
+    const favsR = await rateLimiter.execute(() => api._request('GET', '/favorites?type=friend&n=100'));
+    const groups = (groupsR.status === 200 && Array.isArray(groupsR.data)) ? groupsR.data : [];
+    const favs = (favsR.status === 200 && Array.isArray(favsR.data)) ? favsR.data : [];
+    for (const g of groups) {
+      const isContact = contactGroups.has(g.displayName || g.name);
+      const weight = groupWeights[g.displayName || g.name] !== undefined ? groupWeights[g.displayName || g.name] : (isContact ? -40 : 5);
+      const memberIds = new Set(favs.filter(f => (f.tags || [])[0] === g.name).map(f => f.favoriteId));
+      groupMap.set(g.displayName || g.name, { memberIds, weight, isContact });
+    }
+  } catch (e) { /* 收藏夹失败不阻断 */ }
+
+  // 3. 熟悉度：同屏统计（现成 storage.findCompanions，30天 + 一年各一次，缓存）
+  const SELF = api.currentUser?.id || (await api._request('GET', '/auth/user')).data?.id || '';
+  const NOW_MS = Date.now();
+  const DAY = 86400000;
+  const companionsCache = {};
+  async function getCompanionsMap(startMs, endMs) {
+    const key = `${startMs}|${endMs}`;
+    if (companionsCache[key]) return companionsCache[key];
+    const r = storage.findCompanions(SELF, new Date(startMs).toISOString(), new Date(endMs).toISOString());
+    const map = new Map((r.companions || []).map(c => [c.userId, c.matchCount || 0]));
+    companionsCache[key] = map;
+    return map;
+  }
+  async function familiarityScore(userId) {
+    const recentMap = await getCompanionsMap(NOW_MS - 30 * DAY, NOW_MS);
+    const histMap = await getCompanionsMap(NOW_MS - 365 * DAY, NOW_MS);
+    const recent = recentMap.get(userId) || 0;
+    const hist = histMap.get(userId) || 0;
+    const recentScore = Math.min(recent * 2, 60) + (recent > 0 ? 10 : 0);
+    const histScore = Math.min(hist * 0.5, 30) * 0.6;
+    return { score: Math.round(recentScore + histScore), recentMatchCount: recent, histMatchCount: hist };
+  }
+
+  // 4. 逐个好友：世界名 + 实例 + 熟悉度 + 综合评分
+  const worldCache = new Map();
+  const instanceInfo = new Map();
+  const sleepWorlds = new Set();
+  try {
+    const sw = storage._query ? storage._query('SELECT world_id FROM new_worlds WHERE sleep_ok=1') : [];
+    for (const r of sw) sleepWorlds.add(r.world_id);
+  } catch (e) {}
+
+  const detailed = [];
+  for (const f of onlineFriends) {
+    const loc = parseLocation(f.location || 'private');
+    if (!loc || loc.type === 'private' || loc.type === 'traveling' ||
+        f.location === 'private' || f.location === 'offline' || f.location === 'traveling') continue;
+
+    // 世界名
+    let worldName = f.worldId || loc.worldId || '';
+    if (loc.worldId) {
+      if (worldCache.has(loc.worldId)) worldName = worldCache.get(loc.worldId);
+      else {
+        const cached = storage.getWorldName(loc.worldId);
+        if (cached && cached.name) worldName = cached.name;
+        else {
+          const r = await rateLimiter.execute(() => api._request('GET', `/worlds/${loc.worldId}`));
+          if (r.status === 200 && r.data && r.data.name) {
+            worldName = r.data.name;
+            try { storage.upsertWorld({ worldId: loc.worldId, name: r.data.name, authorId: r.data.authorId || '', authorName: r.data.authorName || '' }); } catch (e) {}
+          }
+        }
+        worldCache.set(loc.worldId, worldName);
+      }
+    }
+
+    // 实例详情
+    let instanceUsers, instanceCapacity, fillRatio;
+    if (loc.instanceId && f.location && !f.location.includes('~private')) {
+      const instKey = f.location;
+      if (!instanceInfo.has(instKey)) {
+        try {
+          const r = await rateLimiter.execute(() => api._request('GET', `/instances/${instKey}`));
+          if (r.status === 200 && r.data) instanceInfo.set(instKey, { nUsers: r.data.n_users || 0, capacity: r.data.capacity || 0 });
+          else instanceInfo.set(instKey, null);
+        } catch (e) { instanceInfo.set(instKey, null); }
+      }
+      const inst = instanceInfo.get(instKey);
+      if (inst) {
+        instanceUsers = inst.nUsers;
+        instanceCapacity = inst.capacity;
+        fillRatio = inst.capacity > 0 ? +(inst.nUsers / inst.capacity).toFixed(2) : 0;
+      }
+    }
+
+    // 收藏夹分组
+    let groupName = null, groupWeight = 0, isContact = false;
+    for (const [gn, info] of groupMap) {
+      if (info.memberIds.has(f.id)) {
+        groupName = gn; groupWeight = info.weight; isContact = info.isContact;
+        break;
+      }
+    }
+
+    // 熟悉度
+    const fam = await familiarityScore(f.id);
+
+    // 综合评分
+    let score = 0;
+    const reasons = [];
+    if (isContact) { score -= 40; reasons.push('活动联系人-40'); }
+    else {
+      score += Math.min(fam.score, 100);
+      reasons.push(`熟悉度${fam.score}(30天${fam.recentMatchCount}次)`);
+      if (groupName) {
+        const bonus = Math.min(groupWeight, 10);
+        if (bonus !== 0) { score += bonus; reasons.push(`[${groupName}]+${bonus}`); }
+      }
+    }
+    const isSleepWorld = loc.worldId && sleepWorlds.has(loc.worldId);
+    if (isSleepWorld && instanceUsers !== undefined) {
+      if (instanceUsers < 5) { score -= 60; reasons.push(`💤睡觉图仅${instanceUsers}人-60`); }
+      else { score -= 20; reasons.push(`💤睡觉聚会${instanceUsers}人-20`); }
+    } else if (!isSleepWorld && instanceUsers !== undefined && instanceUsers < 3 && instanceUsers > 0) {
+      score -= 15; reasons.push(`人少${instanceUsers}人可能私聊-15`);
+    }
+    if (instanceUsers !== undefined) {
+      if (fillRatio >= 0.3 && fillRatio <= 0.8) { score += 50; reasons.push(`黄金区${Math.round(fillRatio*100)}%+50`); }
+      else if (fillRatio > 0.9) { score -= 40; reasons.push(`爆满-40`); }
+      else if (fillRatio < 0.1) { score -= 10; reasons.push(`冷清-10`); }
+      score += instanceUsers * 3; reasons.push(`人数${instanceUsers}`);
+    }
+    if (loc.type === 'public') { score += 20; reasons.push('public+20'); }
+    else if (loc.type === 'friends' || loc.type === 'hidden') { score += 10; reasons.push(loc.type === 'hidden' ? 'friend++10' : 'friends+10'); }
+    else if (loc.type === 'group') { score += 5; reasons.push('group+5'); }
+    if (f.status === 'active') { score += 10; reasons.push('active+10'); }
+
+    detailed.push({
+      userId: f.id,
+      displayName: f.displayName,
+      worldId: loc.worldId,
+      worldName,
+      instanceType: loc.type,
+      instanceTypeDisplay: loc.type === 'hidden' ? 'friend+' : loc.type,
+      instanceUsers, instanceCapacity, fillRatio,
+      region: loc.region || '',
+      status: f.status,
+      isSleepWorld,
+      familiarity: fam,
+      relation: { group: groupName, isContact, note: isContact ? '活动联系人(非好友)' : (groupName ? `收藏夹[${groupName}]` : '普通好友') },
+      recommendScore: Math.round(score),
+      reasons,
+    });
+  }
+
+  detailed.sort((a, b) => (b.recommendScore || 0) - (a.recommendScore || 0));
+  const filtered = minScore > 0 ? detailed.filter(d => d.recommendScore >= minScore) : detailed;
+  return {
+    totalOnline: onlineFriends.length,
+    joinable: detailed.length,
+    top: filtered.slice(0, limit),
+    method: 'familiarity+group+scene+instance',
   };
 }
 
@@ -2394,6 +2579,9 @@ async function handleRpc(rpc, session, res) {
             break;
           case 'get_favorite_friends_locations':
             result = await handleGetFavoriteFriendsLocations(args);
+            break;
+          case 'recommend_join':
+            result = await handleRecommendJoin(args);
             break;
           default:
             throw new Error(`Unknown tool: ${name}`);
