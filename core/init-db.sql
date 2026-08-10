@@ -117,6 +117,7 @@ CREATE TABLE IF NOT EXISTS new_worlds (
 );
 CREATE INDEX IF NOT EXISTS idx_new_worlds_visited ON new_worlds(visited);
 
+
 -- 推荐选择学习（recommend_join 用户选择记录，个性化权重学习的数据源）
 -- 每次用户从推荐列表选择某人/某图记录一条快照，含当时列表基线用于对比分析
 CREATE TABLE IF NOT EXISTS join_choices (
