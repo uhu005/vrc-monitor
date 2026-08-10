@@ -669,7 +669,7 @@ const CUSTOM_TOOLS = [
   },
   {
     name: 'peek_group_announcement',
-    description: '[group] Peek a group announcement: joins if joinState=open, reads announcement, then leaves. Requires confirm: true. Non-open groups return peekable:false.',
+    description: '[group] Peek a group announcement: joins if joinState=open, reads announcement, then leaves. Non-open groups return peekable:false.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -677,6 +677,17 @@ const CUSTOM_TOOLS = [
         confirm: { type: 'boolean', description: 'Must be true to auto-join (members see the join feed)' },
       },
       required: ['groupId'],
+    },
+  },
+  {
+    name: 'get_favorite_friends_locations',
+    description: '[query·好友收藏] 列出某个好友收藏夹（线上收藏分组）内所有好友的当前位置列表。可指定 groupName（如"new"、"活动店员"、"join"）或 favoriteGroupId；不指定则列出全部分组。返回按推荐度排序：在线且实例可加入的在前（public/friends 实例），private 实例自动排除，按实例内玩家数/容量比 + 收藏热度综合评分。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        groupName: { type: 'string', description: '收藏夹名（displayName），如 "new"/"活动店员"/"join"。不填则返回全部分组概览' },
+        favoriteGroupId: { type: 'string', description: '收藏分组 id（fvgrp_...），与 groupName 二选一' },
+      },
     },
   },
 ];
@@ -735,6 +746,202 @@ async function handleGetOnlineFriends() {
       nickname: nicknameMap.get(f.id) || null,
       locationParsed: parseLocation(f.location || 'private'),
     })),
+  };
+}
+
+/**
+ * 好友收藏夹位置列表
+ * 1. 拉取全部好友收藏分组（/favorite/groups?type=friend）
+ * 2. 指定分组：拉组内好友（/favorites?type=friend&groupId=xxx），逐个查 /users/{id} 拿在线状态与位置
+ * 3. 推荐度排序：在线 + 实例可加入（public/friends/group，排除 private）在前，
+ *    按实例玩家数/容量比 + 好友收藏热度综合评分
+ */
+async function handleGetFavoriteFriendsLocations({ groupName, favoriteGroupId }) {
+  const nicknames = storage.getNicknames({});
+  const nicknameMap = new Map();
+  for (const item of nicknames) {
+    if (item.userId) nicknameMap.set(item.userId, item.nickname);
+  }
+
+  // 1. 全部好友收藏分组
+  const groupsR = await rateLimiter.execute(() => api._request('GET', '/favorite/groups?type=friend&n=100'));
+  if (groupsR.status !== 200) throw new Error(`API error: ${groupsR.status}`);
+  const groups = Array.isArray(groupsR.data) ? groupsR.data : [];
+
+  if (!groupName && !favoriteGroupId) {
+    // 概览模式：返回全部分组 + 成员数（用分组的 name=group_N 匹配 tags）
+    const favsAllR = await rateLimiter.execute(() => api._request('GET', '/favorites?type=friend&n=100'));
+    const favsAll = (favsAllR.status === 200 && Array.isArray(favsAllR.data)) ? favsAllR.data : [];
+    // 按 tags[0]（group_N）分组统计
+    const byGroupTag = new Map();
+    for (const f of favsAll) {
+      const tag = (f.tags || [])[0] || '';
+      byGroupTag.set(tag, (byGroupTag.get(tag) || 0) + 1);
+    }
+    const overview = groups.map(g => ({
+      groupId: g.id,
+      groupName: g.displayName || g.id,
+      groupTag: g.name || '',
+      memberCount: byGroupTag.get(g.name) || 0,
+    }));
+    return { mode: 'overview', groups: overview };
+  }
+
+  // 2. 定位分组
+  let group = null;
+  if (favoriteGroupId) {
+    group = groups.find(g => g.id === favoriteGroupId) || null;
+  } else if (groupName) {
+    group = groups.find(g => (g.displayName || '') === groupName) ||
+            groups.find(g => (g.displayName || '').toLowerCase() === groupName.toLowerCase()) || null;
+  }
+  if (!group) {
+    const available = groups.map(g => g.displayName || g.id);
+    throw new Error(`找不到收藏夹「${groupName || favoriteGroupId}」。可用分组: ${available.join(' / ')}`);
+  }
+
+  // 3. 组内好友：API 的 groupId 参数被忽略（永远返回全部），改用分组的 name=group_N 匹配 tags[0]
+  const groupTag = group.name || '';
+  const favsR = await rateLimiter.execute(() => api._request('GET', '/favorites?type=friend&n=100'));
+  if (favsR.status !== 200) throw new Error(`API error: ${favsR.status}`);
+  const allFavs = Array.isArray(favsR.data) ? favsR.data : [];
+  const favs = groupTag
+    ? allFavs.filter(f => (f.tags || [])[0] === groupTag)
+    : allFavs;
+
+  // 4. 逐个查好友位置（复用在线好友列表更快：一次请求拿到全部在线好友位置）
+  //    先用 /auth/user/friends?offline=false 拿在线好友，再对组内好友查详情
+  const onlineR = await rateLimiter.execute(() => api._request('GET', '/auth/user/friends?offline=false'));
+  const onlineFriends = (onlineR.status === 200 && Array.isArray(onlineR.data)) ? onlineR.data : [];
+  const onlineMap = new Map(onlineFriends.map(f => [f.id, f]));
+
+  // 组内每个好友：在线直接取位置；离线标记
+  const members = [];
+  const onlineIds = [];
+  for (const f of favs) {
+    const uid = f.favoriteId;
+    const online = onlineMap.get(uid);
+    if (online) {
+      members.push({ favoriteId: f.id, userId: uid, displayName: online.displayName, online: true, location: online.location || 'private', status: online.status, platform: online.platform, avatarImageUrl: online.currentAvatarThumbnailImageUrl });
+      onlineIds.push(uid);
+    } else {
+      members.push({ favoriteId: f.id, userId: uid, displayName: null, online: false });
+    }
+  }
+
+  // 5. 在线好友：补世界名 + 实例信息（玩家数/容量/类型），算推荐度
+  //    位置解析 + 世界名缓存；实例详情批量查（限流）
+  const worldCache = new Map();
+  const instanceInfo = new Map();
+
+  async function getWorldNameSafe(worldId) {
+    if (worldCache.has(worldId)) return worldCache.get(worldId);
+    let name = worldId;
+    const cached = storage.getWorldName(worldId);
+    if (cached && cached.name) {
+      name = cached.name;
+    } else {
+      const r = await rateLimiter.execute(() => api._request('GET', `/worlds/${worldId}`));
+      if (r.status === 200 && r.data && r.data.name) {
+        name = r.data.name;
+        try { storage.upsertWorld({ worldId, name, authorId: r.data.authorId || '', authorName: r.data.authorName || '' }); } catch (e) {}
+      }
+    }
+    worldCache.set(worldId, name);
+    return name;
+  }
+
+  const detailed = [];
+  for (const m of members) {
+    if (!m.online) continue;
+    const loc = parseLocation(m.location || 'private');
+    // private/hidden 实例自动排除（进不去：private=仅自己，hidden=仅被邀请者）
+    if (!loc || loc.type === 'private' || loc.type === 'hidden' ||
+        m.location === 'private' || m.location === 'offline' || m.location === 'traveling') {
+      continue;
+    }
+    // traveling 也跳过（不在具体世界）
+    if (loc.type === 'traveling') continue;
+
+    const worldName = await getWorldNameSafe(loc.worldId);
+    const entry = {
+      userId: m.userId,
+      displayName: m.displayName,
+      location: m.location,
+      worldId: loc.worldId,
+      worldName,
+      instanceType: loc.type,
+      instanceId: loc.instanceId || '',
+      region: loc.region || '',
+      status: m.status,
+      platform: m.platform,
+      nickname: nicknameMap.get(m.userId) || null,
+      avatarImageUrl: m.avatarImageUrl,
+    };
+
+    // 实例详情：玩家数/容量（限流；失败不阻断）
+    // VRChat 实例查询 key 是完整 location 且不能 URL 编码（编码 :()~ 会 400 malformed url）
+    if (loc.instanceId) {
+      const instKey = m.location;   // 完整 location 字符串
+      if (!instanceInfo.has(instKey)) {
+        try {
+          const r = await rateLimiter.execute(() => api._request('GET', `/instances/${instKey}`));
+          if (r.status === 200 && r.data) {
+            instanceInfo.set(instKey, {
+              nUsers: r.data.n_users || 0,
+              capacity: r.data.capacity || 0,
+              recommendedCapacity: r.data.recommendedCapacity || 0,
+              type: r.data.type || '',
+            });
+          } else {
+            instanceInfo.set(instKey, null);
+          }
+        } catch (e) {
+          instanceInfo.set(instKey, null);
+        }
+      }
+      const inst = instanceInfo.get(instKey);
+      if (inst) {
+        entry.instanceUsers = inst.nUsers;
+        entry.instanceCapacity = inst.capacity;
+        entry.fillRatio = inst.capacity > 0 ? +(inst.nUsers / inst.capacity).toFixed(2) : 0;
+      }
+    }
+
+    // 推荐度：在线人数/容量比（人多热闹但别爆满）+ 实例类型权重
+    let score = 0;
+    if (entry.instanceUsers !== undefined) {
+      const fill = entry.fillRatio || 0;
+      // 黄金区间 30%-80%：人多但不挤；低于 30% 略减；超过 90% 大幅减（难挤进去）
+      if (fill >= 0.3 && fill <= 0.8) score += 50;
+      else if (fill > 0.9) score -= 40;
+      else if (fill < 0.1) score -= 10;
+      score += entry.instanceUsers * 3;
+    }
+    if (loc.type === 'public') score += 20;        // 公开实例最容易进
+    else if (loc.type === 'friends') score += 10;  // 好友实例需在对方好友列表
+    else if (loc.type === 'group') score += 5;     // 群组实例需同群
+    if (m.status === 'active') score += 10;        // 活跃状态优先
+    entry.recommendScore = Math.round(score);
+    detailed.push(entry);
+  }
+
+  // 排序：推荐度降序
+  detailed.sort((a, b) => (b.recommendScore || 0) - (a.recommendScore || 0));
+
+  const onlineCount = members.filter(m => m.online).length;
+  const joinableCount = detailed.length;
+
+  return {
+    mode: 'list',
+    groupName: group.displayName || group.id,
+    groupId: group.id,
+    memberCount: members.length,
+    onlineCount,
+    joinableCount,
+    excludedPrivate: onlineCount - joinableCount,
+    friends: detailed,
+    offline: members.filter(m => !m.online).map(m => ({ userId: m.userId })),
   };
 }
 
@@ -2086,6 +2293,9 @@ async function handleRpc(rpc, session, res) {
             break;
           case 'peek_group_announcement':
             result = await rateLimiter.execute(() => handlePeekGroupAnnouncement(args));
+            break;
+          case 'get_favorite_friends_locations':
+            result = await handleGetFavoriteFriendsLocations(args);
             break;
           default:
             throw new Error(`Unknown tool: ${name}`);
