@@ -681,7 +681,7 @@ const CUSTOM_TOOLS = [
   },
   {
     name: 'get_favorite_friends_locations',
-    description: '[query·好友收藏] 列出某个好友收藏夹（线上收藏分组）内所有好友的当前位置列表。可指定 groupName（如"new"、"活动店员"、"join"）或 favoriteGroupId；不指定则列出全部分组。返回按推荐度排序：在线且实例可加入的在前（public/friends 实例），private/hidden 实例自动排除，按实例内玩家数/容量比 + 收藏热度综合评分。也可用 searchName 直接按名字在好友列表里查某人的位置（含不可加入的 private/hidden，标记 joinable=false）。',
+    description: '[query·好友收藏] 列出某个好友收藏夹（线上收藏分组）内所有好友的当前位置列表。可指定 groupName（如"new"、"活动店员"、"join"）或 favoriteGroupId；不指定则列出全部分组。返回按推荐度排序：在线且实例可加入的在前（public/friends/hidden=friend+/group 实例均可加入），仅 private 实例自动排除（看不到位置），按实例内玩家数/容量比 + 收藏热度综合评分。也可用 searchName 直接按名字在好友列表里查某人的位置（能看到具体位置即代表可加入，标记 joinable；纯 private 才进不去）。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -812,13 +812,14 @@ async function handleGetFavoriteFriendsLocations({ groupName, favoriteGroupId, s
     for (const f of matched) {
       const loc = parseLocation(f.location || 'private');
       if (!loc) continue;
-      const isJoinable = loc.type === 'public' || loc.type === 'friends' || loc.type === 'group';
+      const isJoinable = loc.type === 'public' || loc.type === 'friends' || loc.type === 'group' || loc.type === 'hidden';
       const worldName = loc.worldId ? await getWorldNameSafe(loc.worldId) : null;
       const entry = {
         userId: f.id,
         displayName: f.displayName,
         online: true,
         joinable: isJoinable,
+        instanceTypeDisplay: loc.type === 'hidden' ? 'friend+（好友+）' : (loc.type || 'unknown'),
         location: f.location || 'private',
         worldId: loc.worldId || null,
         worldName,
@@ -831,8 +832,8 @@ async function handleGetFavoriteFriendsLocations({ groupName, favoriteGroupId, s
         nickname: nicknameMap.get(f.id) || null,
         avatarImageUrl: f.currentAvatarThumbnailImageUrl,
       };
-      // 可加入的才查实例玩家数（private/hidden 查了也进不去）
-      if (isJoinable && loc.instanceId && f.location && !f.location.includes('~private') && !f.location.includes('~hidden')) {
+      // 可加入的才查实例玩家数（private 查了也进不去）
+      if (isJoinable && loc.instanceId && f.location && !f.location.includes('~private')) {
         const instKey = f.location;
         if (!instanceInfo.has(instKey)) {
           try {
@@ -950,8 +951,9 @@ async function handleGetFavoriteFriendsLocations({ groupName, favoriteGroupId, s
   for (const m of members) {
     if (!m.online) continue;
     const loc = parseLocation(m.location || 'private');
-    // private/hidden 实例自动排除（进不去：private=仅自己，hidden=仅被邀请者）
-    if (!loc || loc.type === 'private' || loc.type === 'hidden' ||
+    // private 实例自动排除（Invite：仅被邀请者本人可进）
+    // 注意：hidden 实例 = 游戏里的 friend+(好友+)实例，好友及好友的好友可进，不排除！
+    if (!loc || loc.type === 'private' ||
         m.location === 'private' || m.location === 'offline' || m.location === 'traveling') {
       continue;
     }
@@ -1014,7 +1016,8 @@ async function handleGetFavoriteFriendsLocations({ groupName, favoriteGroupId, s
       score += entry.instanceUsers * 3;
     }
     if (loc.type === 'public') score += 20;        // 公开实例最容易进
-    else if (loc.type === 'friends') score += 10;  // 好友实例需在对方好友列表
+    else if (loc.type === 'friends') score += 10;  // 好友实例
+    else if (loc.type === 'hidden') score += 10;   // friend+(好友+)实例，好友可进
     else if (loc.type === 'group') score += 5;     // 群组实例需同群
     if (m.status === 'active') score += 10;        // 活跃状态优先
     entry.recommendScore = Math.round(score);
