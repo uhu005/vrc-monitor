@@ -138,6 +138,7 @@ CREATE TABLE IF NOT EXISTS join_choices (
   list_count INTEGER DEFAULT 0,     -- 当时列表长度
   list_avg_users REAL DEFAULT 0,    -- 当时列表平均人数（基线）
   list_avg_fill REAL DEFAULT 0,     -- 当时列表平均填充率（基线）
-  list_quiet_ratio REAL DEFAULT 0   -- 当时列表安静图占比（基线，0-1）
+  list_quiet_ratio REAL DEFAULT 0,  -- 当时列表安静图占比（基线，0-1）
+  world_tags TEXT DEFAULT ''        -- 被选世界的 author_tag_* 标签 JSON 数组（类型偏好学习用）
 );
 CREATE INDEX IF NOT EXISTS idx_join_choices_created ON join_choices(created_at);
