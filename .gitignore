@@ -18,6 +18,9 @@ __pycache__/
 .hermes/
 workspace/
 
+# ── Qoder 工具缓存（repowiki/knowledge 为生成物，已发布到 GitHub wiki，不入库）──
+.qoder/
+
 # ── 编辑器/系统 ──
 .vscode/
 .idea/
@@ -26,6 +29,8 @@ Thumbs.db
 api-test-results.json
 downloads/
 *.bak
+*.bak-*
+backup/
 backups/
 *.sqlite3-wal
 *.sqlite3-shm

@@ -1,7 +1,7 @@
 ---
 name: vrc-monitor-agent
-description: "Use when answering questions about VRChat friends (online status, who played with whom, activity timelines, online patterns) via the vrc-monitor MCP server on port 8799."
-version: 1.0.0
+description: "Use for VRChat friend queries (online status, who played with whom, activity timelines, online patterns) and VRChat social actions (boop, invite, join world, friend management, group operations, image uploads) via the vrc-monitor MCP server on port 8799."
+version: 1.1.0
 metadata:
   hermes:
     tags: [vrchat, gaming, social, mcp, monitoring]
@@ -15,7 +15,7 @@ metadata:
 - 服务启动：项目目录下 `node start-monitor.js`（首次需配置 `credentials.json`，见 AGENTS.md）
 - 数据库：本地 SQLite（WebSocket 实时采集事件，含历史上线/位置/同屏记录）
 
-## MCP 工具（46 个）
+## MCP 工具（55 个）
 
 | 工具 | 说明 |
 |------|------|
@@ -51,6 +51,9 @@ metadata:
 | `remove_gallery_image` | 删除图库图片（不可逆！必须 confirm: true） |
 | `send_invite` | 邀请好友加入你当前所在房间（拉人进房；userId/worldId/instanceId 必填、message 可选） |
 | `request_invite` | 请求好友邀请你加入 TA 的房间（userId 必填、message 可选，默认 "Can I join you?"） |
+| `create_instance` | **创建新实例（房间）**：worldId 必填、type（默认 hidden）/region（默认 jp）可选；⚠️ 非 public 必须带 ownerId=当前用户（否则 400 "Invalid owner ID"，2026-08-09 实测，官方文档没写）；返回 location 可直接给 invite_myself |
+| `invite_myself` | **打开指定实例**（与 open_world 同一引擎）：管道直发优先（Windows 游戏内静默弹菜单），失败静默回退 API 自我邀请（通知接受后传送）；location（worldId:instanceId）或 worldId+instanceId；forceApi 强制走 API |
+| `open_world` | **一键打开世界/实例**：worldId（自动建实例）或 location（完整实例串直接开）；core/vrchat-launch.js openInstance 统一入口——命名管道直发（游戏内静默弹加入菜单，Windows 1 步直达）失败静默回退 API 自我邀请；forceApi 强制走 API |
 | `send_friend_request` | 发送好友请求（添加好友；userId 直接加 或 displayName 精确匹配不区分大小写，二选一） |
 | `remove_friend` | 删除好友（不可逆！userId 或 displayName 精确匹配，必须传 confirm: true 才执行，否则只预览目标） |
 | `get_server_status` | 服务/认证状态 |
@@ -62,6 +65,12 @@ metadata:
 | `join_group` | 加入群组（open 群直接加入；已是成员返回 alreadyMember:true；`groupId` 必填） |
 | `leave_group` | 退出群组（`POST /groups/{id}/leave`；必须 `confirm: true`；非成员返回 notMember） |
 | `peek_group_announcement` | **窥探群公告**：一键「加入→读公告→退出」，仅对 open 群生效，需 `confirm: true` |
+| `get_favorite_friends_locations` | **好友收藏夹位置**：列出收藏分组内好友当前位置（支持 `searchName` 按名直查），按推荐度排序，private 自动排除 |
+| `recommend_join` | **推荐加入**：全部在线好友综合评分推荐（熟悉度 + 收藏夹权重 + 圿间场景 + 实例人数/类型） |
+| `set_join_preference` | 设置推荐偏好（自然语言，如「我不喜欢人太多」→ 爆满重罚） |
+| `get_join_preference` | 查询当前推荐偏好 |
+| `record_join_choice` | 记录一次推荐选择（自动补全上下文，≥5 次后自动学习权重） |
+| `get_join_learning` | 查看选择学习状态与生效的权重调整 |
 
 调用方式（HTTP SSE JSON-RPC）：
 
@@ -137,7 +146,7 @@ curl -s http://127.0.0.1:8799/mcp -X POST -H "Content-Type: application/json" \
 
 ## 结果格式
 
-用户偏好带昵称列的紧凑表格，不用原始显示名。companion 数据展示：`| 排名 | 好友 | 共处时间 | 同屏实例 | 最近一次 |`，一行小结总结社交模式。
+建议用昵称代替原始显示名以提高可读性。companion 数据可展示为：`| 排名 | 好友 | 共处时间 | 同屏实例 | 最近一次 |`，并附一行小结总结社交模式。
 
 ## 常见陷阱
 

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import json
+import logging
 
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -20,6 +21,8 @@ import process_manager as pm  # noqa: E402
 
 router = APIRouter()
 
+logger = logging.getLogger(__name__)
+
 
 # ── /status ────────────────────────────────────────────────────────────
 
@@ -28,8 +31,9 @@ router = APIRouter()
 def get_status() -> Dict[str, Any]:
     try:
         return pm.status()
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    except Exception:
+        logger.exception("get_status failed")
+        return {"ok": False, "error": "内部错误，请查看服务端日志"}
 
 
 # ── /start ─────────────────────────────────────────────────────────────
@@ -39,8 +43,9 @@ def get_status() -> Dict[str, Any]:
 def post_start() -> Dict[str, Any]:
     try:
         return pm.start()
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    except Exception:
+        logger.exception("post_start failed")
+        return {"ok": False, "error": "内部错误，请查看服务端日志"}
 
 
 # ── /stop ──────────────────────────────────────────────────────────────
@@ -50,8 +55,9 @@ def post_start() -> Dict[str, Any]:
 def post_stop() -> Dict[str, Any]:
     try:
         return pm.stop()
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    except Exception:
+        logger.exception("post_stop failed")
+        return {"ok": False, "error": "内部错误，请查看服务端日志"}
 
 
 # ── /restart ───────────────────────────────────────────────────────────
@@ -61,8 +67,9 @@ def post_stop() -> Dict[str, Any]:
 def post_restart() -> Dict[str, Any]:
     try:
         return pm.restart()
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    except Exception:
+        logger.exception("post_restart failed")
+        return {"ok": False, "error": "内部错误，请查看服务端日志"}
 
 
 # ── /config (GET) ──────────────────────────────────────────────────────
@@ -79,8 +86,9 @@ def get_config() -> Dict[str, Any]:
             "env_node_exe": os.environ.get("VRC_MONITOR_NODE"),
             "config_file": str(pm._config_path()),
         }
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    except Exception:
+        logger.exception("get_config failed")
+        return {"ok": False, "error": "内部错误，请查看服务端日志"}
 
 
 # ── /doctor ─────────────────────────────────────────────────────────────
@@ -131,8 +139,9 @@ def get_doctor() -> Dict[str, Any]:
                 "node_exe": node_exe,
             },
         }
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    except Exception:
+        logger.exception("get_doctor failed")
+        return {"ok": False, "error": "内部错误，请查看服务端日志"}
 
 
 # ── credentials ───────────────────────────────────────────────────────
@@ -193,8 +202,9 @@ def get_credentials() -> Dict[str, Any]:
             "monitor_dir": monitor_dir,
             "config_path": str(cred_path) if cred_path else None,
         }
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    except Exception:
+        logger.exception("get_credentials failed")
+        return {"ok": False, "error": "内部错误，请查看服务端日志"}
 
 
 @router.post("/credentials")
@@ -255,11 +265,13 @@ def post_credentials(body: CredentialBody) -> Dict[str, Any]:
             json.dumps(creds, indent=2, ensure_ascii=False), encoding="utf-8"
         )
         tmp.replace(cred_path)
+        os.chmod(cred_path, 0o600)
 
         return {
             "ok": True,
             "saved": True,
             "fields": fields,
         }
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    except Exception:
+        logger.exception("post_credentials failed")
+        return {"ok": False, "error": "内部错误，请查看服务端日志"}

@@ -1,10 +1,58 @@
-# VRChat 好友监控服务 (vrc-monitor)
+# VRChat 助手 (vrchat-assistant)
 
 基于 Node.js 的 VRChat 好友在线状态监控服务，配合 Hermes 插件和桌面插件使用，支持自动抓取 OTP 验证码登录。
 
 > 🤖 **AI-first 项目**：本程序只面向 AI Agent 使用与扩展，人类不直接编码；加功能 = 人类向 Agent 提需求 → Agent 实现。开发规范见 [DEVELOPMENT.md](./DEVELOPMENT.md)。
 
 **面向 AI Agent 的配置引导**：以下步骤可由 Agent 自动完成。建议 agent 在本仓库目录内运行（服务目录可自动探测，无需设置环境变量）。
+
+## 安装前检查（Agent 必读）
+
+> ⚠️ **在开始配置步骤 1 之前，Agent 必须先向用户核实以下问题：**
+
+1. **是否安装/使用过 VRCX？**
+   - VRCX 是一款流行的 VRChat 第三方工具，会在本地保存好友活动历史、世界缓存、好友备注等数据（SQLite 数据库）。本服务的 `migrate-vrcx0.mjs` 脚本可从 VRCX 数据库一键导入这些历史数据。
+   - 若用户**使用过 VRCX**，继续追问第 2 个问题。
+   - 若用户**从未使用过 VRCX**，可跳过数据导入，直接进入「配置步骤」。
+
+2. **是否需要将 VRCX 中的历史数据导入到本系统？**
+   - 导入内容包括：好友列表与信任等级、好友备注/昵称、世界缓存、位置变更历史、上下线记录、Avatar 变更、状态/Bio 变更等（详见下表）。
+   - 导入是**可选**的——不导入也能正常使用本服务，只是查询历史活动记录时没有迁移前的旧数据。
+   - 若用户**需要导入**，在完成「配置步骤」1-3（服务能正常启动）后，运行 `node migrate-vrcx0.mjs` 即可导入数据（脚本会自动探测 VRCX 数据库路径和 userId）。
+   - 若用户**不需要导入**，直接进入「配置步骤」。
+
+| 迁移项 | VRCX 数据表 | 说明 |
+|--------|------------|------|
+| 好友列表 | `friend_log_current` | 好友 userId、显示名、信任等级 |
+| 好友备注 | `memos` | 好友昵称/备注文本 |
+| 世界缓存 | `cache_world` | 世界 ID、名称、作者、缩略图等 |
+| 位置变更 | `feed_gps` | 好友何时在哪个世界 |
+| 上下线记录 | `feed_online_offline` | 好友上线/下线时间及位置 |
+| Avatar 变更 | `feed_avatar` | 好友更换 Avatar 记录 |
+| 状态变更 | `feed_status` | 好友状态文本变更 |
+| Bio 变更 | `feed_bio` | 好友个人简介变更 |
+
+> **数据库位置**：迁移脚本会自动探测以下路径（Windows）：
+> -  VRCX：`%USERPROFILE%\AppData\Roaming\VRCX\VRCX.sqlite3`
+> -  VRCX-0：`%USERPROFILE%\AppData\Roaming\VRCX-0\VRCX-0.sqlite3`
+>
+> 若自动探测失败，Agent 可让用户提供数据库路径手动指定：`node migrate-vrcx0.mjs <VRCX数据库路径> <userId>`。
+
+## 获取代码（Fork & Clone）
+
+> 💡 本项目是 AI-first 项目，用户会持续向 Agent 提需求、由 Agent 实现功能。为保留这些变更并便于同步上游更新，**建议 Agent 先 Fork 本仓库到用户自己的 GitHub 账号，再克隆 Fork 到本地**，而非直接 clone 原仓库。
+
+- **推荐**：Fork 后克隆
+  ```bash
+  # Agent 通过 GitHub 工具完成 fork，然后：
+  git clone https://github.com/<用户名>/vrchat-assistant.git
+  cd vrchat-assistant
+  # upstream 指向原仓库（fork 来源）
+  git remote add upstream https://github.com/ggg123124/vrchat-assistant.git
+  ```
+  之后 Agent 实现的新功能可直接 `git push origin` 保存到用户的 Fork；需要同步官方更新时执行 `git pull upstream main`。
+
+- **可选**：仅直接 clone 原仓库（适用于不打算修改代码、只用现成功能的用户）。注意此方式下 Agent 产生的代码变更无法推送到远程，仅保留在本地，存在丢失风险。
 
 ## 配置步骤
 
@@ -62,6 +110,8 @@ hermes plugins enable vrc-monitor
 
 插件提供 `vrc_status` / `vrc_start` / `vrc_stop` / `vrc_restart` 工具，并在每次 Hermes 会话开始时自动拉起服务（on_session_start 钩子）。
 
+> **平台限制**：插件当前仅支持 Windows（`plugin.yaml` 中 `platforms: [windows]`）。macOS / Linux 用户需手动执行 `node start-monitor.js` 启动服务，或等待插件跨平台支持。Node.js 服务本身是跨平台的，仅 Hermes 插件托管层有此限制。
+
 > 注意：`dashboard/` 子目录（manifest.json + plugin_api.py）是桌面插件和 `hermes dashboard` 的后端 API，复制时**不能遗漏**，否则桌面端「配置」功能不可用。
 >
 > 关于自动拉起：on_session_start 钩子依赖 `VRC_MONITOR_DIR` 环境变量或「agent 在仓库目录内运行」才能定位服务目录。**首次配置完成前（未设置环境变量且不在仓库目录内运行时）服务不会自动启动**，这是预期行为——先完成步骤 1-3 或在仓库目录内重启 Hermes 会话即可。
@@ -75,13 +125,13 @@ cp desktop/plugin.js "$HERMES_HOME/desktop-plugins/vrc-monitor/"
 
 然后：
 1. 重启 Hermes Gateway（加载 dashboard 后端路由）
-2. 桌面端按 ⌘K -> **Reload desktop plugins**
+2. 桌面端按 Ctrl+K (Windows) / ⌘K (macOS) -> **Reload desktop plugins**
 
 桌面端右侧出现「VRChat Monitor」面板：显示服务运行状态，点击「配置」可填写 VRChat 邮箱/密码/邮箱 IMAP 授权码（保存到 credentials.json），无需手工编辑文件。
 
 ### 6. 配置 MCP 接口（可选但推荐）
 
-服务通过 MCP 协议暴露 46 个工具（get_online_friends / get_friend_info / get_friend_events / get_companions / get_online_pattern / get_nicknames / set_nickname / get_world_name / set_world_note / get_world_history / get_weekly_report / scan_new_worlds / get_new_worlds / get_mutual_friends / search_users / search_groups / search_worlds / backup_database / get_user_groups / get_group_info / get_group_instances / get_group_announcement / join_group / leave_group / peek_group_announcement / send_boop / get_boop_emojis / upload_emoji / upload_print / upload_gallery_image / download_print / download_gallery_image / send_friend_request / remove_friend 等，详见 README），Hermes Agent 可直接调用，无需 curl 手写 JSON-RPC。
+服务通过 MCP 协议暴露 55 个工具（get_online_friends / get_friend_info / get_friend_events / get_companions / get_online_pattern / get_nicknames / set_nickname / get_world_name / set_world_note / get_world_history / get_weekly_report / scan_new_worlds / get_new_worlds / get_mutual_friends / search_users / search_groups / search_worlds / backup_database / get_user_groups / get_group_info / get_group_instances / get_group_announcement / join_group / leave_group / peek_group_announcement / send_boop / get_boop_emojis / upload_emoji / upload_print / upload_gallery_image / download_print / download_gallery_image / send_friend_request / remove_friend / create_instance / invite_myself / open_world / get_favorite_friends_locations / recommend_join / set_join_preference / get_join_preference / record_join_choice / get_join_learning 等，详见 README），Hermes Agent 可直接调用，无需 curl 手写 JSON-RPC。
 
 在 Hermes 配置文件（`$HERMES_HOME/config.yaml`，Windows 为 `%LOCALAPPDATA%\hermes\config.yaml`）中添加：
 

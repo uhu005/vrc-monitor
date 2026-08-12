@@ -1,10 +1,13 @@
 {
   "name": "vrc-monitor",
-  "version": "1.12.0",
+  "version": "1.15.0",
   "type": "module",
   "private": true,
   "description": "VRChat 好友监控系统 — WebSocket 实时采集 + OTP 自动登录 + MCP 接口",
   "main": "start-monitor.js",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node start-monitor.js"
   },

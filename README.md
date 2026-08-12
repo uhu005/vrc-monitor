@@ -1,9 +1,9 @@
-# VRChat 好友监控系统 (vrc-monitor)
+# VRChat 助手 (vrchat-assistant)
 
-> 自建 VRChat 好友动态监控系统 · 替代 VRCX-0
+
 > 技术栈：Node.js + SQLite + WebSocket + MCP + Hermes 插件
 
-监控 VRChat 好友的上下线、世界切换、Avatar/状态变化，通过 WebSocket 实时采集入库，经 MCP 协议暴露给 AI Agent（Hermes）查询，并附带 Hermes 插件实现进程托管。
+通过 WebSocket 实时采集好友上下线、世界切换、Avatar/状态变化并入库。以 55 个 MCP 工具向 AI Agent 暴露全部能力——不只查询，还涵盖社交互动（戳戳/邀请/好友请求）、媒体管理（emoji/相册/图库）、群组操作、推荐系统等。附带 Hermes 插件实现进程托管（自动拉起 + 崩溃自愈）。
 
 > 🤖 **AI Agent 优先项目**：程序只面向 AI Agent 使用与开发，人类不直接编码。详见下方「[项目定位](#-ai-agent-优先项目定位)」与 [DEVELOPMENT.md](./DEVELOPMENT.md)。
 
@@ -20,6 +20,7 @@
   3. Agent 实现功能并自测验证
   4. 使用者验收
   5. （可选）Agent 提交 PR 惠及上游
+- **开发约束由上游预先定下**：使用者的软件开发知识可能有限，难以自行界定清晰的技术约束。因此开发要求（跨平台兼容、DB 变更带迁移、限流、密钥安全等）由作者在 [DEVELOPMENT.md](./DEVELOPMENT.md) 中预先固化，**适用于所有为使用者开发新功能的 AI Agent**——无论是否提交 PR，开发时都应当遵守，除非用户明确授权跳出约束框架。
 - **fork 自由**：MIT 协议，任何人可以 fork，让 AI Agent 按自己的需求扩展，无需事先征得同意。
 - **提交 PR 有要求**：单一职责、不破坏现有行为、DB 变更带迁移、文档同步、不提交密钥等 11 条硬性要求，详见 [DEVELOPMENT.md](./DEVELOPMENT.md)。
 - 面向 AI Agent 的部署配置引导见 [AGENTS.md](./AGENTS.md)。
@@ -31,10 +32,10 @@
 - ✅ **WebSocket 实时监控** — 好友上线/下线/换世界即时入库
 - ✅ **自动重连 + 认证自愈** — 指数退避（1s→60s）+ cookie 过期自动 OTP 邮箱取码登录，无需人工干预
 - ✅ **自动 OTP 登录** — 邮箱验证码自动从邮箱 IMAP 抓取，全链路无人值守
-- ✅ **历史数据迁移** — 从 VRCX-0 导入 10 个月的 33 万条活动记录
+- ✅ **历史数据迁移** — 从 VRCX 导入历史活动记录（上下线/位置/Avatar/状态/Bio 变更、好友列表、世界缓存等）
 - ✅ **世界名缓存** — 自动解析 `wrld_xxx` 为可读世界名（懒刷新：缓存命中直接用，`forceRefresh: true` 手动刷新防改名陈旧）
 - ✅ **关注名单** — 标记核心好友，活动时特别通知
-- ✅ **MCP 工具接口** — 46 个工具供 Hermes / 任意 MCP 客户端调用
+- ✅ **MCP 工具接口** — 55 个工具供 Hermes / 任意 MCP 客户端调用
 - ✅ **数据库自动备份** — 启动 + 每 24h 自动备份（WAL 在线备份，无需停机），保留最近 2 份到 `backups/`；`backup_database` 工具可随时手动触发
 - ✅ **Hermes 插件托管** — 会话自动拉起、崩溃自愈、`vrc_status` 等管理工具
 
@@ -46,55 +47,19 @@
 
 ## 🚀 快速开始
 
-> 本节全部步骤由 **AI Agent 执行**。作为使用者，你只需要做两件事：**① 提供 VRChat 账号与邮箱 IMAP 授权码（第 1 步）**，**② 在 Agent 完成后验收结果（第 3 步）**。其余交给 Agent。
+> 本节全部步骤由 **AI Agent 执行**。作为使用者，你只需要做两件事：**① 提供 VRChat 账号与邮箱 IMAP 授权码**，**② 在 Agent 完成后验收结果**。其余交给 Agent。
 
-### 0. 准备
+**前置条件**：Node.js ≥ 18、一个 VRChat 账号（需开启邮箱 2FA）、一个支持 IMAP 的邮箱（用于接收 OTP 验证码）。
 
-Agent 先检查环境（其余前置条件由使用者确认）：
+完整的部署配置步骤（凭据、环境变量、启动、Hermes 插件、桌面插件、MCP 接口、Agent Skill 安装）详见 **[AGENTS.md](./AGENTS.md)**——Agent 可按此自动完成全部配置。
 
-- Node.js ≥ 18（`node --version` 验证）
-- 一个 VRChat 账号（需开启邮箱 2FA）—— 使用者提供
-- 一个支持 IMAP 的邮箱（用于接收 OTP 验证码，需生成 IMAP 授权码/专用密码）—— 使用者提供
-
-### 1. 配置凭据
-
-由 Agent 复制模板并写入真实凭据（**该文件不会入库**）：
-
-```bash
-cp credentials.example.json credentials.json
-```
-
-```json
-{
-  "email": "你的VRChat登录邮箱",
-  "password": "你的VRChat密码",
-  "imap_auth_code": "邮箱IMAP授权码"
-}
-```
-
-> 🔑 **需要使用者操作（Agent 无法代办）**：IMAP 授权码必须由使用者登录邮箱网页版自行生成——设置 → 开启 IMAP/SMTP → 生成授权码/专用密码（QQ 邮箱：设置 → 账号 → 开启 IMAP/SMTP → 生成授权码）。支持任意 IMAP 邮箱（QQ/163/Gmail/Outlook 等），服务按邮箱域名自动选择服务器；可加 `imap_host` 字段手动指定。
-> Agent 在配置完成后应确认 `credentials.json` 已落盘且格式正确，并将该文件保持在 .gitignore 内（**禁止提交**）。
-
-### 2. 启动服务
-
-由 Agent 执行并跟踪启动日志：
-
-```bash
-cd <本仓库目录>
-node start-monitor.js
-```
-
-首次启动服务会自动从配置的邮箱（IMAP）抓取 OTP 验证码完成登录，随后保持运行。Agent 应确认日志无认证/限流错误，再进入第 3 步验收。
-
-### 3. 健康检查（验收标准）
-
-Agent 执行验收：
+**验收标准**：
 
 ```bash
 curl http://127.0.0.1:8799/health
 ```
 
-**验收通过标准**：`Auth: true`、`WS: connected`、返回在线好友数。达标后向使用者报告「部署完成」，未达标则排查后重试。
+返回 `Auth: true`、`WS: connected`、在线好友数。
 
 ## 📦 Agent Skill 安装（开箱即用）
 
@@ -102,7 +67,7 @@ curl http://127.0.0.1:8799/health
 
 | Skill | 内容 | 适用场景 |
 |-------|------|----------|
-| `skills/vrc-monitor-agent/` | 38 个 MCP 工具清单、5 大查询工作流（在线/同屏/时间线/上线规律/昵称）、常见陷阱、健康检查 | 日常好友查询 |
+| `skills/vrc-monitor-agent/` | 55 个 MCP 工具清单、5 大查询工作流（在线/同屏/时间线/上线规律/昵称）、常见陷阱、健康检查 | 日常好友查询与社交操作 |
 | `skills/vrc-monitor-companion-query/` | 「谁和我/和 XX 一起玩过」同屏交叉查询的正确姿势（为何不委派子 agent） | 同屏/玩伴查询 |
 
 **安装方式**（以 Hermes 为例，其他 Agent 框架同理）——把 skill 目录复制到你的 skills 目录：
@@ -139,7 +104,7 @@ hermes plugins enable vrc-monitor
 ```bash
 mkdir -p "$HERMES_HOME/desktop-plugins/vrc-monitor"
 cp desktop/plugin.js "$HERMES_HOME/desktop-plugins/vrc-monitor/"
-# 重启 Gateway + 桌面端 ⌘K → Reload desktop plugins
+# 重启 Gateway + 桌面端 Ctrl+K (Windows) / ⌘K (macOS) → Reload desktop plugins
 ```
 
 ### 插件提供的工具
@@ -168,7 +133,7 @@ cp desktop/plugin.js "$HERMES_HOME/desktop-plugins/vrc-monitor/"
 - **双路检测**：状态文件 pid 存活 **或** 端口探测成功，均可识别为运行中（防状态文件丢失误判）
 - **日志**：`$HERMES_HOME/workspace/vrc-monitor/monitor.log`
 
-## 🔌 MCP 工具（46 个）
+## 🔌 MCP 工具（55 个）
 
 服务监听 `http://127.0.0.1:8799/mcp`，通过 HTTP SSE 提供 MCP 协议。Hermes 用户可在 `$HERMES_HOME/config.yaml`（Windows 为 `%LOCALAPPDATA%\hermes\config.yaml`）配置：
 
@@ -244,6 +209,15 @@ mcp_servers:
 | `remove_gallery_image` | 删除图库图片（不可逆，需 `confirm: true`） | `fileId` | `confirm` |
 | `send_invite` | 邀请好友加入**你当前所在房间**（拉人进房） | `userId`、`worldId`、`instanceId` | `message`（附带消息） |
 | `request_invite` | 请求好友**邀请你加入 TA 的房间**（默认消息 "Can I join you?"） | `userId` | `message` |
+| `get_favorite_friends_locations` | **好友收藏夹位置**：列出收藏分组内好友当前位置（支持 `searchName` 按名直查），按推荐度排序，private 自动排除 | `groupName`/`favoriteGroupId`/`searchName` | — |
+| `recommend_join` | **推荐加入**：全部在线好友综合评分推荐（熟悉度 + 收藏夹权重 + 房间场景 + 实例人数/类型） | `limit`、`minScore` | — |
+| `set_join_preference` | 设置推荐偏好（自然语言，如「我不喜欢人太多」→ 爆满重罚） | `preference` | — |
+| `get_join_preference` | 查询当前推荐偏好 | — | — |
+| `record_join_choice` | 记录一次推荐选择（自动补全上下文，≥5 次后自动学习权重） | `userId`/`displayName` | — |
+| `get_join_learning` | 查看选择学习状态与生效的权重调整 | — | — |
+| `create_instance` | **创建新房间**：worldId 必填；type（public/hidden/friends/private/group，默认 hidden）、region（us/eu/jp，默认 jp）可选；非 public 自动带 ownerId=当前用户（不带会 400 "Invalid owner ID"）；返回 `location` 可直接给 invite_myself | `worldId` | `type`、`region`、`instanceId`、`groupAccessType` |
+| `invite_myself` | **打开指定实例**（与 open_world 同一引擎，静默回退）：命名管道直发优先（Windows 游戏内静默弹加入菜单），管道不可用自动回退 API 自我邀请（客户端收到通知接受后传送）；`location`（worldId:instanceId 完整串）或 `worldId`+`instanceId` 分开传 | `location` 或 `worldId`+`instanceId` | `forceApi` |
+| `open_world` | **一键打开世界/实例**：`worldId`（自动建实例，type/region 可指定）或 `location`（完整实例串直接开）；命名管道直发（游戏内静默弹加入菜单，仅 Windows，1 步直达）失败自动回退 API 自我邀请 | `worldId` 或 `location` | `type`、`region`、`shortName`、`forceApi` |
 | `send_friend_request` | **发送好友请求**（添加好友）：`userId` 直接加，或 `displayName` 精确匹配（不区分大小写）后加 | `userId` 或 `displayName` 至少一个 | — |
 | `remove_friend` | **删除好友**（不可逆）：`userId` 或 `displayName` 精确匹配；**必须 `confirm: true` 才执行**，否则只返回目标信息预览 | `userId` 或 `displayName` 至少一个 | `confirm`（默认 false） |
 
@@ -273,35 +247,53 @@ mcp_servers:
 
 ```
 .
-├── start-monitor.js        # 主入口（Node 服务）
+├── start-monitor.js            # 主入口（薄入口 ~200 行：启动流程 + WS 事件处理）
 ├── core/
-│   ├── init-db.sql         # 数据库 DDL
-│   ├── storage.js          # SQLite 封装
-│   ├── ws-manager.js       # WebSocket 管理
-│   ├── event-pipeline.js   # 事件处理管道
-│   ├── friend-state.js     # 好友状态管理
-│   ├── rate-limiter.js     # API 限流
-│   └── vrchat-launch.js    # 打开实例统一入口（管道探测 + API 回退）
-├── vrchat-api.js           # VRChat API 客户端
-├── fetch-otp.py            # 邮箱 IMAP OTP 自动抓取
-├── migrate-vrcx0.mjs       # VRCX-0 数据迁移脚本
-├── open-world.mjs          # 本机辅助：创建房间并在 VRChat 内打开（管道/API 双通道）
-├── hermes-plugin/          # Hermes 托管插件
+│   ├── init-db.sql             # 数据库 DDL
+│   ├── storage.js              # SQLite 封装
+│   ├── ws-manager.js           # WebSocket 管理
+│   ├── event-pipeline.js       # 事件处理管道
+│   ├── friend-state.js         # 好友状态管理
+│   ├── rate-limiter.js         # API 限流
+│   ├── vrchat-launch.js        # 打开实例统一入口（管道探测 + API 回退）
+│   ├── new-worlds.js           # 新世界扫描核心逻辑
+│   ├── backup.js               # 数据库在线备份
+│   ├── mcp-definitions.js      # MCP 工具定义（55 个工具）
+│   ├── server-context.js       # 共享上下文（ctx 对象 + log + parseLocation）
+│   ├── http-server.js          # HTTP 服务器 + SSE 端点
+│   ├── rpc-router.js           # RPC 分发（tools/call → handler）
+│   ├── otp-fetcher.js          # OTP 邮箱获取
+│   └── handlers/               # 55 个 MCP 工具的 handler
+│       ├── recommend.js       #   推荐系统（好友收藏位置/推荐加入/偏好/学习）
+│       ├── friends.js         #   好友查询（在线/详情/搜索/共同好友/添加/删除）
+│       ├── instance.js        #   实例操作（创建/自我邀请/打开世界）
+│       ├── events.js          #   事件历史（好友事件/世界名/周报）
+│       ├── groups.js          #   群组操作（查询/搜索/加入/退出）
+│       ├── media.js           #   媒体（Boop emoji/Print 相册/Gallery 图库）
+│       └── misc.js            #   杂项（统计/新世界/关注名单/同屏/昵称/备份）
+├── vrchat-api.js               # VRChat API 客户端
+├── fetch-otp.py                # 邮箱 IMAP OTP 自动抓取
+├── migrate-vrcx0.mjs           # VRCX-0 数据迁移脚本
+├── open-world.mjs              # 本机辅助：创建房间并在 VRChat 内打开（管道/API 双通道）
+├── hermes-plugin/              # Hermes 托管插件
 │   ├── plugin.yaml
 │   ├── __init__.py
-│   ├── process_manager.py  # 进程生命周期管理
+│   ├── process_manager.py      # 进程生命周期管理
 │   ├── tools.py
-│   └── dashboard/          # 桌面插件后端 API
+│   └── dashboard/              # 桌面插件后端 API
 │       ├── manifest.json
-│       └── plugin_api.py   # /status /credentials /doctor 等路由
+│       └── plugin_api.py       # /status /credentials /doctor 等路由
 ├── desktop/
-│   └── plugin.js           # Hermes 桌面插件（GUI 配置面板）
-├── skills/                 # 开箱即用的 Agent skill（已去敏感化）
+│   └── plugin.js               # Hermes 桌面插件（GUI 配置面板）
+├── skills/                     # 开箱即用的 Agent skill（已去敏感化）
 │   ├── vrc-monitor-agent/          # 主使用指南（工具/工作流/陷阱）
 │   └── vrc-monitor-companion-query/ # 同屏查询专项
 ├── scripts/
 │   └── prepare_image.py            # 上传前图片处理（square 方形化 / landscape 旋转+auto裁剪填充）
-├── credentials.example.json # 凭据模板（复制为 credentials.json）
+├── credentials.example.json   # 凭据模板（复制为 credentials.json）
+├── AGENTS.md                  # Agent 部署配置引导
+├── ARCHITECTURE.md            # 系统架构文档
+├── DEVELOPMENT.md             # 开发规范
 └── README.md
 ```
 
@@ -319,22 +311,7 @@ node migrate-vrcx0.mjs <VRCX数据库路径> <userId>
 
 > **注意**：userId 可在 VRChat 官网个人资料页查看，格式如 `usr_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`。脚本会自动去掉横线匹配 VRCX 数据库表名格式。
 
-## 🧰 辅助脚本（一次性工具）
-
-### `new-worlds-tracker.mjs` — 新地图追踪
-
-拉取最近 N 天发布的新世界（`system_created_recently` 标签 + 创建时间窗口），写入本仓库 `new_worlds` 表，用 `events` 表的 `user-location` 事件标记「用户是否逛过」，输出热度推荐列表。
-
-```bash
-node new-worlds-tracker.mjs [DAYS] [--dry] [--min-favorites N]
-# 示例：最近 7 天新地图（dry-run 预览）
-node new-worlds-tracker.mjs 7 --dry
-```
-
-- 数据全存本仓库 `vrc-monitor.sqlite3`（`new_worlds` 表），不依赖 VRCX 本机库
-- API 调用走 `core/rate-limiter.js` 限流
-- 输出 JSON：`{ collected, tracked, visited, unvisited, recommended }`
-- 定时场景：cron 每天执行即可保持跟踪列表新鲜
+## 🧰 辅助工具（本机可选）
 
 ### `open-world.mjs` — 创建房间并在 VRChat 客户端内打开（探测式本机增强）
 
