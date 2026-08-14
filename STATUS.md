@@ -56,7 +56,7 @@
 
 ## 会话日志
 
-- **2026-08-14（晚间）**：**修复 MCP GET /mcp 秒断循环（Hermes 客户端每秒断连重连）**——症状：agent.log 每分钟 60-120 条  + vrcx-monitor keepalive degraded（17:19 起持续数小时），服务本身健康（POST 工具全正常）。根因：http-server.js 的 GET /mcp 是 endpoint probe（立即 res.end()），Hermes streamable HTTP 客户端建立 GET stream 长连接等推送 → 秒断秒连。修复：GET /mcp 保持 SSE 长连接 + 2s 心跳（，低于 mihomo 代理 4s 空闲超时）；POST 路径零改动。验证：curl -N 挂住 + agent.log 断连归零（19:45 起）+ 工具调用正常。commit 689c8a0 已推 fork。顺带提交了 8-13 遗留的 STATUS.md 版本更新。
+- **2026-08-14（晚间）**：**修复 MCP GET /mcp 秒断循环（Hermes 客户端每秒断连重连）**——症状：agent.log 每分钟 60-120 条 `GET stream disconnected` + vrcx-monitor keepalive degraded（17:19 起持续数小时），服务本身健康（POST 工具全正常）。根因：http-server.js 的 GET /mcp 是 endpoint probe（立即 res.end()），Hermes streamable HTTP 客户端建立 GET stream 长连接等推送 → 秒断秒连。修复：GET /mcp 保持 SSE 长连接 + 2s 心跳（`: ping`，低于 mihomo 代理 4s 空闲超时）；POST 路径零改动。验证：curl -N 挂住 + agent.log 断连归零（19:45 起）+ 工具调用正常。commit 689c8a0 已推 fork。顺带提交了 8-13 遗留的 STATUS.md 版本更新。
 
 - **2026-08-10**：建本状态文件（清醒协议落地）。服务健康、52 工具。待办：等 PR #5/#6 评审。
 - **2026-08-11**：PR #5 合并（open-world 进上游）+ PR #6 合并（v1.14.0 推荐工具集）+ PR #8 提交（学习 5 维度/权重均衡）。权重均衡落地（熟悉度×1.5 vs 地图属性成对调）。上游仓库更名 vrchat-assistant。issue #7（Release @ 截断）创建。
