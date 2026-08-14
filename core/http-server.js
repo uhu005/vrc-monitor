@@ -78,10 +78,23 @@ async function handleRequest(req, res) {
     return;
   }
 
-  // MCP endpoint probe
+  // MCP streamable HTTP：GET = SSE 长连接通道（2026-08-14 修复）
+  // 原来这里是 endpoint probe（立即 res.end()），而 Hermes 的 MCP 客户端会建立
+  // GET stream 长连接等服务器推送 → 服务器秒断 → 客户端每秒重连循环（日志刷屏 +
+  // keepalive degraded）。现在保持连接 + 定时发 SSE 注释心跳（: ping），
+  // 2s 间隔低于本机代理（mihomo）的空闲超时（Keep-Alive: timeout=4），防代理掐断。
+  // 服务器无主动推送需求，心跳只用于维持通道活跃。
   if (req.method === 'GET' && req.url === '/mcp') {
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Content-Length': 0 });
-    res.end();
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    });
+    res.write(': connected\n\n');
+    const heartbeat = setInterval(() => {
+      try { res.write(': ping\n\n'); } catch { /* socket closed */ }
+    }, 2000);
+    req.on('close', () => clearInterval(heartbeat));
     return;
   }
 
