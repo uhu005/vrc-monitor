@@ -56,6 +56,8 @@
 
 ## 会话日志
 
+- **2026-09-04（晚间）**：**大版本升级 v1.15.0 → v3.2.0-beta**（落后 334 commits，v2.0.0 数据本地化 / v3.0.0 插件化 / 结构化日志 / TOTP 自动登录 / Web Dashboard / auth-guard / playwright X 抓取）。流程：提交 STATUS 基线 → 备份三件套到 `F:\soft\vrc-monitor-backup-20260904\` → vrc_stop（坑：第一次 vrc_stop 只清状态文件没杀到进程 35160，vrc_start 后 .active.json 更新为真 PID，再走正规 vrc_stop 才真停；直接 taskkill 被治理层拦）→ git merge upstream/main（3 冲突：`.gitignore` 双保留、`package-lock.json` 取上游、`core/http-server.js` **重打 SSE 长连接补丁**并改用上游 pathname 变量——上游仍是 endpoint probe 秒断式，补丁必须保留）→ npm install（新增 playwright，可选功能不用下浏览器二进制）→ 同步 hermes-plugin/桌面插件/skills（vrc-monitor-agent skill v1.0→v2.0，companion-query 上游已移除本地保留）。验证全过：5 个核心文件 node --check / /health 全绿（auth/ws/11 插件 loaded/events 无损）/ tools/list **104 工具**（原 55，插件化扩展）/ GET /mcp SSE 长连接实测挂住+2s 心跳 / get_online_friends 真实调用成功 / 日志无错误 / 结构化日志+启动自动备份生效。**PR #8 已于 8-11 合并上游**，学习系统以官方 recommend 插件形态回归。推送 fork 需 workflow scope（合并带入 ci.yml），老大设备码授权（05AD-9F0D）后推送成功 560ea62→7a3dab9；fork CI（上游 ci.yml）ubuntu+windows 双平台全绿，等于官方测试套件验证了合并结果。**下一步**：vrc_restart 注意 .active.json PID 校验；关注 playwright 首次实际使用（X 世界抓取）；插件化后新增工具待实际使用探索。
+
 - **2026-08-14（晚间）**：**修复 MCP GET /mcp 秒断循环（Hermes 客户端每秒断连重连）**——症状：agent.log 每分钟 60-120 条 `GET stream disconnected` + vrcx-monitor keepalive degraded（17:19 起持续数小时），服务本身健康（POST 工具全正常）。根因：http-server.js 的 GET /mcp 是 endpoint probe（立即 res.end()），Hermes streamable HTTP 客户端建立 GET stream 长连接等推送 → 秒断秒连。修复：GET /mcp 保持 SSE 长连接 + 2s 心跳（`: ping`，低于 mihomo 代理 4s 空闲超时）；POST 路径零改动。验证：curl -N 挂住 + agent.log 断连归零（19:45 起）+ 工具调用正常。commit 689c8a0 已推 fork。顺带提交了 8-13 遗留的 STATUS.md 版本更新。
 
 - **2026-08-10**：建本状态文件（清醒协议落地）。服务健康、52 工具。待办：等 PR #5/#6 评审。
