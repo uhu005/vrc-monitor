@@ -2,8 +2,10 @@
  * 共享服务上下文 — 所有模块通过此对象访问运行时状态
  *
  * start-monitor.js main() 初始化后赋值各字段；
- * handler / rpc-router / http-server 模块通过 import { ctx } 使用。
+ * tool handler / registry / http-server 模块通过 import { ctx } 使用。
  */
+
+import { initLogger, logger } from './logger.js';
 
 export const ctx = {
   storage: null,
@@ -12,8 +14,10 @@ export const ctx = {
   wsManager: null,
   eventPipeline: null,
   friendState: null,
-  serverState: { started: null, authUser: null, friendCount: 0, needsOtp: false },
+  serverState: { started: null, authUser: null, friendCount: 0, needsOtp: false, needsTotp: false },
   watchlist: { cache: [], dirty: false },
+  // HTTP 路由由插件注册（api.http.registerRoute），核心统一分发
+  httpRoutes: new Map(),
   paths: {
     __dirname: null,
     PORT: 8799,
@@ -26,8 +30,7 @@ export const ctx = {
 };
 
 export function log(msg) {
-  const ts = new Date().toISOString().slice(11, 19);
-  console.log(`[${ts}] ${msg}`);
+  logger.info(String(msg));
 }
 
 export function parseLocation(loc) {

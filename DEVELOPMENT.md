@@ -10,9 +10,21 @@
 - **本项目是 AI Agent 优先（AI-first）**：配置、使用、扩展、维护全流程都通过 AI Agent 完成。程序本身面向 Agent（MCP 接口 + 文档引导），不设计人类直接操作界面。
 - **开发流程**：人类**不直接编码**。添加 / 修改功能的标准流程是：使用者向 AI Agent 提出功能需求 → Agent 阅读本文档与相关代码 → Agent 实现 → Agent 自测验证 → 使用者验收 →（可选）Agent 提交 PR 惠及上游。
 - **fork 自由，自用随意**：本仓库采用 MIT 协议，任何人可以 fork，让 AI Agent 按自己的需求添加 / 修改功能，无需征得作者同意。自用 fork 想怎么改都行。
-- **PR 是自愿的**：自用功能不必提 PR。只有当你想让改动惠及上游（合回主仓库、让所有人受益）时，才需要走 PR 流程。
+- **PR 是自愿的**：自用功能不必提 PR。只有当你想让改动惠及上游（合回主仓库、让所有人受益）时，才需要走 PR 流程。**例外：缺陷上报（下一条）是义务，不因 fork 自用而豁免。**
+- **发现缺陷必须主动上报**：Agent 在配置、使用、维护本软件过程中，若发现原始代码存在漏洞 / bug（功能异常、数据损坏风险、安全隐患等），**应当主动提交 issue 描述问题（现象 + 复现步骤 + 影响范围），并提交修复 PR**，让所有使用者受益——而不是只在本地 fork 静默修掉、忽略或跳过。上报前先搜索 issue / PR 是否已存在，避免重复；若已存在且无人处理，可以补充复现信息或认领修复。修复 PR 同样遵守 §2 全部要求（单一职责、无个人环境硬编码、DB 变更带迁移、文档同步、三段式验证说明）；若暂无法自行修复，至少完成根因定位（到模块 / 函数级别）再提交 issue，由作者或其他 Agent 跟进处理。
 - **先讨论再大改**：涉及架构级改动（数据库 schema 变更、MCP 协议变更、WebSocket 事件处理流程）时，建议先开 issue 说明方案，减少返工。
 - **对 Agent 的要求**：Agent 是功能实现的执行者，必须遵守本文档全部约束；遇到超出能力范围的决策（如破坏性接口变更、隐私边界问题），应明确告知使用者而不是擅自决定。
+- **身份表达（以 AI Agent 口吻提交）**：Agent 在 issue / PR / commit / 评论中的所有文字，一律以**自身（AI Agent）的口吻**书写，不以背后使用者（人类）的口吻或人称发言。示例：用"我的使用者提出…"或直接陈述需求/结论，不用"我要…我做了…"这类人类第一人称。**署名与口吻分离**：提交者署名（commit author）可以使用背后使用者的 GitHub 账号 / 邮箱（Agent 使用使用者账号提交是允许的），但所有文字必须以 Agent 自身口吻书写，不得以人类第一人称发言。让作者和审查方（也可能都是 AI Agent）能一眼区分"这是 Agent 提交的内容"与"这是使用者本人的需求"。
+
+### 1.1 贡献模型：功能一律做插件，核心只收 fix 与底座演进
+
+本仓库的**贡献模型**在 PR-3「解冻」后正式切换为**插件优先**：
+
+- **新功能一律做成插件**：功能贡献者先读 [docs/PLUGIN-DEV.md](./docs/PLUGIN-DEV.md)（插件开发指南）与 [docs/PLUGIN-API.md](./docs/PLUGIN-API.md)（契约 v1.1），在 `plugins/official/<name>/`（随主仓发布）或 `plugins/local/<name>/`（用户私有）里新建一个插件文件夹，经 `register(api)` + `api.registerTool` 暴露 MCP 工具。可复制 [docs/plugin-template/](./docs/plugin-template/) 模板起步。**功能代码不得进 `core/`、不得改核心运行时、不得触碰 `ctx`。**
+- **核心（`core/`）只收两类改动**：① bug/缺陷修复；②底盘演进（插件运行所需的基础设施，如 `plugin-loader.js` / `plugin-api.js` / `registry.js` / 核心服务注册表 `registerCoreServices()` 的能力扩展）。核心不收「某个具体业务功能的实现」。
+- **新增工具需登记注册名**：插件经 `api.registerTool` 注册的工具，只有其名字在 `core/tool-order.json` 中才会出现在 `tools/list`（`registry.listTools()` 只按该清单遍历）。新增功能工具时，把工具名补进 `core/tool-order.json` 属于「底座演进」类改动，一并随插件 PR 提交（并同步登记进 `skills/vrc-monitor-agent/SKILL.md`「MCP 工具」权威清单）。
+- **三件套（持续演进）**：核心工具（`core/tools/*`，自声明 `tools` 数组、经 `core/registry.js` 注册）＋ 插件（`plugins/official/*`，默认导出 `register(api)`、经 `api.registerTool` 注册）＋ 核心注册表（`core/registry.js`）统一并入 `listTools()` 输出。核心工具走 `ctx`，插件一律走 `api.*`，两者最终对 Agent 呈现为同一套 MCP 工具。
+- **插件即文档**：每个插件在 [docs/plugin-template/](./docs/plugin-template/) 模板下自带 `plugin.json` + `index.js` + `SKILL.md`（可运行骨架）；新插件照抄模板改名即可。
 
 ## 2. 提交 PR 的要求
 
@@ -28,8 +40,10 @@ PR 由 AI Agent 编写提交（人类只提出需求、不直接编码）。以�
 8. **文档使用中文**：README / AGENTS.md / skills 均为中文，新增或更新的文档用中文写。
 9. **不提交任何密钥**：`credentials.json`、cookie、token、密码、IMAP 授权码严禁出现在 commit、PR 描述、issue、日志或测试输出中。提交前自查。
 10. **MIT 许可延续**：保持 MIT 许可证及版权声明；提交代码即视为同意以 MIT 协议授权给项目。
-11. **验证说明**：PR 描述必须写明「需求来源 → 实现方式 → 验证过程与结果」三段式说明（PR 的审查方也可能是 AI Agent，需要可复现的验证信息）。可参考 `test-apis.mjs` / `test-websocket.mjs` / `test-ws-direct.mjs`。
+11. **验证说明**：PR 描述必须写明「需求来源 → 实现方式 → 验证过程与结果」三段式说明（PR 的审查方也可能是 AI Agent，需要可复现的验证信息）。可参考 `test/test-apis.mjs` / `test/test-websocket.mjs` / `test/test-ws-direct.mjs`。
 12. **平台专属代码（如 Windows 命名管道）必须满足**：平台门控（非目标平台直接禁用）、探测失败静默回退到跨平台路径、封装 `core/` 模块与跨平台路径共用同一入口、文档中标注适用平台与回退行为。禁止以「平台专属」为由绕过第 2 条（无个人环境硬编码）与第 5 条（文档同步）。
+13. **以 AI Agent 口吻提交**：commit 信息、PR 描述、issue 正文一律用 Agent 自身口吻书写（见 §1「身份表达」），不冒用背后使用者的人称（署名可以用使用者账号，但口吻必须是 Agent）；需求来源段落（第 11 条三段式说明中的"需求来源"）写"使用者提出…"而非"我需要…"，让作者与审查方清楚区分 Agent 的陈述与使用者的原始需求。
+14. **响应审核后必须请求再次审核**：收到审核方 REQUEST_CHANGES（或带修改意见的 COMMENT / 打回评论）并完成修复、推送新 commit 后，**必须在同一 PR 的评论中发一条「请求再次审核」**（标记格式见 AGENT-REVIEW.md §2.7），作为触发审核方复测的动作。**只推 commit 不发请求评论 = 视为未响应审核**，审核方不会对该轮修复执行复测；每响应一轮 REQUEST_CHANGES 都要重复此动作（收到 APPROVE 后不再需要）。
 
 > 目前仓库没有 CI，上述脚本是手动验证工具。合并决策由作者（或其 AI Agent）实际运行验证后作出。
 
@@ -55,7 +69,7 @@ PR 由 AI Agent 编写提交（人类只提出需求、不直接编码）。以�
   - 不读取 VRChat 客户端安装目录、不依赖 GUI / 桌面环境；
   - 不引入个人环境硬编码（本机路径、个人代理等，见 §2 第 2 条）；
   - 探测与发送逻辑带超时保护，失败快速回退，不影响服务本身。
-- 所有数据来自 VRChat API（REST + WebSocket），不读取 VRChat 客户端安装目录。`migrate-vrcx0.mjs` 只是可选的 VRCX-0 历史数据迁移工具，不是运行时依赖。
+- 所有数据来自 VRChat API（REST + WebSocket），不读取 VRChat 客户端安装目录。`scripts/migrate-vrcx0.mjs` 只是可选的 VRCX-0 历史数据迁移工具，不是运行时依赖。
 
 ### 3.2 不假设操作系统
 
@@ -73,6 +87,16 @@ PR 由 AI Agent 编写提交（人类只提出需求、不直接编码）。以�
 
 - 端口、绑定地址、数据目录、Node 路径等运行参数应可通过环境变量覆盖。
 - 现状：端口（`start-monitor.js` 中硬编码 8799）与绑定地址（127.0.0.1）是已知限制，改造方向是环境变量可配置；已有 `VRC_MONITOR_DIR` / `VRC_MONITOR_NODE` 支持。**新增参数直接做成环境变量可配置，不要新增硬编码。**
+- X 博主抓取相关（`core/fetch-x-worlds.js`，三通道降级）：
+  - `VRC_MONITOR_X_SEARCH_QUERY_ID`：X SearchTimeline GraphQL 的 queryId（默认 `hyPfJYJ_XAtDYoslQc-Rgg`）。X 会不定期轮换 queryId 导致 SearchTimeline 兜底失效，更新方法：从 x.com 访问页面的 JS bundle，或社区维护文档（如 github.com/fa0311/TwitterInternalAPIDocument 的 `docs/json/API.json`，搜 `SearchTimeline` 的 `queryId`）查询最新值后覆盖，无需改代码。
+  - `VRC_MONITOR_X_MIN_TWEETS`：Nitter RSS 返回推文数低于该值时，尝试用 X SearchTimeline 补充并合并去重（默认 0 = 仅当 Nitter 完全失败才降级；设 >0 让高频博主「Nitter 只回 ~20 条覆盖不全」时也触发补充，缓解漏抓）。
+  - `VRC_MONITOR_X_PLAYWRIGHT`：Playwright 浏览器抓取开关。默认开启（`1`/`true`/空），设为 `0` 时禁用浏览器通道，直接走 Nitter RSS → SearchTimeline 链。
+  - `VRC_MONITOR_X_PLAYWRIGHT_INSTANCES`：浏览器抓取入口实例列表，逗号分隔（默认 `https://nitter.tiekoetter.com`）。可配置多个 Nitter 实例作为回退。
+  - `VRC_MONITOR_X_PLAYWRIGHT_CHANNEL`：Playwright 浏览器通道（默认 `msedge`）。可选 `msedge`、`chrome`、`chromium`，需已安装对应浏览器且 Playwright 已 `npx playwright install`。
+  - `VRC_MONITOR_X_PLAYWRIGHT_TIMEOUT_MS`：浏览器 goto / waitForSelector 超时（默认 45000 ms）。
+  - `VRC_MONITOR_X_RESOLVE_TCO`：t.co 短链解包开关。默认开启（`1`/`true`/空），设 `0` 时关闭。推文里的世界链接常被 X 压缩成 `https://t.co/XXXX` 短链（探跡家もっけい、fox_yata9 等博主的世界推荐全在短链里），t.co 现在返回 **200 HTML + `<meta refresh>`**（非 HTTP 302），抓 body 解析 `URL=` 才能拿到真实 `wrld_` 链接。解包在 `fetchCreatorTweets` 统一入口对三个通道（浏览器/Nitter/SearchTimeline）批量执行（并发 3、单链接超时 8s、整体 30s），失败静默、不影响主流程。
+  - **浏览器抓取现在作为 `x_scan_creators` / `x_world_digest` 的默认主通道**（Nitter RSS / SearchTimeline 2026 已失效，保留作降级）。
+  - **注意**：Anubis 会拦截无头浏览器，浏览器抓取必须有头（`headless:false`，默认离屏+最小化，窗口置于 `-2400,-2400`）；服务跑在无头 Linux 服务器 / 容器时需要 `xvfb-run` 等提供虚拟显示（该路径待验证）。
 
 ### 3.5 网络环境差异
 
@@ -95,8 +119,8 @@ PR 由 AI Agent 编写提交（人类只提出需求、不直接编码）。以�
 
 服务可能被部署进 Docker、K8s 或 NAS 套件里，遵守以下约定：
 
-- **无状态 + 数据卷挂载**：数据库（`vrc-monitor.sqlite3`）和 `credentials.json` 应通过挂载卷 / 环境变量提供，容器本身可随时重建。禁止把数据写死在镜像内。
-- **日志走 stdout**：容器 / 进程管理器只采集 stdout，不要新增「写日志文件」的逻辑（或做成可选）。
+- **无状态 + 数据卷挂载**：数据库（`data/vrc-monitor.sqlite3`）和 `credentials.json` 应通过挂载卷 / 环境变量提供，容器本身可随时重建。禁止把数据写死在镜像内。
+- **日志默认写 stdout**：容器 / 进程管理器只采集 stdout，服务必须始终保留 stdout 输出（Hermes 插件 / Docker / systemd 采集都靠它）。如需文件日志（本地排障 / 历史回溯），走 `core/logger.js` 的可选文件输出——它默认同时写 stdout 与 `VRC_MONITOR_LOGGER_DIR` 下的文件，且 stdout 永远保留（`VRC_MONITOR_LOGGER_CONSOLE=0` 可仅关 console，但一般不建议）。不得用独立的「写日志文件」模块绕过 logger。
 - **信号处理**：不假设有 systemd / 服务管理器兜底。进程要优雅处理 `SIGTERM` / `SIGINT`（关闭 WebSocket、正常收尾 SQLite 事务），让容器编排能安全停止。
 - **端口与绑定**：当前绑定 `127.0.0.1:8799` 意味着外部（宿主机 / 其他容器）无法直连；需要对外提供服务时，绑定地址要可配置，且暴露到公网前必须有鉴权（本服务目前无鉴权，默认只允许本机访问是有意为之）。
 - **基础镜像**：better-sqlite3 的原生二进制在 glibc 发行版（如 `node:slim`）上最稳；Alpine（musl）需要确认 prebuilt 可用，或改用 glibc 镜像，别默认 Alpine。
@@ -106,7 +130,7 @@ PR 由 AI Agent 编写提交（人类只提出需求、不直接编码）。以�
 
 可能跑在 1~2GB 内存的 NAS 或便宜 VPS 上，遵守以下约定：
 
-- **数据源是 push（WebSocket），不是 pull**：事件流实时推送，不要新增「每 N 秒全量轮询好友状态」之类的兜底逻辑（`migrate-vrcx0.mjs` / `analyze-db.mjs` 是一次性工具，不算）。
+- **数据源是 push（WebSocket），不是 pull**：事件流实时推送，不要新增「每 N 秒全量轮询好友状态」之类的兜底逻辑（`scripts/migrate-vrcx0.mjs` / `scripts/analyze-db.mjs` 是一次性工具，不算）。
 - **REST 调用走限流**：所有 VRChat API 请求必须经过 `core/rate-limiter.js` 的节奏，新增的「状态查询」类功能同样受限流约束。
 - **避免定时任务重叠**：定时任务（备份、周报、重连）要防止上次没跑完又触发下一次（加锁或错峰）。
 - **内存敏感**：不要在内存里长期缓存全量事件（当前设计是 SQLite 落盘 + 按需查询），新增聚合逻辑优先用 SQL 而非把数据全捞进内存。
@@ -121,26 +145,26 @@ PR 由 AI Agent 编写提交（人类只提出需求、不直接编码）。以�
 ## 5. 代码规范
 
 - **语言**：JavaScript，ESM（`package.json` 中 `"type": "module"`）。
-- **Node 版本**：≥ 18（better-sqlite3 v12 的要求；本地开发推荐 22.x）。`package.json` 已声明 `engines` 字段约束。
-- **风格**：跟随现有代码风格（`start-monitor.js` 薄入口与 `core/` 下的模块 + `core/handlers/` 下的 handler）。
-- **模块划分**：`start-monitor.js` 约 200 行薄入口，新增功能放 `core/` 下独立模块（参考 `storage.js` / `ws-manager.js` / `server-context.js` / `mcp-definitions.js` 的拆分方式）。MCP 工具 handler 放 `core/handlers/` 子目录，按功能域分拆文件（参考 `recommend.js` / `friends.js` / `events.js` / `groups.js` / `media.js` / `misc.js` / `instance.js`），通过 `ctx` 共享上下文访问运行时状态。RPC 分发在 `core/rpc-router.js`，HTTP 服务在 `core/http-server.js`。
+- **Node 版本**：≥ 22（better-sqlite3 v12 要求 Node ≥ 20，且其 Windows 预编译二进制仅覆盖 Node 22+，为统一 CI 测试面与跨平台可装性，对齐到 ≥ 22；本地开发推荐 22.x）。`package.json` 已声明 `engines` 字段约束。
+- **风格**：跟随现有代码风格（`start-monitor.js` 薄入口与 `core/` 下的模块 + `core/tools/` 下的核心工具 + `plugins/official/` 下的插件）。
+- **模块划分**：`start-monitor.js` 约 360 行薄入口，新增核心逻辑放 `core/` 下独立模块（参考 `storage.js` / `ws-manager.js` / `server-context.js` / `registry.js` / `plugin-loader.js` 的拆分方式）。MCP 工具分两层：核心工具放 `core/tools/`（每个文件默认导出 `tools` 数组、自声明 def，经 `core/registry.js` 注册）；插件能力放 `plugins/official/<域>/index.js`（默认导出 `register(api)`，经 `api.registerTool` 注册）。核心工具经 `ctx` 共享上下文访问运行时状态；**插件一律走 `api.*`，不触碰 `ctx`**（见 [docs/PLUGIN-DEV.md](./docs/PLUGIN-DEV.md)）。工具分发在 `core/registry.js`，HTTP 服务在 `core/http-server.js`。
 - **平台专属逻辑**：Windows 专属增强（命名管道等）一律封装进 `core/` 独立模块，运行时探测 + 静默回退（见 §3.1），禁止散落在 CLI 脚本或 MCP handler 里。
 - **新功能默认做成 MCP 工具，禁止只写孤立 CLI 脚本**（2026-08-09 用户要求固化）：本项目面向 AI Agent，Agent 通过 MCP 接口（`tools/call`）与功能交互；独立脚本无法被 Agent 直接调用，等于功能不可达。开发要求：
-  - 新功能的标准形态是注册 MCP 工具（工具定义在 `core/mcp-definitions.js` + handler 函数在 `core/handlers/` 对应文件 + RPC case 在 `core/rpc-router.js` 三件套），Agent 一条 `tools/call` 即可使用。
+  - 新功能的标准形态是注册 MCP 工具：核心工具在 `core/tools/<域>.js` 自声明 `tools` 数组；插件能力在 `plugins/official/<域>/index.js` 经 `register(api)` 用 `api.registerTool` 定义。两者最终统一并入 `core/registry.js` 的注册表，Agent 一条 `tools/call` 即可使用。
   - 若确需保留独立入口（如 CLI 脚本 / 定时任务），**核心逻辑必须抽到 `core/` 下的共享模块**，CLI 与 MCP handler 双复用——禁止同一逻辑在两处各写一份（2026-08-09 实操：`new-worlds-tracker.mjs` 的拉取/过滤/评分/分类逻辑抽到 `core/new-worlds.js`，CLI 降级为薄封装；2026-08-10 该 CLI 薄封装已被移除，功能仅保留 MCP 工具形态，规范得到验证）。
-  - MCP handler **复用主服务登录态**（`ctx.serverState.authUser` + `ctx.api` 实例），不要重复实现登录 / OTP / 凭据读取（参考 `handleGetWeeklyReport`）；只有独立 CLI 场景才自带认证。
+  - MCP handler（核心工具）**复用主服务登录态**（`ctx.serverState.authUser` + `ctx.api` 实例），不要重复实现登录 / OTP / 凭据读取；插件工具改用 `api.vrchat.fetch` 调用、经 `api.consume` 复用核心服务，同样不自行实现登录/凭据（见 [docs/PLUGIN-DEV.md](./docs/PLUGIN-DEV.md)）。只有独立 CLI 场景才自带认证。
   - 数据库读写走 `storage`（`_query` / `_run` / `db.transaction`），建表沿用 `core/init-db.sql` 幂等写法。
-  - 文档同步：新增工具后 README / AGENTS.md / `skills/vrc-monitor-agent/SKILL.md` 三处工具表 + 工具数必须同步（`grep '个工具'` 核对）。
+  - 文档同步：新增工具必须登记进 `skills/vrc-monitor-agent/SKILL.md`「MCP 工具」章节（**唯一权威工具表**，2026-08-15 决策，避免多表重复维护）；README 的 MCP 工具段与 AGENTS.md 工具列举为采样说明，新增工具后顺带核对（工具清单漂移检测用 `python3 scripts/check-doc-drift.py`）。
   - **限流不要嵌套**（2026-08-09 真实死锁事故）：handler 内部逐请求 `rateLimiter.execute` 时，RPC case 层**不要再包一层** `rateLimiter.execute`——外层执行时 `_processing=true`，内层请求永远排不上队，整个 handler 挂死（`scan_new_worlds` 首版即如此，120s 超时；修复：case 层裸调，内部已逐请求限流）。
 - **错误处理**：异步路径必须有 try/catch 或 Promise 拒绝处理；WebSocket 消息处理不得因单条消息异常导致服务中断。
-- **日志**：沿用现有 `log()` 输出风格（中文 + emoji），不引入额外日志库。
+- **日志**：统一走 `core/logger.js`（自实现，中文 + emoji 风格），用 `getLogger('<组件名>')` 命名子 logger，不要裸 `console.*`（启动失败/凭据缺失/崩溃兜底路径除外）；**禁止引入第三方日志库**（pino/winston 等，与零依赖原则冲突）。日志变量统一 `VRC_MONITOR_LOGGER_*` 前缀（见 AGENTS.md 环境变量表）。
 - **SQL**：建表 / 索引沿用 `core/init-db.sql` 的幂等写法（`IF NOT EXISTS`）；查询一律用参数占位符，禁止字符串拼接 SQL。
 
 ## 6. 测试与 CI
 
-- **现状**：没有 CI。手动验证脚本：`test-apis.mjs`（REST API）、`test-websocket.mjs` / `test-ws-direct.mjs`（WebSocket）、`analyze-db.mjs`（数据库分析）。合并以作者实际运行为准。
-- **Agent 义务**：涉及 API / WebSocket / 数据库的功能改动，Agent 必须在 PR 描述写明验证方式；能跑现有脚本就跑一遍，不能跑要说明原因。Agent 提交前必须实际运行验证，不能只做静态分析就声称完成。
-- **CI 规划（待建设）**：未来接入 GitHub Actions，覆盖 Node 18/20/22 × Ubuntu + Windows + macOS 的启动与健康检查矩阵。注意：**CI 里不能放真实 VRChat 凭据**——自动化测试只能覆盖「无凭据也能验证」的部分（模块加载、DB 初始化、参数校验），涉及真实登录的验证仍需人工完成（可用 secrets 里的测试账号，但绝不能泄露到日志）。
+- **现状（含 PR-3 起）**：已接入 GitHub Actions（`.github/workflows/ci.yml`），对 Node 22 × Ubuntu/Windows 跑**无凭据冒烟**：`node test/test-registry.mjs`（注册表完整性，工具数、顺序+定义+handler）、`node scripts/dump-tools.mjs`（权威工具清单，行数与 core/tool-order.json 动态对齐）、`node test/test-migrate-data.mjs`（issue #103 回归：无 data/ 目录启动不崩 + 迁移引导行为/warn 提示）、`python scripts/check-doc-drift.py --json`（文档漂移，`has_drift` 必须为 false）。**CI 里一份真实 VRChat 凭据都没有**，自动化只覆盖「无凭据也能验证」的部分（模块加载、插件加载、DB 初始化、注册表完整、文档一致），涉及真实登录的验证仍需作者人工完成（可用 secrets 里的测试账号，但绝不能泄露到日志）。手动验证脚本：`test/test-apis.mjs`（REST API）、`test/test-websocket.mjs` / `test/test-ws-direct.mjs`（WebSocket）、`scripts/analyze-db.mjs`（数据库分析）。合并以作者实际运行为准，并参考 CI 冒烟结果。
+- **Agent 义务**：涉及 API / WebSocket / 数据库的功能改动，Agent 必须在 PR 描述写明验证方式；能跑现有脚本就跑一遍（尤其 `test/test-registry.mjs` / `scripts/check-doc-drift.py`），不能跑要说明原因。Agent 提交前必须实际运行验证，不能只做静态分析就声称完成。
+- **CI 里的凭据红线**：workflow 文件及其他自动化路径**严禁**出现任何真实凭据、Cookie、token、密码、IMAP 授权码（`credentials.json` 已被 gitignore 排除）。自动化测试账号如需纳入 CI，一律走 GitHub repo secrets 且绝不回显到日志。
 - 新增测试脚本命名沿用 `test-*.mjs` 风格，方便 CI 统一发现。
 
 ## 7. AI Agent 提交前自检清单
@@ -150,7 +174,7 @@ PR 由 AI Agent 编写提交（人类只提出需求、不直接编码）。以�
 - [ ] `git status` 中没有 `credentials.json` / cookie / token 等敏感文件
 - [ ] 无本机路径、个人代理、个人账号信息残留
 - [ ] `node start-monitor.js` 可正常启动，`/health` 返回 `authenticated: true`、`ws.status: connected`
-- [ ] 至少跑一遍相关测试脚本（`test-apis.mjs` 等），或说明为什么不适用
+- [ ] 至少跑一遍相关测试脚本（`test/test-apis.mjs` 等），或说明为什么不适用
 - [ ] 新增 / 修改的功能已在 README 或 skills 文档中登记
 - [ ] 数据库变更已考虑存量库迁移
 - [ ] 提交信息符合 Conventional Commits 格式

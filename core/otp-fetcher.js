@@ -8,14 +8,15 @@ import { ctx } from './server-context.js';
 
 export async function fetchOtpFromEmail() {
   const { __dirname, CRED_FILE } = ctx.paths;
-  const otpScript = path.join(__dirname, 'fetch-otp.py');
+  const otpScript = path.join(__dirname, 'scripts', 'fetch-otp.py');
   if (!existsSync(otpScript)) {
     throw new Error('fetch-otp.py 不存在');
   }
   const creds = JSON.parse(readFileSync(CRED_FILE, 'utf-8'));
   const { execSync } = await import('node:child_process');
   const authCode = creds.imap_auth_code || creds.qqmail_auth_code || '';
-  let cmd = `python "${otpScript}" "${creds.email}" "${authCode}"`;
+  const pythonBin = process.env.VRC_MONITOR_PYTHON || 'python';
+  let cmd = `"${pythonBin}" "${otpScript}" "${creds.email}" "${authCode}"`;
   if (creds.imap_host) cmd += ` "${creds.imap_host}"`;
   const otp = execSync(cmd, { timeout: 15000, encoding: 'utf-8' }).trim();
   return otp;

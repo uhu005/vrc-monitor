@@ -7,51 +7,148 @@
  * 是原生绑定 + WAL 模式：每次写即时落盘、崩溃安全、支持并发读。
  */
 import Database from 'better-sqlite3';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { backupDatabase } from './backup.js';
+import { getLogger } from './logger.js';
+
+// 命名日志：storage 组件标签，替代原裸 console.*（保留 [storage] 语义由 [storage] 标签承接）
+const log = getLogger('storage');
+import { SocialAnalytics } from './analytics/social.js';
+import { WorldStore } from './domains/world-store.js';
+import { CacheStore } from './domains/cache-store.js';
+import { ContactsStore } from './domains/contacts-store.js';
+import { XWorldsStore } from './domains/x-worlds-store.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DDL_PATH = path.join(__dirname, 'init-db.sql');
+const X_WORLDS_DDL_PATH = path.join(__dirname, 'init-x-worlds.sql');
 
 export class Storage {
+  constructor() {
+    this.social = new SocialAnalytics(this);
+    this.world = new WorldStore(this);
+    this.cache = new CacheStore(this);
+    this.contacts = new ContactsStore(this);
+    this.xWorlds = new XWorldsStore(this);
+  }
+
   /** @type {import('better-sqlite3').Database} */
   db = null;
   dbPath = '';
 
   async init(dbPath) {
     this.dbPath = dbPath;
+    mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('busy_timeout = 5000');
 
     const ddl = readFileSync(DDL_PATH, 'utf-8');
+    // 迁移：旧库表名 new_worlds → world_kb（2026-08-16 更名，幂等）
+    // ⚠️ 必须在 DDL exec 之前执行！否则 CREATE TABLE IF NOT EXISTS world_kb 会先建出
+    // 空表，RENAME 因名字冲突失败，老数据残留在 new_worlds 中（代码全查 world_kb → 空）。
+    // 顺序：老库（仅 new_worlds）→ RENAME 带走数据 + 索引跟随 → DDL 建 idx_world_kb_visited。
+    const oldKbCols = this._query(`PRAGMA table_info(new_worlds)`);
+    const newKbCols = this._query(`PRAGMA table_info(world_kb)`);
+    if (oldKbCols.length > 0 && newKbCols.length === 0) {
+      this._run(`ALTER TABLE new_worlds RENAME TO world_kb`);
+      this._run(`DROP INDEX IF EXISTS idx_new_worlds_visited`);
+    }
     this.db.exec(ddl);
+    // X 博主世界推荐表（x_world_digest 工具，幂等 CREATE IF NOT EXISTS）
+    try {
+      const xddl = readFileSync(X_WORLDS_DDL_PATH, 'utf-8');
+      this.db.exec(xddl);
+    } catch (e) {
+      log.warn(`x-worlds DDL 加载失败: ${e.message}`);
+    }
+    // 迁移：旧库 tracked_non_friends 缺状态列（非好友追踪在线状态展示，幂等）
+    const tnfCols = this._query(`PRAGMA table_info(tracked_non_friends)`);
+    if (!tnfCols.some(c => c.name === 'status')) {
+      this._run(`ALTER TABLE tracked_non_friends ADD COLUMN status TEXT DEFAULT ''`);
+    }
+    if (!tnfCols.some(c => c.name === 'status_description')) {
+      this._run(`ALTER TABLE tracked_non_friends ADD COLUMN status_description TEXT DEFAULT ''`);
+    }
+    if (!tnfCols.some(c => c.name === 'location')) {
+      this._run(`ALTER TABLE tracked_non_friends ADD COLUMN location TEXT DEFAULT ''`);
+    }
+    if (!tnfCols.some(c => c.name === 'removed_at')) {
+      this._run(`ALTER TABLE tracked_non_friends ADD COLUMN removed_at TEXT DEFAULT ''`);
+    }
     // 迁移：旧库 world_cache 缺 note 列
     const worldCols = this._query(`PRAGMA table_info(world_cache)`);
     if (!worldCols.some(c => c.name === 'note')) {
       this._run(`ALTER TABLE world_cache ADD COLUMN note TEXT`);
     }
-    // 迁移：旧库 new_worlds 缺 sleep_ok 列（recommend_join 睡觉图评分用，幂等）
-    const nwCols = this._query(`PRAGMA table_info(new_worlds)`);
+    // 迁移：旧库 world_cache 缺 favorited 列（favorite_world 云端收藏本地标记，幂等）
+    const wcFavCols = this._query(`PRAGMA table_info(world_cache)`);
+    if (!wcFavCols.some(c => c.name === 'favorited')) {
+      this._run(`ALTER TABLE world_cache ADD COLUMN favorited INTEGER DEFAULT 0`);
+    }
+    // 迁移：旧库 world_kb 缺 sleep_ok 列（recommend_join 睡觉图评分用，幂等）
+    const nwCols = this._query(`PRAGMA table_info(world_kb)`);
     if (!nwCols.some(c => c.name === 'sleep_ok')) {
-      this._run(`ALTER TABLE new_worlds ADD COLUMN sleep_ok INTEGER DEFAULT 0`);
+      this._run(`ALTER TABLE world_kb ADD COLUMN sleep_ok INTEGER DEFAULT 0`);
     }
     // 迁移：旧库 join_choices 缺 world_tags 列（类型偏好学习用，幂等）
     const jcCols = this._query(`PRAGMA table_info(join_choices)`);
     if (!jcCols.some(c => c.name === 'world_tags')) {
       this._run(`ALTER TABLE join_choices ADD COLUMN world_tags TEXT DEFAULT ''`);
     }
-    // 迁移：旧库 new_worlds 缺 tags/description/source 列（scan_new_worlds upsert 依赖，幂等）
-    const nwCols2 = this._query(`PRAGMA table_info(new_worlds)`);
+    // 迁移：旧库 world_kb 缺 tags/description 列（scan_new_worlds upsert 依赖，幂等）
+    const nwCols2 = this._query(`PRAGMA table_info(world_kb)`);
     if (!nwCols2.some(c => c.name === 'tags')) {
-      this._run(`ALTER TABLE new_worlds ADD COLUMN tags TEXT DEFAULT ''`);
+      this._run(`ALTER TABLE world_kb ADD COLUMN tags TEXT DEFAULT ''`);
     }
     if (!nwCols2.some(c => c.name === 'description')) {
-      this._run(`ALTER TABLE new_worlds ADD COLUMN description TEXT DEFAULT ''`);
+      this._run(`ALTER TABLE world_kb ADD COLUMN description TEXT DEFAULT ''`);
     }
-    if (!nwCols2.some(c => c.name === 'source')) {
-      this._run(`ALTER TABLE new_worlds ADD COLUMN source TEXT DEFAULT 'new'`);
+    // 迁移：旧库 world_kb 缺 user_rating 列（rate_world 用户反馈，幂等）
+    const nwCols3 = this._query(`PRAGMA table_info(world_kb)`);
+    if (!nwCols3.some(c => c.name === 'user_rating')) {
+      this._run(`ALTER TABLE world_kb ADD COLUMN user_rating INTEGER DEFAULT 0`);
+    }
+    // 迁移：旧库 world_kb 缺 author_id 列（作者维度推荐用，幂等）
+    const nwCols4 = this._query(`PRAGMA table_info(world_kb)`);
+    if (!nwCols4.some(c => c.name === 'author_id')) {
+      this._run(`ALTER TABLE world_kb ADD COLUMN author_id TEXT DEFAULT ''`);
+    }
+    // 迁移：旧库 world_kb 缺 backlog 系列列（待逛地图列表，幂等）
+    const nwCols5 = this._query(`PRAGMA table_info(world_kb)`);
+    if (!nwCols5.some(c => c.name === 'backlog')) {
+      this._run(`ALTER TABLE world_kb ADD COLUMN backlog INTEGER DEFAULT 0`);
+    }
+    if (!nwCols5.some(c => c.name === 'backlog_added_at')) {
+      this._run(`ALTER TABLE world_kb ADD COLUMN backlog_added_at TEXT`);
+    }
+    if (!nwCols5.some(c => c.name === 'backlog_reason')) {
+      this._run(`ALTER TABLE world_kb ADD COLUMN backlog_reason TEXT DEFAULT ''`);
+    }
+    if (!nwCols5.some(c => c.name === 'backlog_priority')) {
+      this._run(`ALTER TABLE world_kb ADD COLUMN backlog_priority INTEGER DEFAULT 0`);
+    }
+    // 迁移：world_kb.source 是死列（issue #78）——从未被写入/读取，仅靠误导性注释自我解释，
+    // 与 events.source 同名易混淆，且 DDL 声称的「scan_new_worlds upsert 依赖」实际不存在。
+    // 幂等删除：PRAGMA 判列存在再 DROP（SQLite ≥3.35 支持；better-sqlite3 已满足）。
+    const nwCols6 = this._query(`PRAGMA table_info(world_kb)`);
+    if (nwCols6.some(c => c.name === 'source')) {
+      this._run(`ALTER TABLE world_kb DROP COLUMN source`);
+    }
+    // 迁移：历史 tags='' 脏数据统一为 '[]'（json_each 对空串抛 malformed JSON，Review R2）
+    this._run(`UPDATE world_kb SET tags = '[]' WHERE tags IS NULL OR tags = ''`);
+    // 迁移：旧库 friends 缺 bio/user_icon/pronouns 列（friend-profile 变更追踪用，幂等）
+    const friendCols = this._query(`PRAGMA table_info(friends)`);
+    if (!friendCols.some(c => c.name === 'bio')) {
+      this._run(`ALTER TABLE friends ADD COLUMN bio TEXT`);
+    }
+    if (!friendCols.some(c => c.name === 'user_icon')) {
+      this._run(`ALTER TABLE friends ADD COLUMN user_icon TEXT`);
+    }
+    if (!friendCols.some(c => c.name === 'pronouns')) {
+      this._run(`ALTER TABLE friends ADD COLUMN pronouns TEXT`);
     }
     return this;
   }
@@ -82,6 +179,37 @@ export class Storage {
     } else {
       this.db.prepare(sql).run();
     }
+  }
+
+  // 公开薄封装（消除外部对 this.db / _query / _run 的直接耦合）
+  query(sql, params = {}) {
+    if (Object.keys(params).length > 0) {
+      return this.db.prepare(sql).all(this._normParams(params));
+    }
+    return this.db.prepare(sql).all();
+  }
+
+  run(sql, params = {}) {
+    if (params !== undefined && Object.keys(params).length > 0) {
+      return this.db.prepare(sql).run(this._normParams(params));
+    }
+    return this.db.prepare(sql).run();
+  }
+
+  get(sql, params = {}) {
+    return this.db.prepare(sql).get(this._normParams(params));
+  }
+
+  exec(sql) {
+    return this.db.exec(sql);
+  }
+
+  transaction(fn) {
+    return this.db.transaction(fn);
+  }
+
+  backup(dir) {
+    return backupDatabase(this.db, dir);
   }
 
   // ── 事件流 ──
@@ -119,6 +247,65 @@ export class Storage {
     return this._query(sql, params);
   }
 
+  /**
+   * 批量取多个用户各自最新一条 friend-location 事件（get_online_friends 停留时长用）。
+   * 返回 Map<userId, {createdAt, content}>；某用户无事件则不在 Map 中。
+   * 窗口函数 PARTITION BY user_id 一次查询拿全，避免 N 次点查。
+   */
+  getLatestFriendLocations(userIds) {
+    if (!userIds || userIds.length === 0) return new Map();
+    const ph = userIds.map((_, i) => `$u${i}`).join(',');
+    const params = {};
+    userIds.forEach((id, i) => { params[`$u${i}`] = id; });
+    const rows = this._query(
+      `SELECT user_id, created_at, content_json FROM (
+         SELECT user_id, created_at, content_json,
+                ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at DESC) AS rn
+         FROM events
+         WHERE type = 'friend-location' AND user_id IN (${ph})
+       ) WHERE rn = 1`,
+      params
+    );
+    const map = new Map();
+    for (const r of rows) map.set(r.user_id, { createdAt: r.created_at, content: r.content_json });
+    return map;
+  }
+
+  /**
+   * 批量取每个用户本次在线会话的起点（get_online_friends 在线时长用，2026-08-16 新增）。
+   * 口径：会话起点 = 最近一次 friend-offline 之后最早的一条 friend-online。
+   * 为何不能直接取最新 friend-online：VRChat WS 重连/状态同步会重复推送 friend-online
+   * （实测 24h 527 条 vs ~30 人在线），最新一条会严重低估时长；MIN(>last_off) 天然跳过重复推送。
+   * 仅当用户从未有过 offline 记录时才取最早一条 friend-online（数据库记录以来首次上线）；
+   * 有 offline 但 offline 后无 online（事件丢失/数据不一致）→ 返回 NULL，调用方安全降级
+   * （避免把离线前时间当会话起点导致 onlineMinutes 高估，PR #36 审核 W1）。
+   * 返回 Map<userId, sessionStartIso|null>；无 friend-online 事件则不在 Map 中。
+   */
+  getOnlineSessionStarts(userIds) {
+    if (!userIds || userIds.length === 0) return new Map();
+    const ph = userIds.map((_, i) => `$u${i}`).join(',');
+    const params = {};
+    userIds.forEach((id, i) => { params[`$u${i}`] = id; });
+    const rows = this._query(
+      `WITH offs AS (
+         SELECT user_id, MAX(created_at) AS last_off FROM events
+         WHERE type='friend-offline' AND user_id IN (${ph}) GROUP BY user_id
+       )
+       SELECT e.user_id,
+              CASE WHEN o.last_off IS NULL THEN MIN(e.created_at)
+                   ELSE MIN(CASE WHEN e.created_at > o.last_off THEN e.created_at END) END
+              AS session_start
+       FROM events e
+       LEFT JOIN offs o ON e.user_id = o.user_id
+       WHERE e.type = 'friend-online' AND e.user_id IN (${ph})
+       GROUP BY e.user_id`,
+      params
+    );
+    const map = new Map();
+    for (const r of rows) map.set(r.user_id, r.session_start || null);
+    return map;
+  }
+
   getRecentEvents({ limit = 50, type } = {}) {
     let sql = `SELECT * FROM events`;
     const params = {};
@@ -145,46 +332,73 @@ export class Storage {
   // ── 好友状态 ──
 
   upsertFriend(friend) {
-    const params = {
-      $userId: friend.userId,
-      $displayName: friend.displayName || '',
-      $memo: friend.memo ?? null,
-      $trustLevel: friend.trustLevel ?? null,
-      $isOnline: friend.isOnline ? 1 : 0,
-      $location: friend.location || '',
-      $worldId: friend.worldId || '',
-      $worldName: friend.worldName || '',
-      $platform: friend.platform || '',
-      $status: friend.status || '',
-      $statusDescription: friend.statusDescription || '',
-      $avatarImageUrl: friend.avatarImageUrl || '',
-      $lastSeen: friend.lastSeen || '',
-      $lastOnline: friend.lastOnline || '',
-      $lastOffline: friend.lastOffline || '',
+    const userId = friend.userId;
+    // 只更新显式传入的字段：partial upsert（如 friend-location/friend-active 事件只带少数字段）
+    // 不得覆盖未传的 profile 字段。历史 bug（PR #56 审查实测复现）：location 事件穿插会
+    // 把 bio/status/avatar_image_url 等用 '' 覆盖，导致资料变更追踪基线被清空、main 上
+    // status/avatar 数据同源丢失。故按 key 存在性动态构建 SET 子句。
+    const columns = {
+      display_name: 'displayName',
+      memo: 'memo',
+      trust_level: 'trustLevel',
+      is_online: 'isOnline',
+      location: 'location',
+      world_id: 'worldId',
+      world_name: 'worldName',
+      platform: 'platform',
+      status: 'status',
+      status_description: 'statusDescription',
+      avatar_image_url: 'avatarImageUrl',
+      bio: 'bio',
+      user_icon: 'userIcon',
+      pronouns: 'pronouns',
+      last_seen: 'lastSeen',
+      last_online: 'lastOnline',
+      last_offline: 'lastOffline',
+    };
+    const norm = {
+      displayName: v => v || '',
+      memo: v => v ?? null,
+      trustLevel: v => v ?? null,
+      isOnline: v => v ? 1 : 0,
+      location: v => v || '',
+      worldId: v => v || '',
+      worldName: v => v || '',
+      platform: v => v || '',
+      status: v => v || '',
+      statusDescription: v => v || '',
+      avatarImageUrl: v => v || '',
+      bio: v => v || '',
+      userIcon: v => v || '',
+      pronouns: v => v || '',
+      lastSeen: v => v || '',
+      lastOnline: v => v || '',
+      lastOffline: v => v || '',
     };
 
+    const setCols = [];
+    const params = { $userId: userId };
+    for (const [col, key] of Object.entries(columns)) {
+      if (friend[key] === undefined) continue;  // 未传 → 不更新该列
+      const v = norm[key](friend[key]);
+      // display_name 空串不覆盖已有名字（issue #127）：offline/空 payload 事件会以 ''
+      // 覆盖已存名字，导致离线好友显示 '?'。UPDATE 时 CASE WHEN 非空才更新；参数始终设置供 INSERT。
+      const setExpr = col === 'display_name'
+        ? `display_name=CASE WHEN $display_name <> '' THEN $display_name ELSE display_name END`
+        : `${col}=COALESCE($${col}, ${col})`;
+      params[`$${col}`] = v;
+      setCols.push(setExpr);
+    }
+    if (setCols.length === 0) return;
+
+    const insCols = ['user_id', ...Object.keys(columns).filter(c => friend[columns[c]] !== undefined)];
+    const insPh = insCols.map(c => c === 'user_id' ? '$userId' : `$${c}`);
+
     this._run(
-      `INSERT INTO friends (user_id, display_name, memo, trust_level, is_online, location,
-        world_id, world_name, platform, status, status_description, avatar_image_url,
-        last_seen, last_online, last_offline)
-       VALUES ($userId, $displayName, $memo, $trustLevel, $isOnline, $location,
-        $worldId, $worldName, $platform, $status, $statusDescription, $avatarImageUrl,
-        $lastSeen, $lastOnline, $lastOffline)
+      `INSERT INTO friends (${insCols.join(', ')})
+       VALUES (${insPh.join(', ')})
        ON CONFLICT(user_id) DO UPDATE SET
-        display_name=COALESCE($displayName, display_name),
-        memo=COALESCE($memo, memo),
-        trust_level=COALESCE($trustLevel, trust_level),
-        is_online=COALESCE($isOnline, is_online),
-        location=COALESCE($location, location),
-        world_id=COALESCE($worldId, world_id),
-        world_name=COALESCE($worldName, world_name),
-        platform=COALESCE($platform, platform),
-        status=COALESCE($status, status),
-        status_description=COALESCE($statusDescription, status_description),
-        avatar_image_url=COALESCE($avatarImageUrl, avatar_image_url),
-        last_seen=COALESCE($lastSeen, last_seen),
-        last_online=COALESCE($lastOnline, last_online),
-        last_offline=COALESCE($lastOffline, last_offline),
+        ${setCols.join(', ')}${setCols.length ? ',' : ''}
         updated_at=datetime('now')`,
       params
     );
@@ -203,186 +417,46 @@ export class Storage {
     return rows[0] || null;
   }
 
+  // 好友资料变更历史（friend-profile 变更追踪，2026-08-19 新增）
+  // 查询 events 表中 content_json.type 为 avatar/status/bio/user_icon/pronouns 的记录。
+  // 与 VRCX 迁移脚本（feed_avatar/feed_status/feed_bio）写入格式一致：顶层 type='friend-update'，
+  // 实际变更类型在 content_json.type 里。types 参数逗号分隔过滤（默认全部）。
+  getFriendProfileChanges(userId, { limit = 50, offset = 0, types } = {}) {
+    const validTypes = ['avatar', 'status', 'bio', 'user_icon', 'pronouns'];
+    let typesArr = validTypes;
+    if (types) {
+      typesArr = String(types).split(',').map(t => t.trim()).filter(t => validTypes.includes(t));
+      if (typesArr.length === 0) typesArr = validTypes;
+    }
+    const params = { $limit: limit, $offset: offset };
+    const placeholders = typesArr.map((t, i) => { params[`$t${i}`] = t; return `$t${i}`; }).join(',');
+    let sql = `SELECT * FROM events WHERE type = 'friend-update'
+               AND json_extract(content_json, '$.type') IN (${placeholders})`;
+    if (userId) { sql += ` AND user_id = $userId`; params.$userId = userId; }
+    sql += ` ORDER BY created_at DESC LIMIT $limit OFFSET $offset`;
+    return this._query(sql, params);
+  }
+
+  getFriendProfileChangeCount(userId, { types } = {}) {
+    const validTypes = ['avatar', 'status', 'bio', 'user_icon', 'pronouns'];
+    let typesArr = validTypes;
+    if (types) {
+      typesArr = String(types).split(',').map(t => t.trim()).filter(t => validTypes.includes(t));
+      if (typesArr.length === 0) typesArr = validTypes;
+    }
+    const params = {};
+    const placeholders = typesArr.map((t, i) => { params[`$t${i}`] = t; return `$t${i}`; }).join(',');
+    let sql = `SELECT COUNT(*) n FROM events WHERE type = 'friend-update'
+               AND json_extract(content_json, '$.type') IN (${placeholders})`;
+    if (userId) { sql += ` AND user_id = $userId`; params.$userId = userId; }
+    return this._query(sql, params)[0].n;
+  }
+
   searchFriends(query) {
     return this._query(
       `SELECT * FROM friends WHERE display_name LIKE $q OR memo LIKE $q ORDER BY display_name LIMIT 50`,
       { $q: `%${query}%` }
     );
-  }
-
-  // ── 世界缓存 ──
-
-  getWorldName(worldId) {
-    const rows = this._query(`SELECT * FROM world_cache WHERE world_id = $worldId`, { $worldId: worldId });
-    return rows[0] || null;
-  }
-
-  searchWorldsByName(keyword) {
-    const like = `%${keyword}%`;
-    const rows = this._query(
-      `SELECT world_id, name FROM world_cache WHERE name LIKE $like ORDER BY name LIMIT 20`,
-      { $like: like }
-    );
-    const eventRows = this._query(
-      `SELECT world_id, world_name AS name FROM events WHERE world_name LIKE $like AND world_id != '' GROUP BY world_id, world_name ORDER BY world_name LIMIT 20`,
-      { $like: like }
-    );
-    const seen = new Set();
-    const merged = [];
-    for (const r of [...rows, ...eventRows]) {
-      if (!r.world_id || seen.has(r.world_id)) continue;
-      seen.add(r.world_id);
-      merged.push({ worldId: r.world_id, name: r.name || '' });
-    }
-    return merged;
-  }
-
-  _recordWorldChanges(world) {
-    const old = this.getWorldName(world.worldId);
-    if (!old) return;
-    // 数据库列名 → upsertWorld 传入对象的驼峰字段名映射（避免取到 undefined）
-    const fieldMap = {
-      name: 'name',
-      description: 'description',
-      author_name: 'authorName',
-      image_url: 'imageUrl',
-      release_status: 'releaseStatus',
-      capacity: 'capacity',
-      tags: 'tags',
-    };
-    const fields = ['name', 'description', 'author_name', 'image_url', 'release_status', 'capacity', 'tags'];
-    const newTags = JSON.stringify(world.tags || []);
-    for (const f of fields) {
-      const oldValue = f === 'tags' ? String(old.tags ?? '') : String(old[f] ?? '');
-      const newValue = f === 'tags' ? newTags : String(world[fieldMap[f]] ?? '');
-      if (oldValue !== newValue) {
-        this._run(
-          `INSERT INTO world_history (world_id, field, old_value, new_value)
-           VALUES ($worldId, $field, $oldValue, $newValue)`,
-          { $worldId: world.worldId, $field: f, $oldValue: oldValue, $newValue: newValue }
-        );
-      }
-    }
-  }
-
-  upsertWorld(world) {
-    this._recordWorldChanges(world);
-    this._run(
-      `INSERT INTO world_cache
-       (world_id, name, author_id, author_name, description, image_url,
-        release_status, capacity, favorites, tags, updated_at)
-       VALUES ($worldId, $name, $authorId, $authorName, $description, $imageUrl,
-        $releaseStatus, $capacity, $favorites, $tags, datetime('now'))
-       ON CONFLICT(world_id) DO UPDATE SET
-        name = excluded.name,
-        author_id = excluded.author_id,
-        author_name = excluded.author_name,
-        description = excluded.description,
-        image_url = excluded.image_url,
-        release_status = excluded.release_status,
-        capacity = excluded.capacity,
-        favorites = excluded.favorites,
-        tags = excluded.tags,
-        updated_at = datetime('now')`,
-      {
-        $worldId: world.worldId, $name: world.name || '',
-        $authorId: world.authorId || '', $authorName: world.authorName || '',
-        $description: world.description || '', $imageUrl: world.imageUrl || '',
-        $releaseStatus: world.releaseStatus || '',
-        $capacity: world.capacity || 0, $favorites: world.favorites || 0,
-        $tags: JSON.stringify(world.tags || []),
-      }
-    );
-  }
-
-  upsertWorldsBatch(worlds) {
-    for (const w of worlds) {
-      this._recordWorldChanges(w);
-    }
-    const stmt = this.db.prepare(
-      `INSERT INTO world_cache
-       (world_id, name, author_id, author_name, description, image_url,
-        release_status, capacity, favorites, tags, updated_at)
-       VALUES ($worldId, $name, $authorId, $authorName, $description, $imageUrl,
-        $releaseStatus, $capacity, $favorites, $tags, datetime('now'))
-       ON CONFLICT(world_id) DO UPDATE SET
-        name = excluded.name,
-        author_id = excluded.author_id,
-        author_name = excluded.author_name,
-        description = excluded.description,
-        image_url = excluded.image_url,
-        release_status = excluded.release_status,
-        capacity = excluded.capacity,
-        favorites = excluded.favorites,
-        tags = excluded.tags,
-        updated_at = datetime('now')`
-    );
-    for (const w of worlds) {
-      stmt.run(this._normParams({
-        $worldId: w.worldId, $name: w.name || '',
-        $authorId: w.authorId || '', $authorName: w.authorName || '',
-        $description: w.description || '', $imageUrl: w.imageUrl || '',
-        $releaseStatus: w.releaseStatus || '',
-        $capacity: w.capacity || 0, $favorites: w.favorites || 0,
-        $tags: JSON.stringify(w.tags || []),
-      }));
-    }
-  }
-
-  // ── 群组缓存 ──
-
-  getGroupCached(groupId) {
-    const rows = this._query(`SELECT * FROM group_cache WHERE group_id = $g`, { $g: groupId });
-    return rows[0] || null;
-  }
-
-  upsertGroupCache({ groupId, name, description, memberCount }) {
-    this._run(
-      `INSERT INTO group_cache (group_id, name, description, member_count, updated_at)
-       VALUES ($g, $name, $desc, $mc, datetime('now'))
-       ON CONFLICT(group_id) DO UPDATE SET
-         name = excluded.name, description = excluded.description,
-         member_count = excluded.member_count, updated_at = datetime('now')`,
-      { $g: groupId, $name: name || '', $desc: description || '', $mc: memberCount || 0 }
-    );
-  }
-
-  setWorldNote({ worldId, note = '' }) {
-    this._run(
-      `INSERT INTO world_cache (world_id, name, note)
-       VALUES ($worldId, '', $note)
-       ON CONFLICT(world_id) DO UPDATE SET note = $note, updated_at = datetime('now')`,
-      { $worldId: worldId, $note: note }
-    );
-    const rows = this._query(`SELECT world_id, note FROM world_cache WHERE world_id = $worldId`, { $worldId: worldId });
-    const r = rows[0];
-    return { worldId: r.world_id, note: r.note };
-  }
-
-  getWorldHistory(worldId, limit = 50) {
-    const rows = this._query(
-      `SELECT field, old_value, new_value, changed_at FROM world_history WHERE world_id = $worldId ORDER BY id DESC LIMIT $limit`,
-      { $worldId: worldId, $limit: limit }
-    );
-    return rows.map(r => ({ field: r.field, oldValue: r.old_value, newValue: r.new_value, changedAt: r.changed_at }));
-  }
-
-  // ── 关注名单 ──
-
-  addToWatchlist(userId, displayName, priority = 0) {
-    this._run(
-      `INSERT OR REPLACE INTO watchlist (user_id, display_name, priority)
-       VALUES ($userId, $displayName, $priority)`,
-      { $userId: userId, $displayName: displayName || '', $priority: priority }
-    );
-  }
-
-  removeFromWatchlist(userId) {
-    this._run(`DELETE FROM watchlist WHERE user_id = $userId`, { $userId: userId });
-  }
-
-  getWatchlist() {
-    return this._query(`SELECT * FROM watchlist ORDER BY priority DESC, display_name`);
   }
 
   // ── 配置 ──
@@ -396,397 +470,35 @@ export class Storage {
     this._run(`INSERT OR REPLACE INTO config (key, value) VALUES ($key, $value)`, { $key: key, $value: String(value) });
   }
 
-  // ── 昵称映射 ──
-
-  getNicknames({ userId, query } = {}) {
-    if (userId) {
-      const rows = this._query(
-        `SELECT user_id, display_name, nickname, updated_at FROM nicknames WHERE user_id = $userId`,
-        { $userId: userId }
-      );
-      return rows.map(r => ({ userId: r.user_id, displayName: r.display_name, nickname: r.nickname, updatedAt: r.updated_at }));
-    }
-
-    if (query) {
-      const q = `%${query}%`;
-      const rows = this._query(
-        `SELECT user_id, display_name, nickname, updated_at FROM nicknames
-         WHERE display_name LIKE $q OR nickname LIKE $q
-         ORDER BY display_name`,
-        { $q: q }
-      );
-      return rows.map(r => ({ userId: r.user_id, displayName: r.display_name, nickname: r.nickname, updatedAt: r.updated_at }));
-    }
-
-    const rows = this._query(`SELECT user_id, display_name, nickname, updated_at FROM nicknames ORDER BY display_name`);
-    return rows.map(r => ({ userId: r.user_id, displayName: r.display_name, nickname: r.nickname, updatedAt: r.updated_at }));
-  }
-
-  setNickname({ userId, nickname, displayName = '' } = {}) {
-    this._run(
-      `INSERT INTO nicknames (user_id, display_name, nickname, updated_at)
-       VALUES ($userId, $displayName, $nickname, datetime('now'))
-       ON CONFLICT(user_id) DO UPDATE SET
-         display_name = CASE WHEN excluded.display_name = '' THEN nicknames.display_name ELSE excluded.display_name END,
-         nickname = excluded.nickname,
-         updated_at = datetime('now')`,
-      { $userId: userId, $displayName: displayName || '', $nickname: nickname }
-    );
-    const rows = this._query(
-      `SELECT user_id, display_name, nickname, updated_at FROM nicknames WHERE user_id = $userId`,
-      { $userId: userId }
-    );
-    const r = rows[0];
-    return { userId: r.user_id, displayName: r.display_name, nickname: r.nickname, updatedAt: r.updated_at };
-  }
-
   // ── 工具方法 ──
 
-  // ── 新增：查找同屏好友 ──
+  // ── 社交分析转发（核心实现在 core/analytics/social.js）──
 
-  findCompanions(userId, startTime, endTime) {
-    // 1. 获取目标用户的时间范围内所有 location 事件
-    //    - 查自己：user-location（自己的位置事件）
-    //    - 查好友：friend-location（好友的位置事件）
-    const userEvents = this._query(
-      `SELECT * FROM events WHERE user_id = $userId AND type IN ('user-location', 'friend-location')
-       AND created_at >= $start AND created_at <= $end
-       ORDER BY created_at ASC`,
-      { $userId: userId, $start: startTime, $end: endTime }
+  findCompanions(...args) { return this.social.findCompanions(...args); }
+  findFriendPairScreen(...args) { return this.social.findFriendPairScreen(...args); }
+  findFriendPairMeetings(...args) { return this.social.findFriendPairMeetings(...args); }
+  getOnlinePattern(...args) { return this.social.getOnlinePattern(...args); }
+  getOwnWorldSessions(...args) { return this.social.getOwnWorldSessions(...args); }
+  getWeeklyCompanions(...args) { return this.social.getWeeklyCompanions(...args); }
+  getFriendGroupStats(...args) { return this.social.getFriendGroupStats(...args); }
+
+  // ── 运维日志（认证/连接生命周期）──
+
+  insertOpsLog({ kind, level = 'info', message, createdAt }) {
+    this._run(
+      `INSERT INTO ops_log (kind, level, message, created_at) VALUES ($kind, $level, $message, $createdAt)`,
+      { $kind: kind, $level: level, $message: String(message).slice(0, 500), $createdAt: createdAt || new Date().toISOString() }
     );
-
-    // 2. 提取用户去过的所有 unique instanceId
-    const userInstances = new Set();
-    const userTimeline = [];
-    for (const ev of userEvents) {
-      let location = '';
-      try {
-        const cj = JSON.parse(ev.content_json);
-        location = cj.location || '';
-      } catch {}
-      if (location && location !== 'offline' && location !== 'traveling') {
-        const parts = location.split(':');
-        const worldId = parts[0];
-        const instanceId = parts.slice(1).join(':');
-        if (worldId && instanceId) {
-          userInstances.add(instanceId);
-          userInstances.add(`${worldId}:${instanceId}`);
-        }
-        userTimeline.push({
-          id: ev.id,
-          created_at: ev.created_at,
-          type: ev.type,
-          world_id: worldId,
-          instance_id: instanceId,
-          world_name: ev.world_name || '',
-          content_json: ev.content_json,
-        });
-      } else {
-        userTimeline.push({
-          id: ev.id,
-          created_at: ev.created_at,
-          type: ev.type,
-          world_id: location || 'offline',
-          instance_id: null,
-          world_name: ev.world_name || '',
-          content_json: ev.content_json,
-        });
-      }
-    }
-
-    // 3. 获取所有好友在时间范围内的 friend-location 事件
-    const friendEvents = this._query(
-      `SELECT * FROM events WHERE type = 'friend-location'
-       AND created_at >= $start AND created_at <= $end
-       ORDER BY created_at ASC`,
-      { $start: startTime, $end: endTime }
-    );
-
-    // 4. 交叉匹配（排除目标用户本人——查好友时 TA 自己的 friend-location 也会进 friendEvents）
-    const matchedMap = new Map();
-    for (const ev of friendEvents) {
-      if (ev.user_id === userId) continue;
-      let location = '';
-      try {
-        const cj = JSON.parse(ev.content_json);
-        location = cj.location || '';
-      } catch {}
-      if (!location || location === 'offline' || location === 'traveling') continue;
-
-      const parts = location.split(':');
-      const worldId = parts[0];
-      const instanceId = parts.slice(1).join(':');
-      const key = `${worldId}:${instanceId}`;
-
-      if (userInstances.has(instanceId) || userInstances.has(key)) {
-        if (!matchedMap.has(ev.user_id)) {
-          matchedMap.set(ev.user_id, {
-            displayName: ev.display_name,
-            events: [],
-          });
-        }
-        matchedMap.get(ev.user_id).events.push({
-          id: ev.id,
-          created_at: ev.created_at,
-          type: ev.type,
-          world_id: worldId,
-          instance_id: instanceId,
-          world_name: ev.world_name || '',
-        });
-      }
-    }
-
-    // 5. 整理输出
-    const companions = [];
-    for (const [uid, info] of matchedMap) {
-      const times = info.events.map(e => e.created_at).sort();
-      const worlds = new Set(info.events.map(e => e.world_name || e.world_id));
-      companions.push({
-        userId: uid,
-        displayName: info.displayName,
-        firstSeen: times[0],
-        lastSeen: times[times.length - 1],
-        matchCount: info.events.length,
-        worlds: [...worlds].filter(Boolean),
-      });
-    }
-
-    companions.sort((a, b) => (a.firstSeen < b.firstSeen ? -1 : 1));
-
-    return {
-      userId,
-      timeRange: { start: startTime, end: endTime },
-      userInstanceCount: userInstances.size,
-      userTimeline,
-      companionCount: companions.length,
-      companions,
-    };
+    // 保留策略：只留最近 500 条（写入即裁剪，幂等）
+    this._run(`DELETE FROM ops_log WHERE id <= (SELECT id FROM ops_log ORDER BY id DESC LIMIT 1 OFFSET 500)`);
   }
 
-  // ── 新增：分析好友上线规律 ──
-
-  getOnlinePattern(userId, { startTime, endTime, days } = {}) {
-    let start, end, windowDays;
-    if (startTime && endTime) {
-      start = startTime;
-      end = endTime;
-      const startMs = Date.parse(start);
-      const endMs = Date.parse(end);
-      if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
-        throw new Error('Invalid startTime or endTime');
-      }
-      if (startMs > endMs) {
-        throw new Error('startTime must be <= endTime');
-      }
-      windowDays = Math.max(1, Math.ceil((endMs - startMs) / (24 * 60 * 60 * 1000)));
-    } else {
-      const effectiveDays = Number.isFinite(Number(days)) && Number(days) > 0 ? Number(days) : 30;
-      const now = new Date();
-      const beijingNow = new Date(now.getTime() + 8 * 60 * 60 * 1000);
-      const beijingDateStr = beijingNow.toISOString().slice(0, 10);
-      const endDate = new Date(`${beijingDateStr}T23:59:59.999+08:00`);
-      const startDate = new Date(`${beijingDateStr}T00:00:00.000+08:00`);
-      startDate.setDate(startDate.getDate() - effectiveDays + 1);
-      start = startDate.toISOString();
-      end = endDate.toISOString();
-      windowDays = effectiveDays;
+  getOpsLog({ limit = 200, kind } = {}) {
+    const lim = Math.min(Math.max(Number(limit) || 200, 1), 1000);
+    if (kind) {
+      return this._query(`SELECT * FROM ops_log WHERE kind = $kind ORDER BY id DESC LIMIT $lim`, { $kind: kind, $lim: lim });
     }
-
-    const rows = this._query(
-      `SELECT * FROM events WHERE user_id = $userId
-       AND (
-         type LIKE 'friend-online%' OR type LIKE 'user-online%'
-         OR type LIKE 'friend-offline%' OR type LIKE 'user-offline%'
-         OR type LIKE 'friend-location%' OR type LIKE 'user-location%'
-       )
-       AND created_at >= $start AND created_at <= $end
-       ORDER BY created_at ASC`,
-      { $userId: userId, $start: start, $end: end }
-    );
-
-    const hourly = { online: {}, offline: {}, location: {} };
-    const activeDatesSet = new Set();
-    let displayName = '';
-
-    for (const ev of rows) {
-      if (!displayName && ev.display_name) displayName = ev.display_name;
-      const date = new Date(ev.created_at);
-      if (Number.isNaN(date.getTime())) continue;
-      const beijingDate = new Date(date.getTime() + 8 * 60 * 60 * 1000);
-      const hour = String(beijingDate.getUTCHours());
-      const dateStr = beijingDate.toISOString().slice(0, 10);
-      activeDatesSet.add(dateStr);
-
-      if (ev.type.endsWith('-online')) {
-        hourly.online[hour] = (hourly.online[hour] || 0) + 1;
-      } else if (ev.type.endsWith('-offline')) {
-        hourly.offline[hour] = (hourly.offline[hour] || 0) + 1;
-      } else if (ev.type.endsWith('-location')) {
-        hourly.location[hour] = (hourly.location[hour] || 0) + 1;
-      }
-    }
-
-    if (!displayName) {
-      const friend = this.getFriend(userId);
-      if (friend) displayName = friend.display_name || '';
-    }
-
-    const total = {
-      online: Object.values(hourly.online).reduce((a, b) => a + b, 0),
-      offline: Object.values(hourly.offline).reduce((a, b) => a + b, 0),
-      location: Object.values(hourly.location).reduce((a, b) => a + b, 0),
-      activeDays: activeDatesSet.size,
-    };
-
-    const sortedDates = [...activeDatesSet].sort((a, b) => (a < b ? -1 : 1));
-    const activeDates = [...sortedDates].reverse();
-
-    const gaps = [];
-    for (let i = 1; i < sortedDates.length; i++) {
-      const diff = (new Date(sortedDates[i]) - new Date(sortedDates[i - 1])) / (24 * 60 * 60 * 1000);
-      gaps.push(diff);
-    }
-    const avgGapDays = gaps.length > 0 ? gaps.reduce((a, b) => a + b, 0) / gaps.length : 0;
-    const longestGapDays = gaps.length > 0 ? Math.max(...gaps) : 0;
-
-    const endMs = Date.parse(end);
-    const last30Start = new Date(endMs - 30 * 24 * 60 * 60 * 1000);
-    const last30ActiveDays = [...activeDatesSet].filter(d => {
-      const t = new Date(d).getTime();
-      return t >= last30Start.getTime() && t <= endMs;
-    }).length;
-
-    const frequency = {
-      windowDays,
-      activeDays: activeDatesSet.size,
-      activityRatio: windowDays > 0 ? activeDatesSet.size / windowDays : 0,
-      last30ActiveDays,
-      avgGapDays,
-      longestGapDays,
-    };
-
-    function peakHour(dist) {
-      let bestHour = null;
-      let bestCount = -1;
-      for (const [h, c] of Object.entries(dist)) {
-        if (c > bestCount) {
-          bestCount = c;
-          bestHour = Number(h);
-        }
-      }
-      return bestHour;
-    }
-
-    const loginPeakHour = peakHour(hourly.online);
-    const activePeakHour = peakHour(hourly.location);
-    const offlinePeakHour = peakHour(hourly.offline);
-
-    function formatSuggestedWindow(h1, h2) {
-      if (h1 === null && h2 === null) return null;
-      if (h1 === null) return `${h2}:00`;
-      if (h2 === null) return `${h1}:00`;
-      if (h1 === h2) return `${h1}:00`;
-      if (Math.abs(h1 - h2) === 1) return `${Math.min(h1, h2)}:00-${Math.max(h1, h2)}:00`;
-      return `${h1}:00/${h2}:00`;
-    }
-
-    const suggestedWindow = formatSuggestedWindow(loginPeakHour, activePeakHour);
-
-    return {
-      userId,
-      displayName,
-      window: { start, end, days: windowDays },
-      total,
-      hourly,
-      activeDates,
-      frequency,
-      peak: {
-        loginPeakHour,
-        activePeakHour,
-        offlinePeakHour,
-        suggestedWindow,
-      },
-    };
-  }
-
-  // ── 周报专用方法 ──
-
-  getOwnWorldSessions(startTime, endTime) {
-    const rows = this._query(
-      `SELECT content_json, created_at FROM events WHERE type='user-location' AND created_at >= $start AND created_at <= $end ORDER BY created_at ASC`,
-      { $start: startTime, $end: endTime }
-    );
-    const sessions = []; // {worldId, start, end, minutes}
-    let curWorld = null, curStart = null;
-    for (const row of rows) {
-      let loc = '';
-      try { loc = JSON.parse(row.content_json).location || ''; } catch {}
-      const dt = row.created_at;
-      if (loc.startsWith('wrld_')) {
-        const wid = loc.split(':')[0];
-        if (curWorld && wid !== curWorld) {
-          sessions.push({ worldId: curWorld, start: curStart, end: dt });
-        }
-        curWorld = wid; curStart = dt;
-      } else {
-        if (curWorld) { sessions.push({ worldId: curWorld, start: curStart, end: dt }); curWorld = null; }
-      }
-    }
-    if (curWorld) sessions.push({ worldId: curWorld, start: curStart, end: rows.length ? rows[rows.length-1].created_at : curStart });
-    // 过滤 <3 分钟的跳转会话，计算 minutes
-    return sessions.filter(s => (Date.parse(s.end) - Date.parse(s.start)) / 60000 >= 3)
-      .map(s => ({ ...s, minutes: (Date.parse(s.end) - Date.parse(s.start)) / 60000 }));
-  }
-
-  getWeeklyCompanions(userId, startTime, endTime) {
-    // startTime/endTime 为 UTC ISO；按北京自然日（UTC 16:00 日界）切分
-    const BJ_OFFSET = 8 * 3600 * 1000;
-    const startMs = Date.parse(startTime), endMs = Date.parse(endTime);
-    const merged = new Map();
-
-    // 对齐到北京天边界：北京 00:00 = UTC 16:00 前一天
-    let dayStart = Math.floor((startMs + BJ_OFFSET) / 86400000) * 86400000 - BJ_OFFSET;
-
-    while (dayStart < endMs) {
-      const dayEnd = Math.min(dayStart + 86400000, endMs);
-      const utcDayStart = new Date(dayStart).toISOString();
-      const utcDayEnd = new Date(dayEnd).toISOString();
-      const r = this.findCompanions(userId, utcDayStart, utcDayEnd);
-      const dayLabel = new Date(dayStart + BJ_OFFSET).toISOString().slice(5, 10); // MM-DD 北京
-      for (const c of (r.companions || [])) {
-        if (!merged.has(c.userId)) {
-          merged.set(c.userId, { displayName: c.displayName, matchCount: 0, days: new Set(), worlds: new Set() });
-        }
-        const m = merged.get(c.userId);
-        m.matchCount += c.matchCount || 0;
-        m.days.add(dayLabel);
-        for (const w of (c.worlds || [])) m.worlds.add(w);
-      }
-      dayStart += 86400000;
-    }
-    return merged;
-  }
-
-  getFriendGroupStats(startTime, endTime) {
-    const rows = this._query(
-      `SELECT content_json FROM events WHERE type='friend-location' AND content_json LIKE '%~group(grp_%' AND created_at >= $start AND created_at <= $end`,
-      { $start: startTime, $end: endTime }
-    );
-    const stats = new Map(); // groupId -> {count, users:Set, worlds:Set}
-    for (const row of rows) {
-      try {
-        const c = JSON.parse(row.content_json);
-        const loc = c.location || '';
-        const m = loc.match(/~group\((grp_[a-f0-9-]+)\)/);
-        if (m && loc.startsWith('wrld_')) {
-          const gid = m[1];
-          if (!stats.has(gid)) stats.set(gid, { count: 0, users: new Set(), worlds: new Set() });
-          const s = stats.get(gid);
-          s.count++; s.users.add(c.userId || ''); s.worlds.add(loc.split(':')[0]);
-        }
-      } catch {}
-    }
-    return stats;
+    return this._query(`SELECT * FROM ops_log ORDER BY id DESC LIMIT $lim`, { $lim: lim });
   }
 
   getStats() {
@@ -801,4 +513,55 @@ export class Storage {
 
   save() { this._save(); }
   close() { this._save(); this.db.close(); }
+
+  // ── world 域转发（核心实现在 core/domains/world-store.js）──
+
+  getWorldName(...args) { return this.world.getWorldName(...args); }
+  searchWorldsByName(...args) { return this.world.searchWorldsByName(...args); }
+  _recordWorldChanges(...args) { return this.world._recordWorldChanges(...args); }
+  upsertWorld(...args) { return this.world.upsertWorld(...args); }
+  upsertWorldsBatch(...args) { return this.world.upsertWorldsBatch(...args); }
+  setWorldNote(...args) { return this.world.setWorldNote(...args); }
+  setWorldFavorited(...args) { return this.world.setWorldFavorited(...args); }
+  rateWorld(...args) { return this.world.rateWorld(...args); }
+  markWorldVisited(...args) { return this.world.markWorldVisited(...args); }
+  setWorldSleep(...args) { return this.world.setWorldSleep(...args); }
+  addToBacklog(...args) { return this.world.addToBacklog(...args); }
+  removeFromBacklog(...args) { return this.world.removeFromBacklog(...args); }
+  getWorldKbInfo(...args) { return this.world.getWorldKbInfo(...args); }
+  backfillWorldKbInfo(...args) { return this.world.backfillWorldKbInfo(...args); }
+  getBacklog(...args) { return this.world.getBacklog(...args); }
+  getWorldHistory(...args) { return this.world.getWorldHistory(...args); }
+
+  // ── cache 域转发（核心实现在 core/domains/cache-store.js）──
+
+  getZhTranslations(...args) { return this.cache.getZhTranslations(...args); }
+  setZhTranslation(...args) { return this.cache.setZhTranslation(...args); }
+  getGroupCached(...args) { return this.cache.getGroupCached(...args); }
+  upsertGroupCache(...args) { return this.cache.upsertGroupCache(...args); }
+  getPlanetCache(...args) { return this.cache.getPlanetCache(...args); }
+  setPlanetCache(...args) { return this.cache.setPlanetCache(...args); }
+  getGroupHeat(...args) { return this.cache.getGroupHeat(...args); }
+  upsertBoothItem(...args) { return this.cache.upsertBoothItem(...args); }
+  getBoothItemCache(...args) { return this.cache.getBoothItemCache(...args); }
+  listBoothItems(...args) { return this.cache.listBoothItems(...args); }
+  recordBoothSearch(...args) { return this.cache.recordBoothSearch(...args); }
+  getBoothSearches(...args) { return this.cache.getBoothSearches(...args); }
+
+  // ── contacts 域转发（核心实现在 core/domains/contacts-store.js）──
+
+  addToWatchlist(...args) { return this.contacts.addToWatchlist(...args); }
+  removeFromWatchlist(...args) { return this.contacts.removeFromWatchlist(...args); }
+  getWatchlist(...args) { return this.contacts.getWatchlist(...args); }
+  getNicknames(...args) { return this.contacts.getNicknames(...args); }
+  setNickname(...args) { return this.contacts.setNickname(...args); }
+
+  // ── xWorlds 域转发（核心实现在 core/domains/x-worlds-store.js）──
+
+  getXWorld(...args) { return this.xWorlds.getXWorld(...args); }
+  insertXWorld(...args) { return this.xWorlds.insertXWorld(...args); }
+  updateXWorld(...args) { return this.xWorlds.updateXWorld(...args); }
+  getXWorldsSince(...args) { return this.xWorlds.getXWorldsSince(...args); }
+  getAllXWorlds(...args) { return this.xWorlds.getAllXWorlds(...args); }
+  clearXWorlds(...args) { return this.xWorlds.clearXWorlds(...args); }
 }

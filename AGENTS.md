@@ -11,15 +11,23 @@
 > ⚠️ **在开始配置步骤 1 之前，Agent 必须先向用户核实以下问题：**
 
 1. **是否安装/使用过 VRCX？**
-   - VRCX 是一款流行的 VRChat 第三方工具，会在本地保存好友活动历史、世界缓存、好友备注等数据（SQLite 数据库）。本服务的 `migrate-vrcx0.mjs` 脚本可从 VRCX 数据库一键导入这些历史数据。
+   - VRCX 是一款流行的 VRChat 第三方工具，会在本地保存好友活动历史、世界缓存、好友备注等数据（SQLite 数据库）。本服务的 `scripts/migrate-vrcx0.mjs` 脚本可从 VRCX 数据库一键导入这些历史数据。
    - 若用户**使用过 VRCX**，继续追问第 2 个问题。
    - 若用户**从未使用过 VRCX**，可跳过数据导入，直接进入「配置步骤」。
 
 2. **是否需要将 VRCX 中的历史数据导入到本系统？**
    - 导入内容包括：好友列表与信任等级、好友备注/昵称、世界缓存、位置变更历史、上下线记录、Avatar 变更、状态/Bio 变更等（详见下表）。
    - 导入是**可选**的——不导入也能正常使用本服务，只是查询历史活动记录时没有迁移前的旧数据。
-   - 若用户**需要导入**，在完成「配置步骤」1-3（服务能正常启动）后，运行 `node migrate-vrcx0.mjs` 即可导入数据（脚本会自动探测 VRCX 数据库路径和 userId）。
+   - 若用户**需要导入**，在完成「配置步骤」1-3（服务能正常启动）后，运行 `node scripts/migrate-vrcx0.mjs` 导入数据（脚本会自动探测 VRCX 数据库路径和 userId）。
+   - **迁移引擎（v1.1.0 起）**：改用 **better-sqlite3**（与主服务同引擎，WAL 模式），已移除旧版 sql.js 整文件重写（该方式曾导致 `SQLITE_CORRUPT`，2026-08-12 实测踩坑后由 PR #10 防呆 + PR #12 根因修复）。服务运行中迁移不再损坏数据库，但仍**建议迁移前停止服务**（避免与服务的实时写入交错）。脚本内置 127.0.0.1:8799 端口检测：检测到服务运行时会给出警告，需加 `--force` 确认后继续（风险自负）。
+   - **✅ 幂等说明（v1.2.0 起，PR #14 已修复）**：迁移记录带 `vrcxId` 标记 + events 表 JSON 表达式唯一索引 + `INSERT OR IGNORE`，**重复执行自动跳过已迁移记录**（只补新增，不重复插入）。旧版脚本（无 vrcxId）产生的迁移数据会被检测并提示，需 `--force` 才会重插（防误全量重插）。迁移完成后 `node start-monitor.js` 启动服务。
    - 若用户**不需要导入**，直接进入「配置步骤」。
+
+3. **是否愿意参与本仓库的 PR/issue 协作审核（AGENT-REVIEW 协议）？**
+   - 本仓库支持**协作审核**：多个独立部署的 AI Agent 可以共同参与 PR / issue 审核，通过认领评论声明参与，满员（默认 3 人）后不再重复劳动。协议见仓库根目录 `AGENT-REVIEW.md`。
+   - 参与是**完全自愿、可随时退出**的：不参与不影响任何功能；参与后 Agent 会定时检查 open PR/issue，认领未满员的条目并提交审核意见（只读，不合并）。
+   - 若用户**愿意参与**：Agent 在完成「配置步骤」后，按 `AGENT-REVIEW.md` §1 配置定时检查（参考脚本 `scripts/agent-review.py`）。
+   - 若用户**不愿意参与**：跳过即可，Agent 不得自行参与。
 
 | 迁移项 | VRCX 数据表 | 说明 |
 |--------|------------|------|
@@ -27,16 +35,18 @@
 | 好友备注 | `memos` | 好友昵称/备注文本 |
 | 世界缓存 | `cache_world` | 世界 ID、名称、作者、缩略图等 |
 | 位置变更 | `feed_gps` | 好友何时在哪个世界 |
+| 自己的位置历史 | `gamelog_location` | 本账号自己的位置历史（VRCX 游戏日志解析），迁移为 `user-location` 事件，供 `get_companions` 交叉匹配好友位置查同屏 |
 | 上下线记录 | `feed_online_offline` | 好友上线/下线时间及位置 |
 | Avatar 变更 | `feed_avatar` | 好友更换 Avatar 记录 |
 | 状态变更 | `feed_status` | 好友状态文本变更 |
 | Bio 变更 | `feed_bio` | 好友个人简介变更 |
 
-> **数据库位置**：迁移脚本会自动探测以下路径（Windows）：
-> -  VRCX：`%USERPROFILE%\AppData\Roaming\VRCX\VRCX.sqlite3`
-> -  VRCX-0：`%USERPROFILE%\AppData\Roaming\VRCX-0\VRCX-0.sqlite3`
+> **数据库位置**：迁移脚本会按平台自动探测以下路径：
+> -  **Windows**：`%USERPROFILE%\AppData\Roaming\VRCX\VRCX.sqlite3`（VRCX-0：`%USERPROFILE%\AppData\Roaming\VRCX-0\VRCX-0.sqlite3`）
+> -  **Linux**：`~/.config/VRCX/VRCX.sqlite3`（原生 Electron 版）；若通过 Wine 运行 Windows 版：`~/.wine/drive_c/users/<user>/AppData/Roaming/VRCX/VRCX.sqlite3`（自定义 Wine 前缀可用 `WINEPREFIX` 环境变量指定）
+> -  **macOS**：`~/Library/Application Support/VRCX/VRCX.sqlite3`
 >
-> 若自动探测失败，Agent 可让用户提供数据库路径手动指定：`node migrate-vrcx0.mjs <VRCX数据库路径> <userId>`。
+> 若自动探测失败，Agent 可让用户提供数据库路径手动指定：`node scripts/migrate-vrcx0.mjs <VRCX数据库路径> <userId>`。
 
 ## 获取代码（Fork & Clone）
 
@@ -79,6 +89,19 @@
 
 - `VRC_MONITOR_DIR`：指向本仓库目录（克隆后服务所在目录）。若 agent 在仓库目录内运行，服务可自动探测，无需手动设置。
 - `VRC_MONITOR_NODE`：指向 Node.js 可执行文件路径。若不设置，自动从 PATH 查找 `node`。
+- `VRC_MONITOR_DB_PATH`：SQLite 数据库文件路径（默认 `<仓库>/data/vrc-monitor.sqlite3`）。可将数据库迁移到任意位置（如独立数据盘），配合常驻服务使用。
+- `VRC_MONITOR_BACKUP_DIR`：自动备份目录（默认 `<仓库>/data/backups`）。
+- `VRC_MONITOR_LOG_DIR`：常驻服务脚本的日志 / 修复记录目录（默认 `<仓库>/service-logs`，仅 `service-windows/` 脚本使用；Linux systemd 方案日志走 journald，无需设置）。
+- `VRC_MONITOR_LOGGER_DIR`：应用日志模块（`core/logger.js`）日志文件目录（默认 `<VRC_MONITOR_DIR>/logs`）。注意：与上面 `VRC_MONITOR_LOG_DIR`（service 脚本用）不同名不同义，勿混用。
+- `VRC_MONITOR_LOGGER_LEVEL`：日志最低输出级别（默认 `info`，取值 `debug|info|warn|error|silent`）。
+- `VRC_MONITOR_LOGGER_FORMAT`：日志格式（默认 `text`，`json`=每行 JSONL 供 agent 解析）。
+- `VRC_MONITOR_LOGGER_MAX_SIZE`：单文件轮转阈值字节（默认 `10485760`=10MB）。
+- `VRC_MONITOR_LOGGER_MAX_FILES`：保留的已轮转 .gz 份数（默认 `5`）。
+- `VRC_MONITOR_LOGGER_SUPPRESS`：逗号分隔子串列表，命中即整条丢弃（如 `ping,keepalive` 压 MCP 保活噪音）。
+- `VRC_MONITOR_LOGGER_CONSOLE`：是否同时写 stdout（默认 `1`；`0` 仅写文件，一般不建议）。
+- `VRC_MONITOR_LOGGER_COLOR`：text 格式是否加 ANSI 色（默认 `auto`，写文件永无色）。
+- `VRC_MONITOR_PYTHON`：执行 scripts/fetch-otp.py 的 Python 解释器路径（默认 PATH 中的 `python`）。以计划任务 / systemd / 容器等方式运行且 PATH 中无 python 时必须设置，否则 OTP 自动登录失败会陷入重试循环（每次循环 VRChat 都会重新发送验证码邮件）。**路径含空格无需自带引号**（如 `C:\Program Files\Python311\python.exe`），脚本执行时会自动加引号。
+- `VRC_MONITOR_SAFE_MODE`：**安全模式开关**（默认关闭）。设为 `true` 时，服务启动后自动移除全部破坏性 MCP 工具（删除好友 `remove_friend`、删除相册照片 `remove_print`、删除画廊图片 `remove_gallery_image`、移除好友收藏 `unfavorite_friend`、移除世界收藏 `unfavorite_world`、移动世界收藏分组 `move_world_group`、移动好友收藏分组 `move_friend_group`、清空收藏分组 `clear_favorite_group`、退出群组 `leave_group`、拒绝好友请求 `decline_friend_request`、隐藏通知 `hide_notification`、移出待逛列表 `remove_from_backlog`、移出关注名单 `remove_from_watchlist`、移除 X 博主 `x_remove_creator` 等）：`tools/list` 不再暴露这些工具，`tools/call` 直接拦截报错，防止 Agent 误删数据。可在仓库根 `.env` 中配置（推荐，已被 .gitignore 排除）。
 
 ### 3. 启动服务
 
@@ -110,7 +133,7 @@ hermes plugins enable vrc-monitor
 
 插件提供 `vrc_status` / `vrc_start` / `vrc_stop` / `vrc_restart` 工具，并在每次 Hermes 会话开始时自动拉起服务（on_session_start 钩子）。
 
-> **平台限制**：插件当前仅支持 Windows（`plugin.yaml` 中 `platforms: [windows]`）。macOS / Linux 用户需手动执行 `node start-monitor.js` 启动服务，或等待插件跨平台支持。Node.js 服务本身是跨平台的，仅 Hermes 插件托管层有此限制。
+> **平台限制**：插件当前仅支持 Windows（`plugin.yaml` 中 `platforms: [windows]`）。Linux 用户可用 `service-linux/`（systemd 用户服务，`bash service-linux/setup-linux.sh`）托管常驻，macOS 用户需手动执行 `node start-monitor.js` 启动服务，或等待插件跨平台支持。Node.js 服务本身是跨平台的，仅 Hermes 插件托管层有此限制。
 
 > 注意：`dashboard/` 子目录（manifest.json + plugin_api.py）是桌面插件和 `hermes dashboard` 的后端 API，复制时**不能遗漏**，否则桌面端「配置」功能不可用。
 >
@@ -131,7 +154,7 @@ cp desktop/plugin.js "$HERMES_HOME/desktop-plugins/vrc-monitor/"
 
 ### 6. 配置 MCP 接口（可选但推荐）
 
-服务通过 MCP 协议暴露 55 个工具（get_online_friends / get_friend_info / get_friend_events / get_companions / get_online_pattern / get_nicknames / set_nickname / get_world_name / set_world_note / get_world_history / get_weekly_report / scan_new_worlds / get_new_worlds / get_mutual_friends / search_users / search_groups / search_worlds / backup_database / get_user_groups / get_group_info / get_group_instances / get_group_announcement / join_group / leave_group / peek_group_announcement / send_boop / get_boop_emojis / upload_emoji / upload_print / upload_gallery_image / download_print / download_gallery_image / send_friend_request / remove_friend / create_instance / invite_myself / open_world / get_favorite_friends_locations / recommend_join / set_join_preference / get_join_preference / record_join_choice / get_join_learning 等，详见 README），Hermes Agent 可直接调用，无需 curl 手写 JSON-RPC。
+服务通过 MCP 协议暴露以下工具（get_online_friends / get_friend_info / get_friend_events / get_companions / get_friend_pair_screen / get_friend_pair_meeting / get_recent_cooplay / get_ops_log / get_online_pattern / get_nicknames / set_nickname / get_world_name / get_worlds_by_author / set_world_note / get_world_history / get_weekly_report / scan_new_worlds / get_new_worlds / get_mutual_friends / search_users / search_groups / search_worlds / search_planet_worlds / recommend_planet_worlds / search_booth_items / get_booth_item / get_booth_history / get_booth_searches / backup_database / get_user_groups / get_group_info / get_group_instances / get_group_announcement / get_group_heat / join_group / leave_group / peek_group_announcement / send_boop / get_boop_emojis / upload_emoji / upload_print / upload_gallery_image / download_print / download_gallery_image / send_friend_request / remove_friend / create_instance / invite_myself / open_world / rate_world / mark_world_visited / set_world_sleep / add_to_backlog / get_backlog / remove_from_backlog / recommend_worlds / favorite_world / get_favorite_friends_locations / recommend_join / set_join_preference / get_join_preference / record_join_choice / get_join_learning / x_world_digest / x_scan_creators / x_creators / x_add_creator / x_remove_creator / x_worlds / get_my_favorite_worlds / get_my_favorite_groups / get_friend_favorite_groups / favorite_friend / unfavorite_friend / move_friend_group / submit_totp / get_notifications / see_notification / hide_notification / accept_friend_request / decline_friend_request / get_friend_profile_changes / fetch_community_events / get_community_events_config / set_community_events_google_key / unfavorite_world / move_world_group / update_favorite_group / clear_favorite_group 等，完整清单与参数见 `skills/vrc-monitor-agent/SKILL.md`「MCP 工具」章节），Hermes Agent 可直接调用，无需 curl 手写 JSON-RPC。
 
 在 Hermes 配置文件（`$HERMES_HOME/config.yaml`，Windows 为 `%LOCALAPPDATA%\hermes\config.yaml`）中添加：
 
@@ -150,15 +173,32 @@ mcp_servers:
 
 ### 7. 安装 Agent Skill（可选但推荐）
 
-仓库 `skills/` 目录自带 2 份开箱即用的 Agent skill（已去敏感化），复制到你的 Hermes skills 目录后，Agent 直接掌握全部查询工作流和陷阱：
+仓库 `skills/` 目录自带开箱即用的 Agent skill（已去敏感化），复制到你的 Hermes skills 目录后，Agent 直接掌握全部查询工作流、开发规范和陷阱：
 
 ```bash
 mkdir -p "$HERMES_HOME/skills"
 cp -r skills/vrc-monitor-agent "$HERMES_HOME/skills/"
-cp -r skills/vrc-monitor-companion-query "$HERMES_HOME/skills/"
+cp -r skills/vrchat-social-queries "$HERMES_HOME/skills/"
+cp -r skills/vrchat-world-queries "$HERMES_HOME/skills/"
+cp -r skills/vrchat-group-queries "$HERMES_HOME/skills/"
+cp -r skills/booth-query-display "$HERMES_HOME/skills/"
+cp -r skills/vrchat-assistant-development "$HERMES_HOME/skills/"
+cp -r skills/review-workflow "$HERMES_HOME/skills/"
 ```
 
-重启 Hermes 会话生效。详见 README「Agent Skill 安装」章节。
+| Skill | 用途 | 何时需要 |
+|-------|------|----------|
+| `vrc-monitor-agent` | 好友/社交/群组/推荐等主体 MCP 工具清单、查询工作流、陷阱 | 日常查询与社交操作 |
+| `vrchat-social-queries` | 社交域工作流：在线五要素/同屏交叉查询/上线规律/昵称映射 | 同屏/玩伴查询、好友分析 |
+| `vrchat-world-queries` | 世界域工作流：挑新世界/待逛 backlog/推荐/PlanetVRC/X 博主 | 世界推荐与情报挖掘 |
+| `vrchat-group-queries` | 群组域工作流：群组查询/公告 403 分诊/join/leave/peek | 群组查询与操作 |
+| `booth-query-display` | BOOTH 素材检索工具（搜索/详情/热度/汉化/格式化展示） | BOOTH 素材查询 |
+| `vrchat-assistant-development` | **开发规范**：新增 MCP 工具（核心 core/tools/* 自声明 + 插件 plugins/official/* 经 register(api) 注册）流程、跨平台约束、提交 PR 要求（DEVELOPMENT.md 的 skill 化） | **给本仓库添加/修改功能、提交 PR 时必装** |
+| `review-workflow` | **审核工作流**：REST-only 审查、端到端实测、分级反馈、多轮复核、PR/issue 审核、协作审核参与（AGENT-REVIEW） | **审核 PR / issue、判断可合并性/可关闭性、参与协作审核时加载** |
+
+重启 Hermes 会话生效。skill 说明见 `skills/vrc-monitor-agent/SKILL.md`（README「文档导航」有入口）。
+
+> **开发功能前必须加载** `vrchat-assistant-development` skill：它固化了仓库的全部开发约束（插件化开发模式、DB 迁移、文档同步、跨平台、提交规范），不加载直接开发容易违反 DEVELOPMENT.md 的硬性要求。
 
 ## 常用操作
 
@@ -170,7 +210,37 @@ cp -r skills/vrc-monitor-companion-query "$HERMES_HOME/skills/"
 | 查看服务状态 | Hermes 工具 `vrc_status` 或桌面插件面板 |
 | 配置账号 | 桌面插件「配置」弹窗，或编辑 `credentials.json` |
 | 重启服务 | Hermes 工具 `vrc_restart` |
-| 迁移 VRCX 数据 | `node migrate-vrcx0.mjs` |
+| 常驻服务（Windows：开机自启 + 崩溃自愈 + 每日修复报告） | `service-windows\setup-windows.cmd`（详见 `service-windows/README.md`） |
+| 常驻服务（Linux：systemd 用户服务，开机自启 + 崩溃自愈 + journal 日志） | `bash service-linux/setup-linux.sh`（详见 `service-linux/README.md`） |
+| 迁移 VRCX 数据 | `node scripts/migrate-vrcx0.mjs`（better-sqlite3 引擎，运行中迁移安全但仍建议先停服务；检测到服务运行会要求 `--force`；**可重复执行**——v1.2.0 起幂等，自动跳过已迁移记录，旧数据需 `--force` 重插，见 PR #14）；完成后 `node start-monitor.js` |
+
+## X 博主世界推荐追踪
+
+服务支持追踪 X（Twitter）上的 VRChat 世界推荐博主，自动抓取其推荐的世界（`x_add_creator` / `x_scan_creators` / `x_world_digest` 等工具，见 skill 工具章节）。
+
+**推荐博主清单**（作者认可的价值博主）：
+
+| 博主 | X 链接 | 备注 |
+|------|--------|------|
+| ヤタノ＠VRを楽しむバーチャルFOX | https://x.com/fox_yata9 | VR 游戏世界推荐 |
+| 探跡家もっけい | https://x.com/mokkei_VE | 世界推荐 |
+| 八谷凛奈 | https://x.com/n4rGm5DmrVXXz6I | 世界推荐 |
+| Bradlee101 | https://x.com/Bradlee1011 | 世界推荐 |
+
+**Agent 行为规则**：
+- **安装/配置阶段主动询问**：Agent 按本指南完成部署配置后，主动询问用户"是否要添加上述推荐博主进行追踪？"，得到确认后再逐一 `x_add_creator {screen_name}` 添加，不要擅自添加，也不要跳过询问
+- 添加后执行 `x_scan_creators` 抓取一次，向用户汇报抓到的推荐世界
+- 用户也可以随时要求追踪/移除其他博主（`x_add_creator` / `x_remove_creator`）
+
+## 发现漏洞 / 缺陷时（Agent 义务）
+
+Agent 在配置、使用、维护本软件过程中，若发现原始代码存在漏洞 / bug（功能异常、数据损坏风险、安全隐患等），**应当主动提交 issue + PR 修复**，让所有使用者受益：
+
+1. **开 issue**：描述现象、复现步骤、影响范围（不夹带任何凭据 / 本机路径 / 个人账号信息）。**上报前先搜索 issue / PR 是否已存在**，避免重复；若已存在且无人处理，可补充复现信息或认领修复；
+2. **提修复 PR**：按 [DEVELOPMENT.md](./DEVELOPMENT.md) 的要求执行（单一职责、无个人环境硬编码、DB 变更带幂等迁移、文档同步、Conventional Commits、三段式验证说明）；
+3. **无法自行修复时**：至少完成根因定位（到模块 / 函数级别）再提交 issue，说明已发现的证据与猜测方向，由作者或其他 Agent 跟进。
+
+> 这是本项目对 Agent 的明确义务（详见 DEVELOPMENT.md §1「发现缺陷必须主动上报」）：发现问题就地修复并回馈上游，而不是只在本地 fork 里静默改掉。**该义务不因 fork 自用而豁免**——即使改动只在本地使用，发现上游缺陷也必须上报。
 
 ## 常见问题
 
@@ -181,9 +251,50 @@ cp -r skills/vrc-monitor-companion-query "$HERMES_HOME/skills/"
 2. 若自动推断的 IMAP 服务器不正确，可在 `credentials.json` 中添加 `"imap_host"` 手动指定（如 `"imap_host": "imap.gmail.com"`）
 3. 连续多次触发 OTP 时，邮箱 IMAP 同步可能有延迟，服务会在冷却后自动重试（认证失败冷却 120s，限流 401 冷却 5min），无需人工干预
 
+### TOTP（Authenticator 验证码）登录
+
+VRChat 账号启用 **TOTP 两步验证**（Authenticator 应用）时，支持**自动重新登录**：
+
+- **配置 `totp_secret`（推荐，全自动）**：在 `credentials.json` 中新增 `totp_secret` 字段，填入 Authenticator 应用的 otpauth:// URI 或 base32 密钥（登录 VRChat 官网 → 安全设置 → 2FA 重新配置时显示，或从 Authenticator 应用导出）。服务在启动登录、运行期 API 401 自动重认证、WS 重连时，都会用 RFC 6238 本地生成验证码自动完成登录（自动尝试前后窗口容错时钟漂移/窗口轮换），**全程无需人工干预**。`/health` 的 `auth.totpAutoEnabled` 为 `true` 表示已启用自动 TOTP。
+- **未配置 `totp_secret`（手动兜底）**：以下情况会进入 `needsTotp` 状态（`/health` 的 `auth.needsTotp` 为 `true`，或日志提示调用 `submit_totp`）：
+  - 服务启动 / WS 重连：cookie 过期、自动重登录发现需要 2FA，且邮箱 OTP 不可用（未启用或抓取失败）；
+  - 服务运行中 API 返回 401（运行期 cookie 过期）：服务检测到 401 会自动触发重新登录，若需要 TOTP 同样进入 `needsTotp` 状态——**无需重启服务**。
+
+手动提交流程：
+1. 服务已保留待验证的临时会话，**只差验证码**；
+2. Agent（或用户）打开 Authenticator 应用查看当前 6 位验证码；
+3. 调用 MCP 工具 `submit_totp { code: "123456" }` 完成登录，WebSocket 会自动重连上线。
+
+注意：
+- 账号**同时启用邮箱 OTP 与 TOTP** 时，自动通道优先级：邮箱 OTP 抓取 → 自动 TOTP 兜底 → 手动 `submit_totp`；
+- 账号**仅启用 TOTP** 且已配置 `totp_secret` 时，服务自动生成验证码登录，不进入 `needsTotp`；
+- 自动 TOTP 提交失败（验证码被拒 / secret 有误）会冷却 30 秒等待下一个 TOTP 窗口后自动重试，并转为 `needsTotp` 状态供手动兜底；`totp_secret` 解析失败时启动会告警并回退手动模式，不阻断服务；
+- 验证码每 30 秒变化；`totp_secret` 与密码同等敏感（存 `credentials.json`，已被 .gitignore 排除），严禁泄露；
+- 运行期 401 自动重登录失败（非 TOTP 原因，如网络/凭据错误）会冷却 60 秒再重试，不会高频刷认证接口。
+
+### 登录状态主动通知（issue #69）
+
+服务是无人值守的后台进程，登录结果默认只写日志。可配置**主动通知**，在「需要人工介入 / 异常」时提醒宿主（正常自动登录成功不通知，避免噪音）：
+
+- **配置**：复制 `notify-config.example.json` 为 `notify-config.json`（已被 .gitignore 排除），设置 `enabled: true`。
+- **通道**：`channels` 数组支持 `desktop`（Linux `notify-send` / macOS `osascript` / Windows PowerShell toast）与 `webhook`（POST JSON 到 `webhook_url`，群机器人/push 服务）。桌面通知依赖系统通知守护（如 Linux dunst/mako），无守护时静默降级不崩服务。
+- **触发事件**：进入 `needsTotp` 待验证、邮箱 OTP 抓取失败、运行期 401 自动重认证失败、认证恢复（闭合「正常→异常→恢复」循环）。
+- **去抖防刷屏**：`consecutive_fail_threshold`（默认 3）连续失败达此数才通知；`min_interval_sec`（默认 300）同类型通知最小间隔。
+- **默认关闭**：缺文件或 `enabled:false` 时完全不通知，不影响服务。
+- 配置示例：
+  ```json
+  { "enabled": true, "channels": ["desktop", "webhook"],
+    "webhook_url": "https://example.com/hook",
+    "consecutive_fail_threshold": 3, "min_interval_sec": 300 }
+  ```
+
 ### 代理说明
 
 如需通过代理访问 VRChat API，请在启动前设置 `HTTPS_PROXY` 或 `HTTP_PROXY` 环境变量。WebSocket 连接默认直连，6 秒超时后自动回退到代理（默认 `127.0.0.1:7892`，可用 `VRC_MONITOR_WS_PROXY` 环境变量覆盖）。
+
+### 端口 8799 被占用 / 提示双实例
+
+服务启动前会预检 8799 端口：已被占用时立即退出并提示排查命令（`netstat -ano | findstr 8799` / `tasklist | findstr node`），防止新旧两个实例并存。两个实例同时运行会**互抢 OTP 验证码**（实例 A 提交成功、实例 B 提交失败 → VRChat 重复下发新验证码 → 邮箱被验证码邮件刷屏）。重启服务前请确认旧 node 进程已结束。
 
 ### 服务目录找不到
 

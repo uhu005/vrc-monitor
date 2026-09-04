@@ -1,0 +1,12 @@
+node_modules
+.git
+.env
+.env.*
+credentials.json
+auth_cookie.txt
+notify-config.json
+data
+backups
+*.sqlite3*
+service-logs
+.system_generated

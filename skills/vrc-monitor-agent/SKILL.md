@@ -1,7 +1,7 @@
 ---
 name: vrc-monitor-agent
 description: "Use for VRChat friend queries (online status, who played with whom, activity timelines, online patterns) and VRChat social actions (boop, invite, join world, friend management, group operations, image uploads) via the vrc-monitor MCP server on port 8799."
-version: 1.1.0
+version: 2.0.0
 metadata:
   hermes:
     tags: [vrchat, gaming, social, mcp, monitoring]
@@ -11,30 +11,57 @@ metadata:
 
 本 skill 面向**任何 AI Agent**：当用户询问 VRChat 好友相关问题（谁在线、谁和谁一起玩、某人的活动时间线、上线规律）时，通过 `vrc-monitor` 的 MCP 接口查询。安装配置见项目根 `AGENTS.md` / `README.md`。
 
+> ⚠️ **Agent 义务**：使用中发现本软件代码存在漏洞 / bug（功能异常、数据损坏风险、安全隐患等），应主动提交 issue + PR 修复让所有使用者受益，详见项目根 `AGENTS.md`「发现漏洞 / 缺陷时」小节与 `DEVELOPMENT.md` §1。
+
 - MCP 端点：`http://127.0.0.1:8799/mcp`
 - 服务启动：项目目录下 `node start-monitor.js`（首次需配置 `credentials.json`，见 AGENTS.md）
 - 数据库：本地 SQLite（WebSocket 实时采集事件，含历史上线/位置/同屏记录）
 
-## MCP 工具（55 个）
+## MCP 工具
 
 | 工具 | 说明 |
 |------|------|
-| `get_online_friends` | 当前在线好友列表（含昵称 nickname + 房型解析 locationParsed：worldId/instanceId/type/ownerId/region） |
+| `get_online_friends` | 当前在线好友列表（含昵称 nickname + 房型解析 locationParsed：worldId/instanceId/type/ownerId/region + 世界名 worldName（未缓存自动 API 补查）+ 房间停留时长 durationMinutes/enteredAt + **在线时长 onlineMinutes/onlineSince**；durationMinutes 进入时间 = max(会话起点, 最新位置事件)防跨会话污染；onlineMinutes = 最近 friend-offline 之后最早 friend-online 起算，重复推送被 MIN 跳过） |
 | `get_friend_info` | 好友详细信息 |
-| `search_users` | 按名字搜索用户 |
+| `search_users` | 按名字搜索用户（API 优先；API 无匹配时自动回退本地好友库模糊搜索 display_name/备注，结果带 `source: local_friends` 标记） |
 | `search_groups` | 按名字搜索群组（API 用 query 参数，不是 search） |
 | `search_worlds` | 按名字搜索世界（英文/日文走 API；中文自动加本地缓存兜底） |
-| `backup_database` | 立即备份数据库（WAL 在线备份，保留最近 2 份到 backups/）；服务启动 + 每 24h 自动备份 |
+| `search_planet_worlds` | **PlanetVRC 地图检索**（planetvrchat.net 日文世界目录）：关键词搜索 → 世界名/wrld_id/平台/分类/收藏数；适合 VRChat API 搜不到的日文/小众图。limit 最大 8（每个结果抓详情页补 wrld_id，约 1-2s/个） |
+| `recommend_planet_worlds` | **PlanetVRC 推荐排行**：sort=popular（访问者数最多）/ new（最新发布）/ updated（最新更新）→ 世界+wrld_id+最大人数+访问量+收藏数+公开日 |
+| `search_booth_items` | **BOOTH 素材检索**（2026-08-13 新增）：booth.pm 关键词搜索 VRChat 素材 → 名称/价格/收藏数（wishlistCount=热度）/卖家/标签。`detail=false` 快速列表；默认补详情（~0.5s/个，max 10）。**下载量/销量 Booth 不公开**（匿名恒 0），收藏数作热度信号 |
+| `get_booth_item` | **BOOTH 单品详情**：按 itemId 查商品 → 名称/价格/描述/标签/图片/卖家/发布时间/收藏数/变体。**本地缓存**：`cached:true` 命中快照，`forceRefresh` 强制实时 |
+| `get_booth_history` | **BOOTH 查询历史**：本地缓存商品快照，按收藏数/更新时间排序 + `minWishlist` 趋势过滤 |
+| `get_booth_searches` | **BOOTH 搜索历史**：最近搜索词 + 结果 + 时间 |
+| `get_my_favorite_worlds` | **我的收藏世界**（2026-08-14 新增）：拉取全部收藏世界（**含 VRC+ 专属收藏夹**），按标签分类（🎮游戏/👻恐怖/🎵音乐体验/🌄风景观光/🧍Avatar模型/🍻社交聚会/😴休闲睡觉/📷拍照/其他），返回世界名/作者/收藏/浏览/简介/分类。数据经 `GET /worlds/favorites` 分页一次拉全（含实时 `occupants`），**秒级返回**，无需逐个查详情。`sortBy` 支持 `favorites`/`visits`/`name`/`added`（**added=按收藏时间倒序，最新添加在前**，基于 `/favorites` 返回顺序，与客户端 "Date Added" 一致）；`group` 参数可按收藏夹过滤（tag 或 displayName，如 `vrcPlusWorlds1`）；配套 `favorites-pdf.py` 一键生成中文 PDF |
+| `get_my_favorite_groups` | **我的收藏分组**：世界收藏分组（`world` + `vrcPlusWorld` 两种类型，**含 VRC+ 专属收藏夹**），返回 tag/显示名/类型/可见性/容量 `capacity`（来自 `/auth/user/favoritelimits`）/已用数/分组 id；`type` 参数可按类型过滤 |
+| `backup_database` | 立即备份数据库（WAL 在线备份，保留最近 2 份到 data/backups/）；服务启动 + 每 24h 自动备份 |
 | `get_friend_events` | 某好友的事件历史（本地库） |
 | `get_recent_events` | 最新事件流 |
-| `get_companions` | **同屏交叉查询**（指定时间窗口内同实例的好友；可查自己或任意好友） |
+| `get_companions` | **同屏交叉查询**（指定时间窗口内同实例的好友；可查自己或任意好友）。**默认不返回 userTimeline**（位置事件多时输出会过大被截断），仅返回 companions 汇总；需逐条位置明细时传 `includeTimeline=true` |
+| `get_recent_cooplay` | **最近一起玩**（最近 N 天与自己同屏过的全部好友，按同屏次数降序）：companions[{userId, displayName, matchCount, daysCount, lastDay}]；days(1-90 默认 7)、limit(默认 30)。与 get_friend_pair_screen（两人版带逐条 matches）互补——面向自己的全好友批量版 |
+| `get_ops_log` | **运维日志**（认证/WS/运维生命周期事件，保留最近 500 条）：返回 items[{id, kind, level, message, createdAt}]；limit(1-1000 默认 200)、kind(可选 'auth'\|'ws'\|'ops') |
+| `get_friend_pair_meeting` | **好友对单次见面分析**（查任意两个好友之间「每次见面」的时段与时长；按实例切分，同一实例内同屏匹配合并为一次见面（**含实例内中途断开空档，合并为一次**），返回每次 start/end/durationMinutes/世界/实例 + meetingCount + totalDurationSeconds；口径：同实例且时间差 ≤ windowMinutes（默认30），排除 private/offline/traveling；startTime/endTime 与 days 二选一） |
+| `get_friend_pair_screen` | **好友对同屏次数与时长**（查任意两个好友之间的共玩/同房统计；精确口径：B 的每条可识别实例事件匹配 A 同一实例且时间差 ≤ windowMinutes（默认30）→ 计同屏；排除 private/offline/traveling，不同时间去过同一房不计；返回 matchCount（次数）、totalMinutes/totalSeconds（总时长，段首到段尾累加，**含实例内中途断开空档**）、worldDuration（按世界拆分时长）、worlds（共现世界）、matches（默认全量，可加 limit 限制条数）；startTime/endTime 与 days 二选一） |
 | `get_online_pattern` | **上线规律分析**（上线/下线/活跃时段分布 + 活跃天数/频率 + 峰值建议） |
-| `get_world_name` | 世界信息查询（懒刷新：缓存命中直接返回，forceRefresh 才走 API；含作者/容量/简介/标签/用户备注 note） |
+| `get_world_name` | 世界信息查询（懒刷新：缓存命中直接返回，forceRefresh 才走 API；含作者ID/作者名/容量/简介/标签/用户备注 note） |
+| `get_worlds_by_author` | **按作者列出全部世界**：authorId 或 authorName（内部经 /users 解析）→ GET /worlds?userId= 分页拉全该作者发布的全部图（worldId/名称/收藏/浏览/容量/标签/发布时间），顺带写 world_cache（含 author_id）。配合 get_world_name 返回的 authorId 使用（如「当前所在图作者的全部图加权重」） |
 | `set_world_note` | 世界用户备注写入/更新（本地存储，API 刷新不覆盖；空串清除） |
 | `get_world_history` | 世界信息变更历史（name/description/author/image_url/release_status/capacity/tags 字段级记录） |
-| `get_weekly_report` | 一周游戏周报（活跃天数/时长/世界 Top/同屏伙伴带昵称/自己的上线规律/群组活动/圈内活动日历；days 默认 7） |
-| `scan_new_worlds` | 扫描最近 N 天新世界（1-30，默认 7），过滤测试/垃圾图后写入 new_worlds 表，按热度推荐 TOP10；dryRun 只看不写 |
-| `get_new_worlds` | 只读查询已跟踪新世界：onlyUnvisited 只看未逛过、sortBy（favorites/occupants/popularity/created_at）、limit（默认 10 最大 50） |
+| `get_weekly_report` | 一周游戏周报（活跃天数/时长/世界 Top/同屏伙伴带昵称/自己的上线规律/群组活动/圈内活动日历；days 默认 7）。**渲染含两个固化板块**：①每日足迹（每天去了哪些房间+和谁一起，daily 每项带当天 companions[{nickname,matchCount}]）②本周总结（末尾一段连贯叙事评述）。模板见 vrchat-social-queries §9 |
+| `scan_new_worlds` | 扫描最近 N 天新世界（1-30，默认 7），过滤测试/垃圾图后写入 world_kb 表（原 new_worlds），按热度推荐 TOP10；dryRun 只看不写 |
+| `get_new_worlds` | 只读查询已跟踪新世界：onlyUnvisited 只看未逛过、sortBy（favorites/occupants/popularity/created_at）、excludeTheme 排除主题（按 author_tag_* 逗号分隔，SQL 层排除）、limit（默认 10 最大 50） |
+| `rate_world` | **用户反馈**：给世界打好评/烂图标记（rating: 1=好图加权 / -1=烂图降权 / 0=清除），写入 world_kb.user_rating，影响 worldScore 推荐排序 |
+| `mark_world_visited` | **显式确认逛过**某世界（事件驱动 visited 会漏记，开图闭环手动确认用） |
+| `set_world_sleep` | **手动标记睡觉图**（worldId 必填，isSleep 默认 true，false=取消），写入 world_kb.sleep_ok=1，recommend_join / recommend_worlds（sleep 主题）的强信号。本地数据，不动云端 |
+| `add_to_backlog` | **加入待逛列表**（本地待办，不动云端收藏）：worldId 必填，reason/priority（0-2，默认 0）可选。幂等：重复加入更新备注/优先级，加入时间保持首次。状态存 world_kb.backlog（合表方案） |
+| `get_backlog` | **查看待逛列表**：status（pending 默认=未逛 / visited=逛完历史 / all）、sortBy（added_at 默认 / priority / favorites）、limit（1-50）。**逛完自动从待逛列表移除**（location 事件 / mark_world_visited / 扫描在首次置 visited=1 时同步清 backlog=0），pending 只显示仍待逛的世界 |
+| `remove_from_backlog` | **移出待逛列表**：worldId 必填。只清 backlog 标记（保留行/世界知识），幂等 |
+| `recommend_worlds` | **多源融合世界推荐**：local 新世界池 × PlanetVRC × 官方主题搜索 × 用户反馈，评分（热度+新鲜度+主题+作者画像 30 天窗口熟客）+ 可解释 reasons；theme/excludeTheme/sources/excludeVisited 参数 |
+| `favorite_world` | **云端收藏**：加入 VRChat 收藏夹分组（tag 为 `worldsN` / `vrcPlusWorldsN` **动态发现**，含 VRC+ 专属收藏夹，默认 worlds0，支持传 displayName），写操作需确认，成功后本地 favorited=1 供推荐加权 |
+| `unfavorite_world` | **移除世界收藏**：DELETE /favorites/{记录id}（先查记录 id 再删，可逆）。worldId 必填；tag 可选（省略=从全部所在分组移除，**含 VRC+ 专属收藏夹**）。写操作，confirm: true 才执行 |
+| `move_world_group` | **移动世界收藏分组**（2026-08-26 新增）：删旧建新，与 `move_friend_group` 同模式（官方客户端 2026.1.1 同款能力）。worldId + toGroup（tag 或 displayName，含 VRC+ 收藏夹）。写操作，destructive（删旧建新非原子），confirm: true 才执行 |
+| `update_favorite_group` | **重命名/改可见性**（2026-08-26 新增）：PUT /favorite/group/{type}/{name}/{userId}。group（tag 或 displayName）必填；displayName（新名）/ visibility（friends/private/public）至少一个。⚠️ 设为 public 分组对他人可见，隐私敏感，须显式 confirm |
+| `clear_favorite_group` | **清空收藏分组**（2026-08-26 新增）：DELETE /favorite/group/{type}/{name}/{userId}，清空组内全部收藏（分组本身保留，重新收藏可加回）。group 必填；批量删除，destructive，confirm: true 才执行 |
 | `get_nicknames` / `set_nickname` | 好友昵称映射（查询/写入，本地库） |
 | `get_mutual_friends` | 共同好友列表：你与目标用户（userId 或 displayName 精确匹配）的共同好友，自动带本地昵称 |
 | `get_watchlist` / `add_to_watchlist` / `remove_from_watchlist` | 关注名单 |
@@ -62,6 +89,7 @@ metadata:
 | `get_group_info` | 群组详情（名称/成员数/shortCode/描述/认证状态/joinState(open/request/invite)；`includeAnnouncement: true` 附带公告，非成员为 null） |
 | `get_group_instances` | **群组当前开的房**（group rooms）：instanceId/location/memberCount + 世界信息；空 = 没开房。适合"XX 群今晚有没有活动房"类问题 |
 | `get_group_announcement` | 群组公告（title/text/作者/时间；无公告或非成员返回 null 不报错） |
+| `get_group_heat` | **群组热度**：群组房活动热度榜（活动次数/活跃好友/世界数/成员数/趋势）+ 前 topK 群（星期×小时）热力图；`grp_`/`gmem_` 兼容 |
 | `join_group` | 加入群组（open 群直接加入；已是成员返回 alreadyMember:true；`groupId` 必填） |
 | `leave_group` | 退出群组（`POST /groups/{id}/leave`；必须 `confirm: true`；非成员返回 notMember） |
 | `peek_group_announcement` | **窥探群公告**：一键「加入→读公告→退出」，仅对 open 群生效，需 `confirm: true` |
@@ -71,6 +99,28 @@ metadata:
 | `get_join_preference` | 查询当前推荐偏好 |
 | `record_join_choice` | 记录一次推荐选择（自动补全上下文，≥5 次后自动学习权重） |
 | `get_join_learning` | 查看选择学习状态与生效的权重调整 |
+| `x_world_digest` | **X 博主世界推荐聚合**：聚合指定 X 博主近 1/3/7/15/30 天推荐的世界，按收藏数排序；收藏/浏览比 ≥ 1/5 标 ⭐重点。`refresh=true` 先抓最新推文再查询 |
+| `x_scan_creators` | **X 推荐抓取**：立即抓取所有已配置博主的最新推文，提取推荐世界并查询收藏/浏览数据入库。双数据源降级：Nitter RSS 失败自动回退 X SearchTimeline GraphQL（完整推文流，可解决 Nitter 404 的博主）；两者都挂时返回可读错误提示。**内置 t.co 短链解包**（推文里的世界链接常被 X 压缩成 `https://t.co/XXXX` 短链，如探跡家もっけい/fox_yata9 等博主的世界推荐全在短链里，不解包会整批漏抓；`VRC_MONITOR_X_RESOLVE_TCO=0` 可关闭） |
+| `x_creators` | 列出当前配置的 X 博主清单 |
+| `x_add_creator` | 添加要追踪的 X 博主（VRChat 世界推荐博主；`screen_name` 不带 @） |
+| `x_remove_creator` | 移除追踪的 X 博主 |
+| `x_worlds` | 查看已收录的推荐世界列表（调试用） |
+| `fetch_community_events` | **[events] VRChat 社区活动聚合**（官方 events 插件）：采集(VRC Search/RLVRC/VRCEve/VRCEvent-KR) → 群组深度挖掘(短码/活动名/世界名反查,补群组热度回填,经 groups.resolve 缓存优先) → 音乐∪虚拟主播筛选 → 结构化 JSON + 落库 plg_events_store。参数：window(week/month/tonight)、focus(all/music/vtuber)、sources(vrcsearch,rlvrc,vrceve,vrckr)、languages、minMembers、maxMine(默认 30,可覆盖)、peekGroups(窥探已挖掘群组公告补充活动,有副作用)、startDate/endDate、limit。返回事件自带规范图标URL/双列时区(start_local/start_bj/tz_label)/中文参加方式(join_info_zh)。用于"最近/今晚有什么活动、哪些可参加、群组热度"。未配置 Google Key 时返回 configStatus 的创建网址指引。PDF 渲染另走管道 |
+| `get_community_events_config` | **[events·配置]** 查看社区活动抓取配置：Google Calendar API Key 是否已配置（值存数据库不回显）；未配置时返回创建 key 的指引网址 |
+| `set_community_events_google_key` | **[events·配置]** 录入/清除使用者的 Google Cloud API Key（存数据库 plg_events_config，仅本插件读）。createKeyUrl=https://console.cloud.google.com/apis/credentials。需要 confirm:true |
+| `submit_totp` | **提交 TOTP 验证码（手动兜底）**：在 credentials.json 配置 `totp_secret` 后，服务自动生成验证码登录，无需调用本工具；仅在自动登录失败（验证码被拒/secret 有误）或未配置 secret 时，账号处于 `needsTotp` 状态（`/health` 的 `auth.needsTotp: true`）才需调用本工具提交当前 6 位验证码（`code` 必填；登录后 WS 自动重连） |
+| `get_friend_favorite_groups` | **好友收藏分组列表**（2026-08-19 新增）：GET /favorite/groups?type=friend + /favorites?type=friend → 分组名/显示名/成员数。与 get_favorite_friends_locations 互补（后者看组内好友实时位置） |
+| `favorite_friend` | **添加好友到收藏分组**（2026-08-19 新增）：POST /favorites type=friend。userId/displayName 二选一；groupName 必填（显示名或分组名）；须已是好友（403 返回 not friends）；重复收藏返回 already favorited（不抛错）。写操作，confirm: true 才执行 |
+| `unfavorite_friend` | **从收藏分组移除好友**（2026-08-19 新增）：DELETE /favorites/{记录id}（先查记录 id 再删，可逆）。groupName 可选（省略=从全部分组移除）。写操作，confirm: true 才执行 |
+| `move_friend_group` | **移动好友到另一分组**（2026-08-19 新增）：删旧建新（API 无原地更新 tags 端点，与 VRCX 行为一致）。toGroup 必填。写操作，destructive（删旧建新非原子），confirm: true 才执行 |
+| `get_friend_profile_changes` | **好友资料变更历史**（2026-08-19 新增）：Avatar/Bio/状态/头像图标/代词变更记录。事件管道实时采集 friend-update 的 user 对象 diff 落库，与 VRCX 迁移数据（feed_avatar/feed_status/feed_bio）同 type 打通。userId 可选（省略=全部好友）；types 逗号分隔过滤（avatar/status/bio/user_icon/pronouns）；limit(1-200)/offset 分页。每次变更返回 change 含当前值+旧值 |
+| `get_notifications` | **通知收件箱**（2026-08-19 新增）：读取当前账号未读通知（旧 v1 系统）。limit/offset 分页；types 过滤（friendRequest/invite/message/boop/requestInvite/votetokick/inviteResponse/requestInviteResponse）；hidden=true 查已隐藏。返回字段：returned（本页返回条数）、shown（过滤后条数）、hasMore（本页取满 limit 时可能还有下一页）。注意：API 的 type 查询参数已废弃不生效（本地过滤）；seen/receiverUserId 仅 WS 推送有，REST 不返回 |
+| `see_notification` / `hide_notification` | **通知已读/隐藏**：标记已读 PUT .../see；隐藏清除 PUT .../hide（旧 v1 hide 即删除）。notificationId 必填 |
+| `accept_friend_request` | **接受好友请求**（2026-08-19 新增）：PUT /auth/user/notifications/{id}/accept，**接受即直接加为好友**，不可逆，必须 confirm: true 才执行，否则只预览 |
+| `decline_friend_request` | **拒绝好友请求**（2026-08-19 新增）：旧 v1 无独立拒绝端点，hide 即清除该通知（对方不会收到明确拒绝提示），必须 confirm: true 才执行，否则只预览 |
+| `auth_get_status` | **公网鉴权状态查询**（2026-08-25 新增）：查看当前服务的网络监听 IP/Port、Token 保护状态与公网安全就绪度评估 |
+| `auth_generate_token` | **生成安全访问 Token**（2026-08-25 新增）：生成 32 字节高强度密码学随机 Token 并提供 .env 配置片段 |
+| `auth_verify_token` | **校验访问 Token**（2026-08-25 新增）：校验给定 Token 是否与当前生效配置相匹配 |
 
 调用方式（HTTP SSE JSON-RPC）：
 
@@ -82,71 +132,28 @@ curl -s http://127.0.0.1:8799/mcp -X POST \
 
 响应是 SSE 格式，取 `data:` 行，解析 `result.content[0].text` 为 JSON。
 
-## 核心查询工作流
+## 安全模式（VRC_MONITOR_SAFE_MODE，2026-08-22 新增）
 
-### 1. "XX 现在和谁一起？" / 同实例好友
+> 在仓库根 `.env` 或环境变量设置 `VRC_MONITOR_SAFE_MODE=true` 并重启服务后，**全部破坏性工具会被自动移除**（`tools/list` 不再暴露 + `tools/call` 直接拦截），防止 Agent 误执行删除/移除类操作。默认关闭。
 
-```
-1. get_friend_info(userId=目标) → 取 location 字段（如 "wrld_xxx:77182~hidden(usr_owner)~region(jp)"）
-2. get_online_friends() → 所有在线好友的位置
-3. 按完整 location 字符串匹配 → 同实例的好友
-4. 从 location 解析 owner：hidden(usr_xxx)/private(usr_xxx)/friends(usr_xxx)/group(grp_xxx)
-5. get_world_name(worldId) → 世界名（location.split(':')[0]）
-```
+被移除的破坏性工具（删除/移除/退出/清除类，完整清单见 `core/safe-mode.js` 的 `DESTRUCTIVE_TOOLS`）：
 
-- 只能看到你也是好友的人（API 限制）
-- `~hidden(usr_A)` = A 的隐藏房；`~private(usr_B)` = B 的私密房；`~friends(usr_C)` = C 的好友房
+`remove_friend`（删好友）、`remove_print`（删相册照片）、`remove_gallery_image`（删画廊图片）、`unfavorite_friend`（移除好友收藏）、`leave_group`（退群）、`decline_friend_request`（拒好友请求）、`hide_notification`（清除通知）、`remove_from_backlog`（移出待逛）、`remove_from_watchlist`（移出关注）、`x_remove_creator`（移除 X 博主）。
 
-### 2. "XX 今天/某天和谁一起玩过？" → `get_companions`
+安全模式下这些工具**在 tools/list 中根本不存在**——Agent 不要尝试调用（会收到拦截报错）。查询/推荐/加好友/加收藏/开房等非破坏性写工具不受影响。关闭安全模式：`.env` 中改回 `VRC_MONITOR_SAFE_MODE=false`（或删掉该行）并重启服务。
 
-**不要委派子 agent 做同屏查询**——子 agent 只会查少量已知 userId，会漏掉其他人。直接用 MCP 工具：
+## 核心查询工作流 → 已按对象域拆分
 
-```bash
-curl -s http://127.0.0.1:8799/mcp -X POST \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_companions","arguments":{"startTime":"2026-08-01T11:00:00Z","endTime":"2026-08-01T17:00:00Z","userId":"<目标userId>"}}}'
-```
+> **2026-08-16 起查询工作流按域拆分**（本总纲保留工具表唯一权威 + 通用陷阱）：
 
-- `startTime`/`endTime`：ISO 8601 UTC（北京时间 -8h），窗口 ≤24h
-- `userId`：**可查自己（默认，即登录账号）或任意好友**——传好友 ID = "XX 和谁一起玩过"
-- 原理：查目标用户的 location 事件 → 提取 worldId:instanceId → 全量比对好友 location 事件 → 排除目标本人 → 按 userId 分组
-- 返回每个同屏好友的 matchCount（同屏次数）、worlds（世界列表）
+| 域 | 工作流 | 见 |
+|----|--------|-----|
+| 好友/社交 | 在线五要素/同房/同屏/时间线/上线规律/常玩/昵称/画像/关系 + 全部写操作（boop/上传/邀请/开房/好友管理） | **vrchat-social-queries** |
+| 群组 | 群组查询/公告 403 分诊/join/leave/peek | **vrchat-group-queries** |
+| 世界 | 挑新世界/backlog/推荐/PlanetVRC/情报挖掘/X 博主 + 地图展示格式 | **vrchat-world-queries** |
+| BOOTH | 素体服装检索/热度榜/封面/汉化 | **booth-query-display** |
 
-### 3. "某天活动时间线" / "XX 和 YY 昨晚同房吗"
-
-```
-1. get_friend_events(userId=A, types="friend-location", limit=5) → 最近位置变化
-   - created_at 是 UTC，+8 转北京时间
-   - location 格式 "wrld_xxx:instanceId~hidden(usr_owner)~region(jp)"；traveling 时看 travelingToLocation
-2. 比对 worldId + instanceId：相同 = 同房；确认时间重叠
-3. get_world_name(worldId) → 世界名
-```
-
-陷阱：`get_friend_events` 每个事件嵌完整用户 JSON（~50KB），limit 大会爆响应。用 `limit=5` + `offset` 分页；或只读顶层字段。
-
-### 4. "XX 几点上线 / 什么时候最容易碰到 TA" → `get_online_pattern`
-
-一次调用拿全部规律，不要逐条翻事件：
-
-```bash
-# 默认最近 30 天（北京时间自然日）；可传 days 或 startTime/endTime
-curl -s http://127.0.0.1:8799/mcp -X POST -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_online_pattern","arguments":{"userId":"<目标userId>"}}}'
-```
-
-返回：`hourly`（上线/下线/位置活跃按北京小时分桶）、`activeDates`（活跃日期）、`frequency`（活跃天数/活动比率/平均间隔/最长空档）、`peak`（登录/活跃/下线峰值小时 + suggestedWindow 最佳相遇时段）。
-
-### 5. 昵称管理
-
-好友昵称映射存本地库（`nicknames` 表），**不维护在 skill 文件里**：
-
-- 查询：`get_nicknames`（不带参数返回全部；`userId` 精确查；`query` 按昵称或显示名模糊查）
-- 写入：`set_nickname {userId, nickname, displayName?}`（upsert 幂等）
-- 建议工作流：用户给好友取中文昵称 → `search_users` 找 userId → `set_nickname` 写入 → 后续查询结果用昵称展示
-
-## 结果格式
-
-建议用昵称代替原始显示名以提高可读性。companion 数据可展示为：`| 排名 | 好友 | 共处时间 | 同屏实例 | 最近一次 |`，并附一行小结总结社交模式。
+## 结果格式 → 社交展示格式（companion 表格）见 vrchat-social-queries；地图展示格式见 vrchat-world-queries §6
 
 ## 常见陷阱
 
@@ -178,8 +185,12 @@ boop 通知落库的顶层事件类型是 `notification-v2`（不是 boop），b
 ### OTP 登录
 
 - 服务自动从邮箱 IMAP 抓取 OTP 验证码登录，无人值守
-- QQ 邮箱有"自动分类"功能会把验证码邮件归档到分类文件夹（IMAP 名含 `VRChat`，modified UTF-7 编码）——fetch-otp.py 已带文件夹遍历兜底，若 OTP 一直失败先想到这个
+- QQ 邮箱有"自动分类"功能会把验证码邮件归档到分类文件夹（IMAP 名含 `VRChat`，modified UTF-7 编码）——scripts/fetch-otp.py 已带文件夹遍历兜底，若 OTP 一直失败先想到这个
 - 认证失败有 120s 冷却，401 限流 5min 冷却，会自愈
+
+### 登录状态主动通知（issue #69）
+
+无人值守服务默认只写日志。可配置 `notify-config.json`（复制 `notify-config.example.json`）开启主动通知：在「需人工介入/异常」时（进入 needsTotp、邮箱 OTP 抓取失败、运行期 401 自动重认证失败、认证恢复）提醒宿主，正常自动登录不通知。`channels` 支持 `desktop`（Linux notify-send / macOS osascript / Windows PowerShell toast）与 `webhook`（POST JSON 到 webhook_url）。去抖：连续失败达 `consecutive_fail_threshold`（默认 3）且距上次通知超 `min_interval_sec`（默认 300）才发送。默认关闭，缺文件或 enabled:false 不影响服务。桌面通知需系统通知守护（Linux dunst/mako），无守护时静默降级不崩服务。
 
 ### 代理（国内网络）
 
@@ -192,3 +203,6 @@ curl -s http://127.0.0.1:8799/health
 ```
 
 正常：`auth.authenticated=true`、`ws.status=connected`。服务没起时：项目目录下 `node start-monitor.js` 后台启动（10-15s 完成登录+WS 连接）。改代码后必须重启才生效（进程常驻，不热加载）。
+
+- **日志**：服务日志统一走 `core/logger.js`，默认写 stdout + `<VRC_MONITOR_LOGGER_DIR>/monitor.log`（默认 `<VRC_MONITOR_DIR>/logs`）。排障优先看该文件；agent 用 `VRC_MONITOR_LOGGER_FORMAT=json` 启动后 `jq` 解析结构化行（键 ts/level/name/msg/pid）。级别用 `VRC_MONITOR_LOGGER_LEVEL` 控制（默认 info，调 debug 可看 MCP 协议往返）。MCP ping/keepalive 噪音可用 `VRC_MONITOR_LOGGER_SUPPRESS=ping,keepalive` 或 `VRC_MONITOR_LOGGER_LEVEL=warn` 过滤。
+- 若想定位「哪个组件打的日志」：JSONL 的 `name` 字段（如 `mcp`/`ws`/`api`/`storage`）；text 格式形如 `[ws]`。

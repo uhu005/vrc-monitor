@@ -10,8 +10,13 @@
  */
 import https from 'node:https';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { recordOpsLog } from './core/ops-log.js';
 
 const API_BASE = 'https://api.vrchat.cloud/api/1';
+
+// 单个 VRChat API 请求的 socket 超时（毫秒）。正常请求 1-3s 返回，
+// 网络抖动/代理失效时若不加超时，挂起的请求会锁死 rateLimiter 队列。
+const REQUEST_TIMEOUT_MS = 15000;
 
 export class VrchatApiClient {
   /** @type {Promise|null} single-flight lock for ensureAuth / ensureAuthWithAutoOtp */
@@ -23,9 +28,24 @@ export class VrchatApiClient {
     this.authCookie = '';
     this.currentUser = null;
     this.requiresOtp = false;       // true after Basic auth when 2FA needed
-    this.tempAuthCookie = '';       // partial cookie before OTP verify
+    this.tempAuthCookie = '';       // partial cookie before 2FA verify
+    this.pending2faTypes = [];      // 2FA types required by the pending login (e.g. ['emailOtp','totp'])
     this._cookiePath = '';
     this.#authLock = null;       // single-flight lock for ensureAuth / ensureAuthWithAutoOtp
+    this.otpFetcher = null;        // 注入邮箱 OTP 自动获取函数（用于 401 自动重认证）
+    this.totpFetcher = null;       // 注入 TOTP 验证码自动生成函数（credentials.json 配置 totp_secret 后启用）
+    this._reauthInFlight = false;  // 防止并发 401 重认证
+    this._reauthCooldownUntil = 0; // 非 TOTP 重认证失败后的冷却（防循环）
+  }
+
+  /** 注入邮箱 OTP 获取函数（start-monitor.js 启动时调用） */
+  setOtpFetcher(fn) {
+    this.otpFetcher = fn;
+  }
+
+  /** 注入 TOTP 验证码自动生成函数（配置 totp_secret 后启用自动登录） */
+  setTotpFetcher(fn) {
+    this.totpFetcher = fn;
   }
 
   loadCookieFromFile(path) {
@@ -45,9 +65,88 @@ export class VrchatApiClient {
   }
 
   /**
-   * Make an HTTPS request with cookie
+   * Make an HTTPS request with cookie.
+   *
+   * 带 401 自动重认证：业务请求返回 401（cookie 过期）时自动尝试重新登录，
+   * 成功后重放原请求一次；若重新登录需要 TOTP，则抛 { needsTotp: true } 进入
+   * needsTotp 状态（tempAuthCookie 已保留，submit_totp 可直接完成登录）。
+   *
+   * 注意：认证端点自身（/auth/user、/auth、twofactorauth）不走此逻辑，
+   * 避免 ensureAuth / checkAuth 内部形成递归。
    */
-  _request(method, path, body = null, customCookies = null) {
+  async _request(method, path, body = null, customCookies = null) {
+    const res = await this._requestRaw(method, path, body, customCookies);
+    if (res.status === 401 && !customCookies && !this._isAuthEndpoint(path)) {
+      try {
+        const reauthed = await this._tryAutoReauth();
+        if (reauthed) {
+          return await this._requestRaw(method, path, body, customCookies);
+        }
+      } catch (err) {
+        if (err.needsTotp) {
+          // 保留 tempAuthCookie，抛 needsTotp 由 registry.dispatch 设置 serverState.needsTotp
+          err.message = `API 登录已失效，需要 TOTP 验证码：请调用 submit_totp 提交当前验证码（${err.message}）`;
+          throw err;
+        }
+        // 其他重认证错误：不吞掉，向上抛
+        throw err;
+      }
+    }
+    return res;
+  }
+
+  /** 认证端点判断——避免 ensureAuth/checkAuth 内部递归触发重认证 */
+  _isAuthEndpoint(path) {
+    return path === '/auth' || path === '/auth/user' || path.startsWith('/auth/twofactorauth');
+  }
+
+  /**
+   * 401 后的自动重认证（single-flight + 冷却）。
+   * 返回 true=已重新登录；false=失败已冷却；抛 { needsTotp } = 需 TOTP 手动提交。
+   */
+  async _tryAutoReauth() {
+    if (this._reauthInFlight) return false;  // 已有重认证进行中，跳过本次
+    if (Date.now() < this._reauthCooldownUntil) return false;
+
+    this._reauthInFlight = true;
+    try {
+      console.log('[VRChat API] ⚠️ 请求返回 401，尝试自动重新登录...');
+      if (this.otpFetcher || this.totpFetcher) {
+        await this.ensureAuthWithAutoOtp(this.otpFetcher);
+      } else {
+        // 无 otpFetcher（如测试/未注入场景）：仍解析 2FA 类型，
+        // 纯 TOTP 账号应进入 needsTotp 而非笼统 needsOtp
+        try {
+          await this.ensureAuth();
+        } catch (err) {
+          if (err.needsOtp) {
+            const types = this.pending2faTypes || [];
+            if (types.includes('totp')) {
+              const totpErr = new Error('账号启用 TOTP 两步验证，请调用 submit_totp 工具提交当前验证码');
+              totpErr.needsTotp = true;
+              throw totpErr;
+            }
+            this.requiresOtp = false;
+            this.tempAuthCookie = '';
+          }
+          throw err;
+        }
+      }
+      console.log('[VRChat API] ✅ 自动重新登录成功');
+      return true;
+    } catch (err) {
+      if (err.needsTotp) throw err;
+      // 非 TOTP 失败（网络/凭据错误等）：冷却 60s，避免高频重试
+      this._reauthCooldownUntil = Date.now() + 60_000;
+      console.error(`[VRChat API] ❌ 自动重新登录失败: ${err.message}`);
+      return false;
+    } finally {
+      this._reauthInFlight = false;
+    }
+  }
+
+  /** 底层原始请求（无 401 自动重认证逻辑） */
+  _requestRaw(method, path, body = null, customCookies = null) {
     return new Promise((resolve, reject) => {
       const url = new URL(API_BASE + path);
       const cookieStr = customCookies || (this.authCookie ? `auth=${this.authCookie}` : '');
@@ -68,9 +167,10 @@ export class VrchatApiClient {
       }
 
       const req = https.request(options, (res) => {
-        let data = '';
-        res.on('data', (chunk) => data += chunk);
+        let chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
         res.on('end', () => {
+          const data = Buffer.concat(chunks).toString('utf8');
           try {
             const parsed = JSON.parse(data);
             resolve({ status: res.statusCode, data: parsed, headers: res.headers });
@@ -78,6 +178,15 @@ export class VrchatApiClient {
             resolve({ status: res.statusCode, data, headers: res.headers });
           }
         });
+      });
+
+      // 超时兜底：socket 半通不通（网络抖动/代理失效）时请求可能永挂不返回，
+      // 若不设超时会占住 rateLimiter 队头 -> 锁死整条队列；超时 destroy 触发 error -> reject。
+      // ⚠️ 注：Node req.setTimeout 是「socket 空闲超时」(idle timeout)——仅在 socket 无任何
+      //    活动时触发；「持续小流量但永不 end」的响应不会被它覆盖（由 rateLimiter 的
+      //    任务级超时兜底，见 core/rate-limiter.js）。
+      req.setTimeout(REQUEST_TIMEOUT_MS, () => {
+        req.destroy(new Error(`VRChat API 请求超时 (${REQUEST_TIMEOUT_MS}ms): ${method} ${path}`));
       });
 
       req.on('error', reject);
@@ -91,18 +200,24 @@ export class VrchatApiClient {
    * the `authCookie` variable still gets set to a valid temp cookie
    * that we need to send alongside the OTP verification request.
    * 
-   * Full login flow: Basic auth → OTP verify → get user info
+   * Full login flow: Basic auth → 2FA verify → get user info
+   *
+   * @param {string} code 6-digit verification code (email OTP or TOTP)
+   * @param {string} type 'emailOtp' | 'totp'
    */
-  async loginWithOtp(otpCode) {
-    if (!this.tempAuthCookie) throw new Error('No pending OTP session. Call tryLoginWithCredentials() first.');
+  async _verify2fa(code, type) {
+    if (!this.tempAuthCookie) throw new Error('No pending 2FA session. Call tryLoginWithCredentials() first.');
 
     const otpCookieStr = `auth=${this.tempAuthCookie}`;
+    const endpoint = type === 'totp'
+      ? '/auth/twofactorauth/totp/verify'
+      : '/auth/twofactorauth/emailotp/verify';
 
-    // Step 2: Verify OTP
-    const r2 = await this._rawRequest('POST', '/auth/twofactorauth/emailotp/verify',
-      { code: otpCode }, otpCookieStr);
+    // Step 2: Verify code
+    const r2 = await this._rawRequest('POST', endpoint,
+      { code }, otpCookieStr);
     if (r2.status !== 200) {
-      throw new Error(`OTP 验证失败 (HTTP ${r2.status})`);
+      throw new Error(`2FA 验证失败 (HTTP ${r2.status})`);
     }
 
     // Extract the REAL auth cookie from verify response Set-Cookie header.
@@ -116,14 +231,25 @@ export class VrchatApiClient {
     // Step 3: Get user with the auth cookie
     const r3 = await this._request('GET', '/auth/user');
     if (r3.status !== 200 || !r3.data?.id) {
-      throw new Error(`OTP 登录后获取用户信息失败 (HTTP ${r3.status})`);
+      throw new Error(`2FA 登录后获取用户信息失败 (HTTP ${r3.status})`);
     }
 
     this.currentUser = r3.data;
     this.requiresOtp = false;
     this.tempAuthCookie = '';
+    this.pending2faTypes = [];
     this.saveCookieToFile();
     return this.currentUser;
+  }
+
+  /** 邮箱 OTP 登录（兼容旧调用） */
+  async loginWithOtp(otpCode) {
+    return this._verify2fa(otpCode, 'emailOtp');
+  }
+
+  /** TOTP（Authenticator 应用验证码）登录 */
+  async loginWithTotp(totpCode) {
+    return this._verify2fa(totpCode, 'totp');
   }
 
   /**
@@ -152,16 +278,25 @@ export class VrchatApiClient {
     this.authCookie = cookies.auth;
 
     if (r1.data?.requiresTwoFactorAuth) {
-      // 2FA required — save the temp cookie for OTP step
+      // 2FA required — save the temp cookie for 2FA step
       this.requiresOtp = true;
       this.tempAuthCookie = cookies.auth;
-      return { requiresOtp: true, message: 'Email OTP required. Please provide the code sent to your email.' };
+      // VRChat 返回数组如 ['emailOtp','totp']；旧格式布尔 true 兜底为 emailOtp
+      this.pending2faTypes = Array.isArray(r1.data.requiresTwoFactorAuth)
+        ? r1.data.requiresTwoFactorAuth
+        : ['emailOtp'];
+      return {
+        requiresOtp: true,
+        twoFactorAuthTypes: this.pending2faTypes,
+        message: '2FA required. Please provide the verification code.',
+      };
     }
 
     // Success — no 2FA needed
     this.currentUser = r1.data;
     this.requiresOtp = false;
     this.tempAuthCookie = '';
+    this.pending2faTypes = [];
     this.saveCookieToFile();
     return { success: true, user: r1.data };
   }
@@ -183,9 +318,10 @@ export class VrchatApiClient {
         },
       };
       const req = https.request(options, (res) => {
-        let data = '';
-        res.on('data', (chunk) => data += chunk);
+        let chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
         res.on('end', () => {
+          const data = Buffer.concat(chunks).toString('utf8');
           try {
             const parsed = JSON.parse(data);
             resolve({ status: res.statusCode, data: parsed, headers: res.headers });
@@ -194,6 +330,15 @@ export class VrchatApiClient {
           }
         });
       });
+      // 超时兜底：socket 半通不通（网络抖动/代理失效）时请求可能永挂不返回，
+      // 若不设超时会占住 rateLimiter 队头 -> 锁死整条队列；超时 destroy 触发 error -> reject。
+      // ⚠️ 注：Node req.setTimeout 是「socket 空闲超时」(idle timeout)——仅在 socket 无任何
+      //    活动时触发；「持续小流量但永不 end」的响应不会被它覆盖（由 rateLimiter 的
+      //    任务级超时兜底，见 core/rate-limiter.js）。
+      req.setTimeout(REQUEST_TIMEOUT_MS, () => {
+        req.destroy(new Error(`VRChat API 请求超时 (${REQUEST_TIMEOUT_MS}ms): ${method} ${path}`));
+      });
+
       req.on('error', reject);
       req.end();
     });
@@ -224,10 +369,19 @@ export class VrchatApiClient {
         },
       };
       const req = https.request(options, (res) => {
-        let data = '';
-        res.on('data', (chunk) => data += chunk);
-        res.on('end', () => resolve({ status: res.statusCode, data, headers: res.headers }));
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => resolve({ status: res.statusCode, data: Buffer.concat(chunks).toString('utf8'), headers: res.headers }));
       });
+      // 超时兜底：socket 半通不通（网络抖动/代理失效）时请求可能永挂不返回，
+      // 若不设超时会占住 rateLimiter 队头 -> 锁死整条队列；超时 destroy 触发 error -> reject。
+      // ⚠️ 注：Node req.setTimeout 是「socket 空闲超时」(idle timeout)——仅在 socket 无任何
+      //    活动时触发；「持续小流量但永不 end」的响应不会被它覆盖（由 rateLimiter 的
+      //    任务级超时兜底，见 core/rate-limiter.js）。
+      req.setTimeout(REQUEST_TIMEOUT_MS, () => {
+        req.destroy(new Error(`VRChat API 请求超时 (${REQUEST_TIMEOUT_MS}ms): ${method} ${path}`));
+      });
+
       req.on('error', reject);
       if (body) req.write(JSON.stringify(body));
       req.end();
@@ -243,17 +397,24 @@ export class VrchatApiClient {
   async ensureAuth() {
     if (this.#authLock) return this.#authLock;
     this.#authLock = this._doEnsureAuth();
+    const t0 = Date.now();
     try {
-      return await this.#authLock;
+      const user = await this.#authLock;
+      recordOpsLog('auth', 'info', '认证完成：会话有效（' + (Date.now() - t0) + 'ms）');
+      return user;
+    } catch (err) {
+      const why = err.needsOtp ? '需要 2FA 验证码' : (err.message || '未知错误');
+      recordOpsLog('auth', 'warn', '认证失败（' + (Date.now() - t0) + 'ms）：' + why);
+      throw err;
     } finally {
       this.#authLock = null;
     }
   }
 
   async _doEnsureAuth() {
-    // If we already know we need OTP, throw needsOtp signal
+    // If we already know we need 2FA, throw needsOtp signal
     if (this.requiresOtp) {
-      const err = new Error('Auth requires email OTP. Use submit_otp tool.');
+      const err = new Error('Auth requires 2FA verification.');
       err.needsOtp = true;
       throw err;
     }
@@ -302,11 +463,43 @@ export class VrchatApiClient {
   async ensureAuthWithAutoOtp(otpFetcher) {
     if (this.#authLock) return this.#authLock;
     this.#authLock = this._doEnsureAuthWithAutoOtp(otpFetcher);
+    const t0 = Date.now();
     try {
-      return await this.#authLock;
+      const user = await this.#authLock;
+      recordOpsLog('auth', 'info', '\u81ea\u52a8\u8ba4\u8bc1\u6210\u529f\uff082FA \u5df2\u81ea\u52a8\u5b8c\u6210\uff0c\u4f1a\u8bdd\u6709\u6548\uff0c' + (Date.now() - t0) + 'ms\uff09');
+      return user;
+    } catch (err) {
+      const why = err.needsTotp
+        ? '\u9700\u8981\u624b\u52a8\u63d0\u4ea4 TOTP\uff08\u8c03\u7528 submit_totp\uff09'
+        : err.needsOtp
+          ? '\u9700\u8981 2FA \u9a8c\u8bc1\u7801\u4e14\u81ea\u52a8\u83b7\u53d6\u5931\u8d25'
+          : (err.message || '\u672a\u77e5\u9519\u8bef');
+      recordOpsLog('auth', 'warn', '\u81ea\u52a8\u8ba4\u8bc1\u5931\u8d25\uff08' + (Date.now() - t0) + 'ms\uff09\uff1a' + why);
+      throw err;
     } finally {
       this.#authLock = null;
     }
+  }
+
+  /** 自动生成并提交 TOTP 验证码完成登录；失败抛错（无 needsTotp 标记，由调用方决定是否转手动） */
+  async _autoTotpLogin() {
+    if (!this.totpFetcher) throw new Error('未配置 TOTP fetcher');
+    // totpFetcher 返回单个验证码或数组（[前窗口, 当前, 后窗口] 容错时钟漂移，审核 #70 🟡 建议 2）
+    const codes = await this.totpFetcher();
+    const candidates = Array.isArray(codes) ? codes : [codes];
+    let lastErr = null;
+    for (const code of candidates) {
+      if (!code || !/^\d{6,8}$/.test(String(code))) {
+        lastErr = new Error(`无效的 TOTP 验证码: "${code}"`);
+        continue;
+      }
+      try {
+        return await this.loginWithTotp(String(code));
+      } catch (err) {
+        lastErr = err; // 该窗口验证码被拒，尝试下一窗口
+      }
+    }
+    throw lastErr || new Error('无可用 TOTP 验证码');
   }
 
   async _doEnsureAuthWithAutoOtp(otpFetcher) {
@@ -314,7 +507,74 @@ export class VrchatApiClient {
       return await this._doEnsureAuth();
     } catch (err) {
       if (!err.needsOtp) throw err;
-      console.log('[VRChat API] ⚠️ 需要邮箱验证码，自动获取中...');
+
+      // 根据账号启用的 2FA 类型分流：含 emailOtp 优先邮箱自动抓取；
+      // 仅 totp 时若配置了 totp_secret 则自动生成验证码，否则转 submit_totp 手动提交
+      const types = this.pending2faTypes || [];
+      const needEmailOtp = types.includes('emailOtp');
+      const needTotp = types.includes('totp');
+
+      if (needEmailOtp) {
+        console.log('[VRChat API] ⚠️ 需要邮箱验证码，自动获取中...');
+        try {
+          const otpCode = await otpFetcher();
+          if (!otpCode || !/^\d{6}$/.test(String(otpCode))) {
+            throw new Error(`无效的验证码: "${otpCode}"，应为6位数字`);
+          }
+          return await this.loginWithOtp(String(otpCode));
+        } catch (otpErr) {
+          // 邮箱抓取失败：若账号也支持 TOTP，先试自动 TOTP 兜底，再转手动提交（保留 tempAuthCookie）
+          if (needTotp) {
+            if (this.totpFetcher) {
+              console.log('[VRChat API] ⚠️ 邮箱验证码获取失败，尝试自动 TOTP 兜底...');
+              try {
+                const user = await this._autoTotpLogin();
+                console.log('[VRChat API] ✅ 自动 TOTP 兜底登录成功');
+                return user;
+              } catch (totpErr) {
+                // 邮箱与自动 TOTP 双失败：补冷却等待下个窗口（与仅 TOTP 分支对称，审核 #70 🟡 建议 1）
+                this._reauthCooldownUntil = Date.now() + 30_000;
+                const totpErr2 = new Error(`邮箱与自动 TOTP 均失败(${totpErr.message})，请调用 submit_totp 工具提交验证码`);
+                totpErr2.needsTotp = true;
+                totpErr2.needsOtp = true;
+                throw totpErr2;
+              }
+            }
+            const totpErr = new Error(`邮箱验证码获取失败(${otpErr.message})，请调用 submit_totp 工具提交 TOTP 验证码`);
+            totpErr.needsTotp = true;
+            totpErr.needsOtp = true;
+            throw totpErr;
+          }
+          this.requiresOtp = false;
+          this.tempAuthCookie = '';
+          throw new Error(`OTP 自动登录失败: ${otpErr.message}`);
+        }
+      }
+
+      if (needTotp) {
+        if (this.totpFetcher) {
+          console.log('[VRChat API] ⚠️ 需要 TOTP 验证码，自动生成中...');
+          try {
+            const user = await this._autoTotpLogin();
+            console.log('[VRChat API] ✅ TOTP 自动登录成功');
+            return user;
+          } catch (totpErr) {
+            // 自动失败：保留 tempAuthCookie 转手动 submit_totp 兜底；冷却等待下一个 TOTP 窗口再自动重试
+            this._reauthCooldownUntil = Date.now() + 30_000;
+            const totpErr2 = new Error(`TOTP 自动登录失败(${totpErr.message})，请调用 submit_totp 工具提交当前验证码或检查 totp_secret`);
+            totpErr2.needsTotp = true;
+            totpErr2.needsOtp = true;
+            throw totpErr2;
+          }
+        }
+        // 未配置 totp_secret：保留 tempAuthCookie，等待 submit_totp 工具提交验证码
+        const totpErr = new Error('账号启用 TOTP 两步验证，请调用 submit_totp 工具提交当前验证码（或在 credentials.json 配置 totp_secret 启用自动登录）');
+        totpErr.needsTotp = true;
+        totpErr.needsOtp = true;
+        throw totpErr;
+      }
+
+      // 未知 2FA 类型：按邮箱处理兜底
       try {
         const otpCode = await otpFetcher();
         if (!otpCode || !/^\d{6}$/.test(String(otpCode))) {
@@ -475,9 +735,10 @@ export class VrchatApiClient {
       };
 
       const req = https.request(options, (res) => {
-        let data = '';
-        res.on('data', (chunk) => data += chunk);
+        let chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
         res.on('end', () => {
+          const data = Buffer.concat(chunks).toString('utf8');
           try {
             const parsed = JSON.parse(data);
             resolve({ status: res.statusCode, data: parsed, headers: res.headers });
@@ -485,6 +746,15 @@ export class VrchatApiClient {
             resolve({ status: res.statusCode, data, headers: res.headers });
           }
         });
+      });
+
+      // 超时兜底：socket 半通不通（网络抖动/代理失效）时请求可能永挂不返回，
+      // 若不设超时会占住 rateLimiter 队头 -> 锁死整条队列；超时 destroy 触发 error -> reject。
+      // ⚠️ 注：Node req.setTimeout 是「socket 空闲超时」(idle timeout)——仅在 socket 无任何
+      //    活动时触发；「持续小流量但永不 end」的响应不会被它覆盖（由 rateLimiter 的
+      //    任务级超时兜底，见 core/rate-limiter.js）。
+      req.setTimeout(REQUEST_TIMEOUT_MS, () => {
+        req.destroy(new Error(`VRChat API 请求超时 (${REQUEST_TIMEOUT_MS}ms): ${method} ${path}`));
       });
 
       req.on('error', reject);
@@ -555,6 +825,15 @@ export class VrchatApiClient {
           buffer.contentType = res.headers['content-type'] || null;
           resolve(buffer);
         });
+      });
+
+      // 超时兜底：socket 半通不通（网络抖动/代理失效）时请求可能永挂不返回，
+      // 若不设超时会占住 rateLimiter 队头 -> 锁死整条队列；超时 destroy 触发 error -> reject。
+      // ⚠️ 注：Node req.setTimeout 是「socket 空闲超时」(idle timeout)——仅在 socket 无任何
+      //    活动时触发；「持续小流量但永不 end」的响应不会被它覆盖（由 rateLimiter 的
+      //    任务级超时兜底，见 core/rate-limiter.js）。
+      req.setTimeout(REQUEST_TIMEOUT_MS, () => {
+        req.destroy(new Error(`VRChat API 下载超时 (${REQUEST_TIMEOUT_MS}ms): ${url}`));
       });
 
       req.on('error', reject);

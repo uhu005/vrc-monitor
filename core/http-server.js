@@ -2,13 +2,16 @@
  * HTTP 服务器 — MCP SSE 端点 + 健康检查
  *
  * 提供 McpSession 管理、SSE 响应辅助、HTTP 服务器创建与请求路由。
- * handleRpc 从 rpc-router.js 导入（ESM live binding，运行时调用无循环依赖问题）。
  */
 
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { ctx, log } from './server-context.js';
-import { handleRpc } from './rpc-router.js';
+import { getLogger } from './logger.js';
+import * as registry from './registry.js';
+
+// 命名日志：MCP 协议层（JSON-RPC 往返），请求日志默认降为 debug 级避免 ping/keepalive 刷屏
+const logMCP = getLogger('mcp');
 
 // ── MCP 会话管理 ──
 const sessions = new Map();
@@ -56,20 +59,57 @@ export function sendError(res, id, message) {
 // ── 请求路由 ──
 async function handleRequest(req, res) {
   const { storage, rateLimiter, wsManager, friendState, eventPipeline, serverState, paths } = ctx;
+  const pathname = (req.url || '').split('?')[0];
+
+  // ── 全局 HTTP 鉴权中间件（由 auth-guard 插件或环境配置提供）──
+  if (ctx.pluginLoader?.hasService('http.authenticate')) {
+    const authResult = ctx.pluginLoader.consume('http.authenticate', req);
+    if (!authResult || !authResult.ok) {
+      const errBody = JSON.stringify({ error: 'Unauthorized', message: authResult?.message || 'Invalid or missing API token' });
+      res.writeHead(401, {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(errBody),
+        'WWW-Authenticate': 'Bearer error="invalid_token"',
+      });
+      res.end(errBody);
+      return;
+    }
+  }
+
+  // ── 插件注册的 HTTP 路由（api.http.registerRoute）──
+  // 在鉴权中间件之后分发：插件路由与 /health、/mcp 同级，按 method+path 精确匹配。
+  const route = ctx.httpRoutes?.get(`${req.method} ${pathname}`);
+  if (route) {
+    try {
+      await route.handler(req, res);
+    } catch (err) {
+      log(`❌ 插件 HTTP 路由失败 [${route.pluginName} ${pathname}]: ${err.message}`);
+      if (!res.headersSent) {
+        const body = JSON.stringify({ error: 'Internal Server Error', message: err.message });
+        res.writeHead(500, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
+        res.end(body);
+      }
+    }
+    return;
+  }
 
   // Health check
-  if (req.method === 'GET' && req.url === '/health') {
+  if (req.method === 'GET' && pathname === '/health') {
     const uptime = serverState.started ? Math.floor((Date.now() - serverState.started) / 1000) : 0;
     const status = {
       ok: true,
-      auth: serverState.authUser
+      // needsTotp 状态下账号并未真正登录（运行期 401 需 TOTP），即使 authUser 仍保留上次缓存，
+      // 也必须报 authenticated:false 并暴露 needsTotp，避免 /health 误报已认证（issue #59）
+      auth: serverState.authUser && !serverState.needsTotp
         ? { authenticated: true, user: serverState.authUser }
-        : { authenticated: false, needsOtp: serverState.needsOtp },
+        : { authenticated: false, needsOtp: serverState.needsOtp, needsTotp: serverState.needsTotp },
+      totpAutoEnabled: !!(ctx.api?.totpFetcher),
       db: storage.getStats(),
       rateLimiter: rateLimiter.getStats(),
       ws: wsManager?.getState(),
       friendState: friendState?.getStats(),
       eventPipeline: eventPipeline?.getStats(),
+      plugins: ctx.pluginLoader?.getStatus() || [],
       uptime,
     };
     const body = JSON.stringify(status, null, 2);
@@ -78,13 +118,12 @@ async function handleRequest(req, res) {
     return;
   }
 
-  // MCP streamable HTTP：GET = SSE 长连接通道（2026-08-14 修复）
-  // 原来这里是 endpoint probe（立即 res.end()），而 Hermes 的 MCP 客户端会建立
+  // MCP streamable HTTP：GET = SSE 长连接通道（2026-08-14 本地修复，合并 v3.2.0-beta 时保留）
+  // 上游仍是 endpoint probe（立即 res.end()），而 Hermes 的 MCP 客户端会建立
   // GET stream 长连接等服务器推送 → 服务器秒断 → 客户端每秒重连循环（日志刷屏 +
   // keepalive degraded）。现在保持连接 + 定时发 SSE 注释心跳（: ping），
   // 2s 间隔低于本机代理（mihomo）的空闲超时（Keep-Alive: timeout=4），防代理掐断。
-  // 服务器无主动推送需求，心跳只用于维持通道活跃。
-  if (req.method === 'GET' && req.url === '/mcp') {
+  if (req.method === 'GET' && pathname === '/mcp') {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
@@ -98,7 +137,14 @@ async function handleRequest(req, res) {
     return;
   }
 
-  if (req.method !== 'POST' || req.url !== '/mcp') {
+  // MCP session termination（SDK 关闭连接时调用，2026-08-17 加：之前 404 导致客户端 warning）
+  if (req.method === 'DELETE' && pathname === '/mcp') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  if (req.method !== 'POST' || pathname !== '/mcp') {
     res.writeHead(404);
     res.end('Not Found');
     return;
@@ -111,13 +157,74 @@ async function handleRequest(req, res) {
       const rpc = JSON.parse(body);
       const sessionId = req.headers['mcp-session-id'];
       const session = getOrCreateSession(sessionId);
-      log(`MCP ${rpc.method || '?'} ${body.slice(0, 60)}...`);
+      logMCP.debug(`MCP ${rpc.method || '?'} ${body.slice(0, 60)}...`);
       await handleRpc(rpc, session, res);
     } catch (err) {
       log(`Parse error: ${err.message}`);
       sendError(res, null, 'Parse error: ' + err.message);
     }
   });
+}
+
+// ── MCP JSON-RPC 协议分发 ──
+async function handleRpc(rpc, session, res) {
+  const { id, method, params } = rpc;
+
+  switch (method) {
+    case 'initialize': {
+      session.initialized = true;
+      sendSSE(res, [{
+        jsonrpc: '2.0', id,
+        result: {
+          protocolVersion: '2025-03-26',
+          capabilities: { tools: {} },
+          serverInfo: { name: 'vrc-monitor', version: '1.14.0' },
+        },
+      }], session.id);
+      break;
+    }
+
+    case 'notifications/initialized':
+      sendSSE(res, [], session.id);
+      break;
+
+    case 'ping':
+      // MCP 协议要求：ping 必须返回 JSON-RPC 结果，否则客户端 keepalive 判定连接不健康
+      sendSSE(res, [{ jsonrpc: '2.0', id, result: {} }], session.id);
+      break;
+
+    case 'tools/list': {
+      sendSSE(res, [{
+        jsonrpc: '2.0', id,
+        result: { tools: registry.listTools() },
+      }], session.id);
+      break;
+    }
+
+    case 'tools/call': {
+      const { name, arguments: args } = params;
+      try {
+        const result = await registry.dispatch(name, args);
+        sendSSE(res, [{
+          jsonrpc: '2.0', id,
+          result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] },
+        }], session.id);
+      } catch (err) {
+        log(`❌ ${name} failed: ${err.message}`);
+        sendError(res, id, err.message);
+      }
+      break;
+    }
+
+    default:
+      // 未实现的方法：带 id 的请求必须返回 -32601 Method not found，
+      // 空响应会让客户端等不到匹配响应而挂起
+      if (id === undefined) {
+        sendSSE(res, [], session.id);
+      } else {
+        sendSSE(res, [{ jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${method}` } }], session.id);
+      }
+  }
 }
 
 // ── 服务器创建 ──
@@ -127,7 +234,7 @@ export function createServer() {
     try {
       await handleRequest(req, res);
     } catch (err) {
-      log(`❌ Unhandled: ${err.message}`);
+      log(` Unhandled: ${err.message}`);
       if (!res.headersSent) {
         try { res.writeHead(502); res.end(err.message); } catch {}
       }
@@ -140,10 +247,12 @@ export function createServer() {
     }
   });
 
-  // 端口冲突不直接 crash
+  // 端口冲突 → 立即退出（防双实例并存互抢 OTP 验证码，issue #49）
   server.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
       log(`❌ 端口 ${PORT} 已被占用，请检查是否有旧进程残留`);
+      log('   检测到监控服务可能已在运行，本进程立即退出，避免双实例并存互抢 OTP 验证码');
+      process.exit(1);
     } else {
       log(`❌ 服务器错误: ${err.message}`);
     }

@@ -1,0 +1,18 @@
+services:
+  vrchat-assistant:
+    build: .
+    container_name: vrchat-assistant
+    restart: unless-stopped
+    ports:
+      - "${VRC_MONITOR_PORT:-8799}:8799"
+    environment:
+      - VRC_MONITOR_SAFE_MODE=${VRC_MONITOR_SAFE_MODE:-true}
+      - VRC_MONITOR_HOST=0.0.0.0
+      - VRC_MONITOR_PORT=8799
+      - VRC_MONITOR_AUTH_TOKEN=${VRC_MONITOR_AUTH_TOKEN:-}
+      - VRC_MONITOR_DB_PATH=/app/data/vrc-monitor.sqlite3
+      - VRC_MONITOR_BACKUP_DIR=/app/data/backups
+      - VRC_MONITOR_COOKIE_FILE=/app/data/auth_cookie.txt
+    volumes:
+      - ./data:/app/data
+      - ./credentials.json:/app/credentials.json:ro

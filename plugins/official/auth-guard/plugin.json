@@ -1,0 +1,6 @@
+{
+  "name": "auth-guard",
+  "version": "1.0.0",
+  "description": "公网访问鉴权与安全防护插件：提供 HTTP Bearer / API-Key 访问鉴权服务、Token 生成与公网安全状态评估",
+  "author": "psenY"
+}

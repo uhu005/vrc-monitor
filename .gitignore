@@ -1,11 +1,17 @@
-# ── 凭据与隐私（绝不入库）──
+# ── 凭据与运行时数据（绝不入库）──
 credentials.json
 credentials.local.json
 auth_cookie.txt
 auth_cookie.txt.bak
+notify-config.json
 *.sqlite3
 *.sqlite3-journal
 monitor.log
+data/
+data/img-cache/
+# events 插件 config.json（可存 Google API key 兜底，防 git add . 泄 key，走 DB/env 优先）
+plugins/**/config.json
+api_calendar_config.json
 
 # ── 环境与运行时 ──
 .env
@@ -14,9 +20,16 @@ monitor.log
 node_modules/
 __pycache__/
 *.pyc
+service-logs/
+# ── 日志模块产物（默认 LOG_DIR 落项目内 logs/）──
+logs/
 # ── Hermes 插件本地文件 ──
 .hermes/
 workspace/
+
+# ── 插件本地文件（用户私有插件，不入库）──
+plugins/local/*
+!plugins/local/.gitkeep
 
 # ── Qoder 工具缓存（repowiki/knowledge 为生成物，已发布到 GitHub wiki，不入库）──
 .qoder/
@@ -38,3 +51,7 @@ backups/
 # ── 大文件备份（不入库）──
 *.bak-*
 *.bak
+
+# ── 收藏 PDF 生成缓存与产物 ──
+img_cache/
+pdf/
