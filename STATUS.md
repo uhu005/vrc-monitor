@@ -62,3 +62,4 @@
 - **2026-08-11**：PR #5 合并（open-world 进上游）+ PR #6 合并（v1.14.0 推荐工具集）+ PR #8 提交（学习 5 维度/权重均衡）。权重均衡落地（熟悉度×1.5 vs 地图属性成对调）。上游仓库更名 vrchat-assistant。issue #7（Release @ 截断）创建。
 - **2026-08-12**：PR #8 评审 R1（2 阻断：夹带删 3 工具/三列迁移缺失；2 警告：61+正则/缓存）→ 修复 449de58 → R2 复测（新阻断：get_join_learning 丢 return）→ 修复 33cdbaa → 等 R3。上游 v1.16/v1.17 发布。参与 #18（recommend_worlds）讨论：wrld_id 方案 b 被采纳、作者维度 3:1:1+封顶建议。
 - **2026-08-13**：issue #19（用户反馈闭环）创建。上游 v1.17.0（#18/#19 全落地：recommend_worlds/favorite_world/rate_world）+ v2.0.0（74 工具平台化）发布。开图闭环完善（非游戏过滤/备图流程/收藏夏の痕跡→观光组）。学习样本 2/5。服务 55 工具健康。
+- **2026-08-18**：检查认证行为：服务当前 authenticated=true、WebSocket connected；历史日志显示 auth cookie 过期后才触发 IMAP 读取 VRChat OTP，存在多次重复重试/失败，但未见持续发邮件逻辑。fetch-otp.py 仅 IMAP LOGIN/SELECT/SEARCH/FETCH/LOGOUT。
