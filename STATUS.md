@@ -12,7 +12,7 @@
 | upstream | `https://github.com/ggg123124/vrchat-assistant.git`（原作者，**已更名**，旧名 vrc-monitor 301 跳转） |
 | 运行版本 | fork main **v3.4.0**（128 个 MCP 工具；上游 v3.3.0 + v3.4.0 已合并，含本地定制脚本） |
 | 服务端口 | 8799（`/health` 健康检查，`/mcp` JSON-RPC+SSE 端点） |
-| 服务状态 | ✅ 运行中：authenticated=true（shine trick）/ ws connected / 插件 15 / 工具 128（2026-11-05 升级后实测） |
+| 服务状态 | ✅ 运行中：authenticated=true（shine trick）/ ws connected / 插件 15 / **安全模式已启用：对外 110 工具**（能力 128，破坏性 18 个被移除+拦截） |
 | 最新 commit | `3da6956` Merge upstream/main v3.4.0（退役本地 SSE 补丁，改用上游 GET /mcp 405） |
 | 未提交/未跟踪 | 无（`proto-intimacy.mjs` 已脱敏，是否删除待老大确认） |
 
@@ -55,6 +55,8 @@
 - VRCX 改库后要重启 VRCX 才显示（内存缓存）
 
 ## 会话日志
+
+- **2026-11-05（上午，续）**：启用 **安全模式**（`.env` 加 `VRC_MONITOR_SAFE_MODE=true`，旧文件备份 `.env.bak-beforesafe-20261105`）→ 重启后 **工具 128→110**：移除并拦截 18 个破坏性工具（删好友/删照片/删画廊图/退群/拒绝好友请求/隐藏通知/移出待逛与关注/取消收藏/移动或清空收藏分组/移除 X 博主 + v3.4.0 新增的 `set_group_announcement`、`delete_group_announcement`、`update_group_post`、`delete_group_post`）。验证：`tools/list`=110 且 18 个全部不在列表；直接 `tools/call remove_friend` 被拦截并返回中文提示（日志 `工具调用失败 [remove_friend]: 🔒 安全模式已启用`）；查询/开图/发帖/兑换等 110 个正常保留；auth=true / ws connected / 在线 67 不变。**要临时恢复破坏性能力：`.env` 改 `false` 后重启服务**。
 
 - **2026-11-05（上午）**：升级 v3.2.0-beta → **v3.4.0**（落后 485 commits，跨 v3.3.0 + v3.4.0）。流程：备份三件套 + `.env` 到 `C:/Users/Windows/vrc-monitor-upgrade-backup-20261105/`（sqlite backup API 一致性快照，integrity ok / 983,121 events）→ 提交 `scripts/open-world.mjs` 的 `--help` 短路修复 → `git merge upstream/main`（唯一冲突 `core/http-server.js`：**取上游 405 实现、退役本地 SSE 长连接补丁**，上游 #188 已证明 405 会让 SDK 重连 2 次后停止，比 200+空 SSE 治本）→ `npm run install-plugins`（补 emoji-notes 的 `pinyin-pro` 依赖 + 构建 dashboard 产物 1.03MB）→ 重启验证：auth=true / ws connected / 插件 15 / **工具 128** / `GET /mcp`=405 / `get_online_friends` 真实返回 65 人在线。`npm test` 542/542；`check-deident` 抓出本地遗留 `proto-intimacy.mjs` 含 3 个真实 userId（含自己）→ 已脱敏占位。同步：hermes-plugin 3.2.0-beta→3.4.0（旧版备份在升级备份目录）、desktop 插件内容一致、6 个缺失 skill 装入并合并 `vrc-monitor-agent` 本地「代码与接入点」段。新增能力：redeem/inventory/emoji-notes/presence-status/friend-removals/群组帖子与公告写侧/friend_world_stats/mutual_groups 等 24 工具；Dashboard 三态主题 + 产物 -32%、动态流计数 208ms→9ms。
 
