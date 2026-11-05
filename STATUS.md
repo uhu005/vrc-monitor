@@ -10,11 +10,11 @@
 | 主目录 | `F:\soft\vrc-monitor`（git 仓库，fork 克隆，唯一运行目录） |
 | origin | `https://github.com/uhu005/vrc-monitor.git`（老大 fork，push 目标） |
 | upstream | `https://github.com/ggg123124/vrchat-assistant.git`（原作者，**已更名**，旧名 vrc-monitor 301 跳转） |
-| 运行版本 | fork main（55 个 MCP 工具：上游 v1.14 基础 52 + 本地 5 维度学习等） |
+| 运行版本 | fork main **v3.4.0**（128 个 MCP 工具；上游 v3.3.0 + v3.4.0 已合并，含本地定制脚本） |
 | 服务端口 | 8799（`/health` 健康检查，`/mcp` JSON-RPC+SSE 端点） |
-| 服务状态 | ✅ 运行中：authenticated=true（shine trick） |
-| 最新 commit | `1c0e2e8` 学习系统 5 维度扩展 + 权重均衡（PR #8 分支另含评审修复 `33cdbaa`） |
-| 未提交/未跟踪 | `proto-intimacy.mjs`（早期"亲密度原型"，已被正式工具取代，**可清理，待老大确认**） |
+| 服务状态 | ✅ 运行中：authenticated=true（shine trick）/ ws connected / 插件 15 / 工具 128（2026-11-05 升级后实测） |
+| 最新 commit | `3da6956` Merge upstream/main v3.4.0（退役本地 SSE 补丁，改用上游 GET /mcp 405） |
+| 未提交/未跟踪 | 无（`proto-intimacy.mjs` 已脱敏，是否删除待老大确认） |
 
 ## 运行态文件（升级/备份必须保留，全部 .gitignore 排除）
 
@@ -34,10 +34,9 @@
 
 ## 进行中事项
 
-- [ ] **PR #8**（学习 5 维度 + 权重均衡）：R1 修复（449de58）+ R2 return 修复（33cdbaa）已推送，**等 R3 复测**。https://github.com/ggg123124/vrchat-assistant/pull/8
-- [ ] **上游同步决策**：上游已发 v1.17.0（recommend_worlds/favorite_world/rate_world，62 工具）+ v2.0.0（收藏 PDF/X 博主/BOOTH/常驻服务，74 工具）。**建议等 PR #8 合并后再同步**（避免评审基线冲突）。#18/#19 我们参与讨论的功能已全部落地
+- [x] **上游同步**：2026-11-05 已升级到 v3.4.0（落后 485 commits，跨 v3.3.0/v3.4.0），工具 104→128
 - [ ] 学习样本攒到 5 次（当前 2/5）解锁 5 维度自动学习
-- [ ] `proto-intimacy.mjs` 清理确认（已被正式工具取代）
+- [ ] `proto-intimacy.mjs` 是否删除（已脱敏，等老大定；该文件已被正式工具取代）
 - [ ] 旧方案遗留：VRCX「新地图」分组 187 条历史重复数据，老大未定是否清理
 
 ## 已知坑（速查，详见 skill）
@@ -55,6 +54,8 @@
 - VRCX 改库后要重启 VRCX 才显示（内存缓存）
 
 ## 会话日志
+
+- **2026-11-05（上午）**：升级 v3.2.0-beta → **v3.4.0**（落后 485 commits，跨 v3.3.0 + v3.4.0）。流程：备份三件套 + `.env` 到 `C:/Users/Windows/vrc-monitor-upgrade-backup-20261105/`（sqlite backup API 一致性快照，integrity ok / 983,121 events）→ 提交 `scripts/open-world.mjs` 的 `--help` 短路修复 → `git merge upstream/main`（唯一冲突 `core/http-server.js`：**取上游 405 实现、退役本地 SSE 长连接补丁**，上游 #188 已证明 405 会让 SDK 重连 2 次后停止，比 200+空 SSE 治本）→ `npm run install-plugins`（补 emoji-notes 的 `pinyin-pro` 依赖 + 构建 dashboard 产物 1.03MB）→ 重启验证：auth=true / ws connected / 插件 15 / **工具 128** / `GET /mcp`=405 / `get_online_friends` 真实返回 65 人在线。`npm test` 542/542；`check-deident` 抓出本地遗留 `proto-intimacy.mjs` 含 3 个真实 userId（含自己）→ 已脱敏占位。同步：hermes-plugin 3.2.0-beta→3.4.0（旧版备份在升级备份目录）、desktop 插件内容一致、6 个缺失 skill 装入并合并 `vrc-monitor-agent` 本地「代码与接入点」段。新增能力：redeem/inventory/emoji-notes/presence-status/friend-removals/群组帖子与公告写侧/friend_world_stats/mutual_groups 等 24 工具；Dashboard 三态主题 + 产物 -32%、动态流计数 208ms→9ms。
 
 - **2026-09-04（晚间）**：**大版本升级 v1.15.0 → v3.2.0-beta**（落后 334 commits，v2.0.0 数据本地化 / v3.0.0 插件化 / 结构化日志 / TOTP 自动登录 / Web Dashboard / auth-guard / playwright X 抓取）。流程：提交 STATUS 基线 → 备份三件套到 `F:\soft\vrc-monitor-backup-20260904\` → vrc_stop（坑：第一次 vrc_stop 只清状态文件没杀到进程 35160，vrc_start 后 .active.json 更新为真 PID，再走正规 vrc_stop 才真停；直接 taskkill 被治理层拦）→ git merge upstream/main（3 冲突：`.gitignore` 双保留、`package-lock.json` 取上游、`core/http-server.js` **重打 SSE 长连接补丁**并改用上游 pathname 变量——上游仍是 endpoint probe 秒断式，补丁必须保留）→ npm install（新增 playwright，可选功能不用下浏览器二进制）→ 同步 hermes-plugin/桌面插件/skills（vrc-monitor-agent skill v1.0→v2.0，companion-query 上游已移除本地保留）。验证全过：5 个核心文件 node --check / /health 全绿（auth/ws/11 插件 loaded/events 无损）/ tools/list **104 工具**（原 55，插件化扩展）/ GET /mcp SSE 长连接实测挂住+2s 心跳 / get_online_friends 真实调用成功 / 日志无错误 / 结构化日志+启动自动备份生效。**PR #8 已于 8-11 合并上游**，学习系统以官方 recommend 插件形态回归。推送 fork 需 workflow scope（合并带入 ci.yml），老大设备码授权（05AD-9F0D）后推送成功 560ea62→7a3dab9；fork CI（上游 ci.yml）ubuntu+windows 双平台全绿，等于官方测试套件验证了合并结果。**下一步**：vrc_restart 注意 .active.json PID 校验；关注 playwright 首次实际使用（X 世界抓取）；插件化后新增工具待实际使用探索。
 

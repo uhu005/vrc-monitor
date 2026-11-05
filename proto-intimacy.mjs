@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 亲密度计算原型（临时验证用）
+ * 亲密度计算原型（临时验证用；ID 已脱敏占位）
  * 基于 events 表的同房统计：近期(30天) + 历史 两个窗口
  */
 import { readFileSync, existsSync } from 'node:fs';
@@ -11,14 +11,14 @@ import Database from 'better-sqlite3';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const db = new Database(path.join(__dirname, 'vrc-monitor.sqlite3'), { readonly: true, timeout: 10000 });
 
-const SELF = 'usr_cd3ddb35-3d1f-46b2-9863-e13307a95596';
+const SELF = 'usr_00000000-0000-0000-0000-000000000003';
 const NOW = Date.now();
 const DAY = 86400000;
 
 // 目标好友
 const targets = {
-  'usr_0ba091c8-9650-43ad-9ff6-c56cd534ab83': 'TDN塩っ子',
-  'usr_9b60da63-b5ef-42a7-9312-ac1b82dcec5a': 'D_mikan',
+  'usr_00000000-0000-0000-0000-000000000001': 'TDN塩っ子',
+  'usr_00000000-0000-0000-0000-000000000002': 'D_mikan',
 };
 
 // 复用 findCompanions 逻辑（内联简化版）：统计同房次数
