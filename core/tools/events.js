@@ -477,6 +477,31 @@ export async function handleGetWeeklyReport({ days = 7 }) {
   };
 }
 
+export async function handleGetWorldImage({ worldId, size = 512 } = {}) {
+  const { api } = ctx;
+  const id = String(worldId || '').trim();
+  if (!id.startsWith('wrld_')) throw new Error('worldId must start with wrld_');
+  const w = Math.max(64, Math.min(1024, Number(size) || 512));
+  const r = await api._request('GET', `/worlds/${id}`);
+  if (r.status !== 200) throw new Error(`API error: ${r.status}`);
+  const imageUrl = r.data?.imageUrl || r.data?.thumbnailImageUrl || '';
+  if (!imageUrl) return { worldId: id, found: false, reason: 'world has no image' };
+  // .../1/file -> .../512/file（VRChat 图片按尺寸分流）
+  // 原图 URL 形如 /api/1/file/{fileId}/{ver}/file；缩略图要用 /api/1/image/{fileId}/{ver}/{size}
+  const sized = String(imageUrl)
+    .replace(/\/api\/1\/file\/([^/]+)\/(\d+)\/file$/, `/api/1/image/$1/$2/${w}`)
+    .replace(/\/api\/1\/image\/([^/]+)\/(\d+)\/\d+$/, `/api/1/image/$1/$2/${w}`);
+  const buf = await api.downloadFile(sized);
+  const contentType = buf.contentType || 'image/jpeg';
+  return {
+    worldId: id,
+    found: true,
+    width: w,
+    bytes: buf.length,
+    contentType,
+    dataUrl: `data:${contentType};base64,${buf.toString('base64')}`,
+  };
+}
 // ── MCP 自声明工具表 ──
 export const tools = [
   {
@@ -798,5 +823,18 @@ export const tools = [
       }
     },
     handler: async (args) => ctx.rateLimiter.execute(() => handleGetWeeklyReport(args), { taskTimeoutMs: 90000 })
+  },
+  {
+    "name": "get_world_image",
+    "description": "[query] Get a world cover image as a base64 data URL (authenticated download). size = width px, 64-1024 (default 512). Returns {found,dataUrl,bytes,contentType}; found=false when the world has no image.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "worldId": { "type": "string", "description": "World ID (wrld_...)" },
+        "size": { "type": "number", "default": 512, "description": "Image width in px (64-1024, default 512)" }
+      },
+      "required": ["worldId"]
+    },
+    handler: async (args) => ctx.rateLimiter.execute(() => handleGetWorldImage(args), { taskTimeoutMs: 60000 })
   }
 ];
