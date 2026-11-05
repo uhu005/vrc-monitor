@@ -47,6 +47,14 @@ async function fetchOtp() {
 // ── 解析参数：worldId / 地图名 / --instance ──
 const INSTANCE_MODE = process.argv.includes('--instance');
 let target = process.argv[2];
+// 帮助/误输入短路（2026-09-21 实锤：裸跑 --help 被当地图名解析，
+// 真·建实例+弹菜单副作用。此短路必须在任何 API/副作用之前）
+if (target === '--help' || target === '-h' || target === 'help' ||
+    target === '--version' || target === '-v') {
+  console.log('用法: node open-world.mjs <worldId 或 地图名>');
+  console.log('      node open-world.mjs --instance <完整location>  # 加入指定实例');
+  process.exit(0);
+}
 if (!target) {
   console.error('用法: node open-world.mjs <worldId 或 地图名>');
   console.error('      node open-world.mjs --instance <完整location>  # 加入指定实例');
