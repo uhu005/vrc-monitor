@@ -3,7 +3,7 @@
 
 export const TYPE_LABELS = {
   location: '位置变动', online: '上线', offline: '下线', status: '状态变动', avatar: '模型变动',
-  bio: '简介变更', userIcon: '头像图标', pronouns: '代词变更', displayName: '改名',
+  bio: '简介变更', userIcon: '头像图标', pronouns: '代词变更', trustLevel: '等级变动', displayName: '改名',
   friendRequest: '好友申请', invite: '邀请', message: '私信', group: '群组通知',
   notification: '通知', notificationUpdate: '通知更新', friendAdd: '新增好友', friendDelete: '删除好友',
   unknown: '未知事件', contentRefresh: '内容库', groupJoined: '加入群组', groupMemberUpdated: '群组更新',
@@ -14,7 +14,7 @@ export const TYPE_LABELS = {
 export const TYPE_ICONS = {
   location: 'pi-map-marker', online: 'pi-sign-in', offline: 'pi-sign-out', status: 'pi-heart',
   avatar: 'pi-user-edit', bio: 'pi-file-edit', userIcon: 'pi-id-card', pronouns: 'pi-user',
-  displayName: 'pi-pencil', friendRequest: 'pi-user-plus', invite: 'pi-arrow-right-arrow-left',
+  displayName: 'pi-pencil', trustLevel: 'pi-shield', friendRequest: 'pi-user-plus', invite: 'pi-arrow-right-arrow-left',
   message: 'pi-comment', group: 'pi-users', notification: 'pi-bell', notificationUpdate: 'pi-bell',
   friendAdd: 'pi-user-plus', friendDelete: 'pi-user-minus', unknown: 'pi-question-circle',
   contentRefresh: 'pi-refresh', groupJoined: 'pi-users', groupMemberUpdated: 'pi-users',
@@ -22,13 +22,29 @@ export const TYPE_ICONS = {
 };
 
 export const TYPE_SEVERITIES = {
-  location: 'info', online: 'success', offline: 'secondary', status: 'warning', avatar: 'warn',
-  bio: 'contrast', userIcon: 'secondary', pronouns: 'contrast', displayName: 'warn',
+  location: 'info', online: 'success', offline: 'secondary', status: 'warn', avatar: 'warn',
+  // 用户 2026-09-22：`contrast` 在深色模式下渲染成**白底**徽章，与其它深色底格格不入 → 统一改深色系：
+  // 简介/代词属资料文本变更（info 蓝）、等级变动属正向（success 绿；图标仍是盾牌）。
+  bio: 'info', userIcon: 'secondary', pronouns: 'info', displayName: 'warn', trustLevel: 'success',
   friendRequest: 'success', invite: 'info', message: 'secondary', group: 'warn',
   notification: 'secondary', notificationUpdate: 'secondary', friendAdd: 'success',
   friendDelete: 'danger', unknown: 'secondary', contentRefresh: 'info', groupJoined: 'success',
   groupMemberUpdated: 'warn', groupRoleUpdated: 'warn', other: 'secondary',
 };
+
+// 可由服务端按 content_json.type 判定的筛选值（2026-10-07，修「筛选简介加载慢」）。
+// 只有这些值支持服务端过滤（映射见后端 core/dashboard-services.js 的 UI_UPDATE_TYPE_SQL）；
+// 其余筛选值（位置/上下线/通知/群组…）仍走客户端过滤。
+export const SERVER_FILTERABLE_TYPES = ['status', 'avatar', 'bio', 'trustLevel'];
+
+// 选中的筛选值**全部**可由服务端过滤时，返回要传给 /api/dashboard/events?updateTypes= 的串；
+// 否则返回 ''（混选 ⇒ 服务端无法表达 ⇒ 退回客户端过滤，保持行为不变）。
+export function serverUpdateTypes(filterList) {
+  const list = Array.isArray(filterList) ? filterList.filter(Boolean) : [];
+  if (!list.length) return '';
+  if (!list.every((t) => SERVER_FILTERABLE_TYPES.includes(t))) return '';
+  return [...new Set(list)].join(',');
+}
 
 // 事件 → 归一化类型（兼容后端多种历史形状；纯函数，行为与 FeedView 原实现一致）
 export function typeOf(x) {
@@ -42,6 +58,7 @@ export function typeOf(x) {
     if (x.updateType === 'status') return 'status';
     if (x.updateType === 'user_icon') return 'userIcon';
     if (x.updateType === 'pronouns') return 'pronouns';
+    if (x.updateType === 'trust_level') return 'trustLevel';
     if (x.updateType === 'displayName') return 'displayName';
     return 'other';
   }

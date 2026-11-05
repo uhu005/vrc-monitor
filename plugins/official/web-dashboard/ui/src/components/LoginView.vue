@@ -1,11 +1,19 @@
 <script setup>
-import { ref } from 'vue';
-import { setToken, hasToken } from '../api.js';
+import { ref, watch } from 'vue';
+import { setToken, verifyToken } from '../api.js';
 
+// 2026-10-16：接收父组件传来的探测失败原因（issue #213）—— 让登录页一进来就显示原因，而不是只写控制台
+const props = defineProps({ initialError: { type: String, default: '' } });
 const token = ref('');
 const showPwd = ref(false);
-const error = ref('');
+const error = ref(props.initialError || '');
+// 2026-10-16 审查 nixi-agent 💡1：不要依赖「登录表单一定在 catch 之后才挂载」这个跨文件前提（它没有任何保护）。
+// 改成响应式跟进：父组件后续补充原因也能显示；已有错误（例如用户提交失败）不被覆盖 ✓
 const loading = ref(false);
+
+watch(() => props.initialError, (v) => {
+  if (v && !error.value) error.value = v;   // 只在还没有错误时补入，避免盖掉用户操作后的提示
+});
 
 async function submit() {
   const t = token.value.trim();
@@ -13,20 +21,16 @@ async function submit() {
   loading.value = true;
   error.value = '';
   try {
-    // 用 /health 验证令牌：Authorization: Bearer 传递，避免令牌出现在 URL（日志/历史残留风险）
-    const r = await fetch('/health', {
-      headers: { 'Authorization': 'Bearer ' + t },
-      signal: AbortSignal.timeout(20000),
-    });
-    const d = await r.json().catch(() => ({}));
-    if (r.ok && d.auth && d.auth.authenticated) {
+    // 用受保护的 dashboard 路由验证令牌（issue #213）：判定必须基于 HTTP 状态。
+    // 此前用 /health 的 auth.authenticated —— 那是 VRChat 账号登录态，账号未登录 /
+    // 处于 needsTotp 时即使令牌正确也会被误判为「令牌无效」。
+    const ok = await verifyToken(t);
+    if (ok) {
       setToken(t);
       location.reload();  // 重新走正常加载流程
       return;
     }
-    if (r.status === 401) { error.value = '令牌无效，请检查后重试'; }
-    else if (d && d.auth && d.auth.needsTotp) { error.value = '账号需要 TOTP 验证（服务自动处理，稍后重试）'; }
-    else { error.value = '验证失败（' + r.status + '），请稍后重试'; }
+    error.value = '令牌无效，请检查后重试';
   } catch (e) {
     error.value = '无法连接服务，请确认服务已启动（' + (e.message || e) + '）';
   } finally {

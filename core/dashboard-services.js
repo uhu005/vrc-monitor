@@ -10,7 +10,55 @@
  * 纯搬移重构：服务名、owner、实现逐字节一致，无行为变更。
  */
 import { isSafeModeEnabled } from './safe-mode.js';
-import { imgProxy, avatarThumb, avatarOf, avatarFileId } from './img-util.js';
+import { getLogger } from './logger.js';   // 2026-09-22 评审 ⚠️1：新增的外部调用点必须逐分支留痕（不许 console.log 绕过 VRC_MONITOR_LOGGER_*）
+const log = getLogger('dashboard');
+import { resolveSelfPresence } from './self-presence.js';
+
+// 世界缓存新鲜度（2026-09-15 新增，env 可配）：world_cache 里的名字/描述/标签是**快照**，
+// 世界作者改名后不会自动变（实测 Idle Merchant 掛機商人 V0.1.4 → V0.3.1 停了 11 天）。
+// 超期即触发一次后台回源刷新（走 dashboard.world，内部限流 + 10s 超时）。
+const WORLD_CACHE_TTL_DAYS = Math.max(1, Number(process.env.VRC_MONITOR_WORLD_CACHE_TTL_DAYS) || 7);
+const WORLD_CACHE_TTL_MS = WORLD_CACHE_TTL_DAYS * 24 * 60 * 60 * 1000;
+// 失败冷却（审查 💡1）：与新鲜度阈值**解耦**——用 7 天 TTL 当冷却会让一次瞬时失败
+// （网络抖动/限流/超时）把展示名停在旧值最多 7 天（旧行为「每请求重试」顺带的自愈没了）。
+// 30 分钟足够压住「不可见世界每 ~2 分钟被重试」的配额浪费，又保留快速自愈。
+// 可配（审查 💡）：VRC_MONITOR_WORLD_FETCH_COOLDOWN_MS——非法值/0/负回落到 30 分钟；
+// 正数 <60s 钳到 60s（最小下限）。注意：负值走 Math.max 会被钳到 60s 而非回落默认
+// （方向=最激进重试，与冷却意图相反），故显式区分。
+const WORLD_FETCH_COOLDOWN_RAW = Number(process.env.VRC_MONITOR_WORLD_FETCH_COOLDOWN_MS);
+const WORLD_FETCH_COOLDOWN_MS = Number.isFinite(WORLD_FETCH_COOLDOWN_RAW) && WORLD_FETCH_COOLDOWN_RAW > 0
+  ? Math.max(60 * 1000, WORLD_FETCH_COOLDOWN_RAW)
+  : 30 * 60 * 1000;
+// 回源失败冷却（2026-09-15 审查 💡1）：dashboard.world 失败时不写占位 → 若不做冷却，
+// 一个永久 404/不可见的世界会在每次 friends 请求里被反复回源（前端 120s 轮询 → 最坏每 ~2 分钟一次）。
+// 内存 Map 即可（重启即重置 → 重试一次，可接受）；无 schema 变更。
+const worldFetchCooldown = new Map(); // worldId -> lastAttemptAt
+// worldId -> VRChat 对当前账号返回 404/403（不可见/已下架）。注意：实测 404 可能是**暂时**的（同一批世界 8 分钟后重试即 200）⇒ 只作「本次取不到」的标注，取到即撤销
+const worldUnavailable = new Set();
+const worldFetchInflight = new Map();   // worldId -> 正在进行的回源 Promise（并发去重）
+/** 同一世界在同一时刻只发一次回源（复审 ⚠️：dashboard.events 与 dashboard.friends 会在同一轮 bootstrap 的
+ *  Promise.all 里并发点名同一个世界，而失败冷却要等失败之后才写入 ⇒ 没有 in-flight 去重会重复打 API）。 */
+function worldFetchOnce(worldSvc, worldId) {
+  let p = worldFetchInflight.get(worldId);
+  if (!p) {
+    p = Promise.resolve().then(() => worldSvc({ worldId })).finally(() => worldFetchInflight.delete(worldId));
+    worldFetchInflight.set(worldId, p);
+  }
+  return p;
+}
+
+// world_cache.updated_at 由 SQLite datetime('now') 写入（UTC、无时区后缀）→ 补 Z 再解析。
+// 注意（审查 💡2）：updated_at 是「行被写过」的时间，setWorldNote/setWorldFavorited 也会刷新它而
+// 不动 name——所以拿它当新鲜度阈值是**近似值**（会写备注/收藏的世界往往刚玩过、名字本就新，
+// 影响小），不要据它推断「名字必然新鲜」。
+function worldCacheStale(updatedAt) {
+  if (!updatedAt) return true;
+  const t = Date.parse(String(updatedAt).replace(' ', 'T') + (String(updatedAt).endsWith('Z') ? '' : 'Z'));
+  if (Number.isNaN(t)) return true;
+  return Date.now() - t >= WORLD_CACHE_TTL_MS;
+}
+import { imgProxy, avatarThumb, avatarOf, avatarFileId, isPlausibleAvatarName } from './img-util.js';
+import { handleGetFriendWorldStats } from './tools/events.js';
 
 // 通知类型→中文标签（与前端 ui/src/utils.js 的 notificationTypeLabels 对齐，供 see/hide-notification 摘要拼类型）。
 // 通知相关事件 content 可能携带 notificationType / updateType / type 之一；历史遗留也可能是裸字符串 ID，
@@ -53,6 +101,52 @@ export function getSelfUserId(storage) {
   } catch { return ''; }
 }
 
+/**
+ * 看板动态流「类型筛选」→ SQL 条件（2026-10-07 用户报障「筛选简介加载慢 / signal timed out」）
+ *
+ * 背景：前端的类型筛选是**纯客户端**的——先按 50 条一页拉全量、再在浏览器里过滤，并且
+ * `fillFeed()` 会为凑够 50 条匹配一路翻页。稀有类型（简介/模型变动/等级变动）几乎必然
+ * 翻到数据库底部（本库 1.8 万+ 事件 ⇒ 数百个请求；公网链路 400-500ms/请求 ⇒ 很慢、最终超时）。
+ * 故把**可由 content_json.type 判定**的筛选值下沉到 SQL。
+ *
+ * ⚠️ 映射必须与前端 `ui/src/constants/event-types.js` 的 `typeOf()` **完全一致**——
+ * `test/dashboard-events-type-filter.test.mjs` 用同一批样本对两者做等价性断言（防漂移）。
+ * 未列出的筛选值（位置/上下线/通知/群组等）**不支持服务端过滤**，前端仍走客户端过滤。
+ */
+export const UI_UPDATE_TYPE_SQL = {
+  // ⚠️ 逐字对齐前端 typeOf()（含它几个"非直觉"分支，不一致就会与服务端筛选分叉）：
+  // ① status：friend-active（转网页/App 在线）算状态变动；user-update 分支**除显式列出的
+  //    avatar/bio/user_icon/pronouns/displayName 之外一律归 status**（含无子类型的旧格式）
+  //    ⇒ 注意 user-update + trust_level 在前端也是 status（不是等级变动），此处必须照搬。
+  status: "((e.type = 'friend-active') OR (e.type = 'friend-update' AND json_extract(e.content_json,'$.type') = 'status') OR (e.type = 'user-update' AND COALESCE(json_extract(e.content_json,'$.type'),'') NOT IN ('avatar','bio','user_icon','pronouns','displayName')))",
+  avatar: "(e.type IN ('friend-update','user-update') AND json_extract(e.content_json,'$.type') = 'avatar')",
+  bio: "(e.type IN ('friend-update','user-update') AND json_extract(e.content_json,'$.type') = 'bio')",
+  // trustLevel：前端只把 **friend-update** 的 trust_level 归为等级变动（user-update 那支落 status）
+  trustLevel: "(e.type = 'friend-update' AND json_extract(e.content_json,'$.type') = 'trust_level')",
+};
+
+/**
+ * 把 UI 类型筛选值列表编译成一条 SQL 条件（多选=OR；未知值忽略）。
+ * 入参只用于查表，**不做字符串插值**（值不进 SQL），故无注入面。
+ * @param {string[]|string|null} uiTypes
+ * @returns {string} SQL 条件片段（无可识别项时返回 ''）
+ */
+export function updateTypeConds(uiTypes) {
+  const list = Array.isArray(uiTypes) ? uiTypes : String(uiTypes || '').split(',');
+  const seen = new Set();
+  const frags = [];
+  for (const raw of list) {
+    const key = String(raw || '').trim();
+    // ⚠️ 必须用 Object.hasOwn —— 直接取属性会走原型链：constructor/__proto__/toString 等取到 truthy 的
+    // 原型成员，会被当成已知筛选值拼进 SQL ⇒ 主查询抛错 ⇒ 该路由无 try/catch ⇒ HTTP 500（2026-10-07 评审 ⚠️ 实测）。
+    // 另外语义上：**混入白名单外的值只会按白名单内的过滤**（不是整条拒绝），API 使用者须知。
+    if (!key || seen.has(key) || !Object.hasOwn(UI_UPDATE_TYPE_SQL, key)) continue;
+    seen.add(key);
+    frags.push(UI_UPDATE_TYPE_SQL[key]);
+  }
+  return frags.length ? '(' + frags.join(' OR ') + ')' : '';
+}
+
 export function registerDashboardServices(loader, ctx) {
   // Dashboard 只通过只读服务取数，插件不直接触碰核心 ctx 或数据库文件。
   loader.services.set('dashboard.snapshot', () => ({
@@ -88,7 +182,7 @@ export function registerDashboardServices(loader, ctx) {
   }
   loader.services.set('dashboard.friends', ({ limit = 100 } = {}) => {
     const rows = ctx.storage.query(`SELECT f.user_id AS userId, f.display_name AS displayName, f.is_online AS isOnline,
-      f.location, f.world_id AS worldId, COALESCE(NULLIF(f.world_name,''), wc.name, '') AS worldName, wc.image_url AS worldImageUrl,
+      f.location, f.world_id AS worldId, COALESCE(NULLIF(wc.name,''), f.world_name, '') AS worldName, wc.image_url AS worldImageUrl, wc.updated_at AS worldCacheUpdatedAt,
       f.platform, f.status, f.status_description AS statusDescription, f.bio, f.pronouns,
       f.trust_level AS trustLevel, f.memo, f.avatar_image_url AS avatarUrl, f.user_icon AS userIcon,
       f.last_seen AS lastSeen, f.last_online AS lastOnline, f.last_offline AS lastOffline
@@ -98,15 +192,18 @@ export function registerDashboardServices(loader, ctx) {
     // 「最近一起玩」按历史同屏聚合（与在线状态无关），排序靠后的好友此前被前 100/200 截断
     // → 点开误判「非好友」，共同好友/群组/世界/模型信息丢失。
     { $limit: Math.min(Math.max(Number(limit) || 100, 1), 1000) });
-    // 后台预热：在线好友所在世界缺缓存时拉取填充 world_cache（限流+10s 超时，不阻塞响应；
-    // 填充后下次请求 worldName/worldImageUrl 即有值，右侧栏显示世界名+头图）
+    // 后台预热：在线好友所在世界**缺缓存**或**缓存过期**（超过 VRC_MONITOR_WORLD_CACHE_TTL_DAYS）
+    // 时拉取刷新 world_cache（限流+10s 超时，不阻塞响应；填充/刷新后下次请求 worldName 即为新值——
+    // 这是「世界改名后本服务能跟上」的关键路径，原先只处理缺名，导致有名字的旧缓存永不更新）
     try {
-      const missing = rows.filter((r) => r.isOnline && r.worldId && String(r.worldId).startsWith('wrld_') && !r.worldName);
+      const missing = rows.filter((r) => r.isOnline && r.worldId && String(r.worldId).startsWith('wrld_')
+        && (!r.worldName || worldCacheStale(r.worldCacheUpdatedAt))
+        && (!worldFetchCooldown.has(r.worldId) || Date.now() - worldFetchCooldown.get(r.worldId) >= WORLD_FETCH_COOLDOWN_MS));
       if (missing.length) {
         const worldSvc = loader.services.get('dashboard.world');
         (async () => {
           for (const r of missing.slice(0, 5)) {
-            try { await worldSvc({ worldId: r.worldId }); } catch { /* 单个世界失败不影响 */ }
+            try { await worldFetchOnce(worldSvc, r.worldId); } catch { /* 单个世界失败不影响 */ }
           }
         })();
       }
@@ -119,7 +216,7 @@ export function registerDashboardServices(loader, ctx) {
     const since = new Date(Date.now() - Number(days || 7) * 86400000).toISOString();
     // 取全部 user-location（含离开/传送 world_id=''），用 location 切分会话：
     // 进入世界（wrld_xxx:instance）→ 开新段；离开/传送（traveling/offline/空）→ 结束当前段
-    const rows = ctx.storage.query(`SELECT e.world_id AS worldId, COALESCE(NULLIF(e.world_name,''), wc.name, '') AS worldName, e.created_at AS createdAt, e.content_json AS content
+    const rows = ctx.storage.query(`SELECT e.world_id AS worldId, COALESCE(NULLIF(wc.name,''), e.world_name, '') AS worldName, e.created_at AS createdAt, e.content_json AS content
       FROM events e LEFT JOIN world_cache wc ON wc.world_id = e.world_id
       WHERE e.type = 'user-location' AND e.created_at >= $since
       ORDER BY e.created_at ASC`, { $since: since });
@@ -180,31 +277,25 @@ export function registerDashboardServices(loader, ctx) {
   // null（无法判定——无 selfId/无 user-location 记录/异常）。
   // 护栏：WS 断链期间收不到 offline 推送，最近一条在线记录超过 1 小时无新事件时
   // 视为"可能仍在线"返回 null，由调用方保守推迟刷新（宁可晚刷不在可能在线时刷）。
+  // 判定实现统一在 core/self-presence.js（与 dashboard.selfPresence 共用，本服务只是三态→三值的薄映射）。
   loader.services.set('dashboard.isSelfOnline', () => {
     try {
-      const selfId = getSelfUserId(ctx.storage);
-      if (!selfId) return null;
-      const row = ctx.storage.query(
-        `SELECT content_json, created_at FROM events WHERE type='user-location' AND user_id = $self ORDER BY created_at DESC LIMIT 1`,
-        { $self: selfId }
-      )[0];
-      if (!row) return null;
-      let loc = '';
-      try { loc = (JSON.parse(row.content_json || '{}').location) || ''; } catch { return null; }
-      // 明确离线/空 → false；其余任何 location 都视为"可能在线"（VRChat 在线时 location 可能是
-      // private/friends/group/local/traveling/wrld_ 等，其中 private/friends/group/local 可为"无 worldId 独立值"，
-      // 见 parseLocInfo 实例段解析）。绝不把在线状态误判为离线去触发重挖。
-      if (loc === 'offline' || loc === 'offline:offline' || loc === '') return false;
-      // 可确认的在线形式 + 新鲜度护栏 → true；无法确认/陈旧 → null（调用方保守推迟刷新）
-      if (loc.startsWith('wrld_') || loc === 'traveling' || /^(private|friends|group|local)\b/.test(loc)) {
-        const at = Date.parse(row.created_at);
-        if (!Number.isFinite(at) || Date.now() - at > 60 * 60 * 1000) return null;
-        return true;
-      }
+      const presence = resolveSelfPresence(ctx.storage, { selfId: getSelfUserId(ctx.storage) });
+      if (presence.state === 'in_game') return true;
+      if (presence.state === 'not_in_game') return false;
       return null;
     } catch { return null; }
   });
   loader.serviceOwners.set('dashboard.isSelfOnline', 'core');
+
+  // 自己的在场状态三态（in_game / not_in_game / unknown），带位置、时间与新鲜度，
+  // 供插件区分"在游戏内"与"只在网页端在线"（服务常驻登录时自己的 location 恒为
+  // offline:offline）——例如 presence-status 插件据此切换自定义状态描述。
+  // 语义与不变量见 core/self-presence.js 头部说明。
+  loader.services.set('dashboard.selfPresence', () =>
+    resolveSelfPresence(ctx.storage, { selfId: getSelfUserId(ctx.storage) }));
+  loader.serviceOwners.set('dashboard.selfPresence', 'core');
+
 
   // 动态数据时间范围（最早/最新事件日期）：日历筛选的可选范围（VRCX 对齐）
   loader.services.set('dashboard.eventsRange', () => {
@@ -215,7 +306,29 @@ export function registerDashboardServices(loader, ctx) {
   });
   loader.serviceOwners.set('dashboard.eventsRange', 'core');
 
-  loader.services.set('dashboard.events', async ({ limit = 50, offset = 0, dateFrom = '', dateTo = '' } = {}) => {
+  // 「最近一张已知头像」按 userId 进程内缓存（含负缓存：无图的用户 6 小时内不重复查库 ✓）
+  // —— 用于 status/bio 这类 WS 未带图的 profile 事件，避免行内头像空白（2026-09-22 用户报障 ✓）
+  const _lastAvatarCache = new Map();
+  const lastKnownAvatarUrl = (userId) => {
+    if (!userId) return '';
+    const hit = _lastAvatarCache.get(userId);
+    if (hit && hit.until > Date.now()) return hit.url;
+    let url = '';
+    try {
+      const r = ctx.storage.query(
+        `SELECT content_json AS c FROM events WHERE user_id = $u`
+        + ` AND json_extract(content_json,'$.avatarImageUrl') <> ''`
+        + ` ORDER BY created_at DESC LIMIT 1`, { $u: userId })[0];
+      if (r) {
+        let c = {}; try { c = JSON.parse(r.c); } catch { /* ignore */ }
+        url = imgProxy(avatarThumb(c.avatarImageUrl) || '');
+      }
+    } catch { /* 查询失败按无图处理 */ }
+    _lastAvatarCache.set(userId, { url, until: Date.now() + (url ? 6 * 3600 * 1000 : 30 * 60 * 1000) });
+    return url;
+  };
+
+  loader.services.set('dashboard.events', async ({ limit = 50, offset = 0, dateFrom = '', dateTo = '', updateTypes = null } = {}) => {
     // 日期范围过滤（VRCX 式日历范围选择）：只查首尾范围内的数据，分页也按范围
     const conds = [];
     const params = {};
@@ -223,11 +336,21 @@ export function registerDashboardServices(loader, ctx) {
     if (dateTo) { conds.push('e.created_at <= $to'); params.$to = dateTo; }
     // 无子类型的原始重推副本必须在 SQL 层过滤：JS 层过滤会让每页不足 limit 条，
     // 前端 `length >= limit` 判定"数据库到底"→ 加载更多/自动加载消失（回归：用户反馈）
-    conds.push(`NOT (e.type IN ('friend-update','user-update') AND json_extract(e.content_json,'$.type') IS NULL)`);
+    // 无子类型的原始重推副本 + **空串子类型**（content.type = ''）都必须在 SQL 层排除：
+    // DTO 出口对这两者一视同仁（`if (!ct.type) return null`）⇒ SQL 判据必须同口径，
+    // 否则 total 会比实际可见行数多（2026-10-07 评审 💡2：main 既有的不一致，实测 total=3 / events=1）。
+    conds.push(`NOT (e.type IN ('friend-update','user-update') AND COALESCE(json_extract(e.content_json,'$.type'),'') = '')`);
+    // 类型筛选服务端化（2026-10-07 用户报障「筛选简介加载慢」）：前端原先是纯客户端过滤 + 自动补齐，
+    // 稀有类型（简介/模型/等级）会一路翻到库底（实测数百请求 ⇒ 公网链路上很慢/超时）。
+    // 这里把可由 content_json.type 判定的筛选值下沉到 SQL（映射见 updateTypeConds，与前端 typeOf 等价）。
+    const utCond = updateTypeConds(updateTypes);
+    if (utCond) conds.push(utCond);
     const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
-    const rows = ctx.storage.query(`SELECT e.*, f.display_name AS friendDisplayName,
+    const rows = ctx.storage.query(`SELECT e.id, e.type, e.user_id, e.display_name, e.content_json, e.world_id,
+      e.world_name, e.created_at, e.source,
+      f.display_name AS friendDisplayName,
       f.avatar_image_url AS avatarUrl, f.user_icon AS userIcon, f.trust_level AS trustLevel,
-      COALESCE(NULLIF(e.world_name,''), wc.name, '') AS world_name,
+      COALESCE(NULLIF(wc.name,''), e.world_name, '') AS world_name,
       wc.image_url AS world_image_url
       FROM events e LEFT JOIN friends f ON f.user_id = e.user_id
       LEFT JOIN world_cache wc ON wc.world_id = e.world_id
@@ -245,10 +368,13 @@ export function registerDashboardServices(loader, ctx) {
       }
     } catch { /* 无表则空 */ }
     const prevLocCache = new Map();
-    // 「从哪来」：向前回溯找上一个**真实世界**位置。
+    // 「从哪来」：向前回溯最多 25 条，取**紧邻的上一个位置**（纯值特殊位置也算）。
     // VRChat 换房前几乎总先推一条 traveling（也是 friend-location 类型），若只取上一条事件，
     // 到达行的 prev 几乎都是 traveling（无 world 对象，名字为空）→「从哪」永远显示不出来（用户反馈）。
-    // 规则：回溯最多 25 条，跳过 traveling/offline 行，取第一条带世界的位置；
+    // 三条判据彼此不同，别混成一句（2026-10-18 复审 EMeow R5 指出块首与行内都在说旧语义）：
+    //   ① traveling ⇒ **跳过**、继续往前找（它没有地点，跳过不改变「紧邻」的含义）；
+    //   ② offline / offline:offline ⇒ **终止**回溯、返回 null（上一刻不在游戏里 ⇒ 没有「从哪」，本 PR 的核心修复）；
+    //   ③ 其余位置 ⇒ **就是答案本身**，不论有没有世界信息（纯值 private / local / … 照此；未知纯值前端无标签 ⇒ 左端整块隐藏）。
     // 同世界重进的行（prev==当前世界）由前端 previousWorldName !== worldName 条件自然隐藏。
     // 兼容迁移数据（顶层 worldName）与实时数据（world 对象）两种字段形态。
     const previousLocationOf = (userId, eventId) => {
@@ -257,21 +383,51 @@ export function registerDashboardServices(loader, ctx) {
       let prev = null;
       try {
         const r = ctx.storage.query(
-          `SELECT content_json FROM events WHERE user_id = $uid AND type IN ('friend-location', 'user-location') AND id < $id ORDER BY id DESC LIMIT 25`,
+          // 与右端（目的地）统一口径：世界名/图优先取 world_cache —— VRChat 对私人房 / hidden 房的
+          // friend-location 推送经常不下发 content.world，只读载荷会让左端「从哪」只剩实例信息、
+          // 显示不出世界名与缩略图（用户反馈「我自己的房间也看不到是什么图吗」）。
+          // world_id 优先用事件列（写入时已规范化），旧数据缺失时回落到载荷里的 world.id。
+          `SELECT e.content_json AS content_json, wc.name AS wc_name, wc.image_url AS wc_image, e.world_name AS e_world_name
+           FROM events e
+           LEFT JOIN world_cache wc
+             ON wc.world_id = COALESCE(NULLIF(e.world_id, ''), CASE WHEN json_valid(e.content_json) THEN json_extract(e.content_json, '$.world.id') END)
+           WHERE e.user_id = $uid AND e.type IN ('friend-location', 'user-location')
+             AND e.id < $id ORDER BY e.id DESC LIMIT 25`,
           { $uid: userId, $id: eventId });
         for (const row of r) {
           let cj = {};
           try { cj = JSON.parse(row.content_json || '{}'); } catch { /* malformed */ }
           const loc = cj.location || '';
-          if (!loc || loc === 'traveling' || loc === 'offline' || loc === 'offline:offline') continue;
+          // 用 startsWith 而不是 === ：线上「传送中」的形态是 traveling:traveling（2026-09-25 实测），
+          // 精确匹配会漏 ⇒ prev 落在没有 world 对象的那条上 ⇒ 左端「从哪」的世界名/图全空。
+          // 用户 2026-10-17 定：左端只显示**紧邻的上一个位置**，不得为了凑名字回退到更早的世界。
+          if (!loc || loc.startsWith('traveling')) continue;   // traveling 没有地点，继续往前找
+          // 上一刻离线 ⇒ 没有「从哪」。用 break 而不是 return：负结果与正结果一样走循环后的 prevLocCache.set。
+          // ⚠️ 复审 nixi 💡1 纠正过我的理由：key 是 userId:eventId、且 prevLocationOf 每行只调一次，
+          //    所以 break **并不省扫描次数**（他实测两种变体相同）；这里只为「缓存写入路径统一」，
+          //    不要把「同页多行各重复扫一遍」当理由写进注释。
+          if (loc === 'offline' || loc === 'offline:offline') { prev = null; break; }
           const worldId = cj.world?.id || (loc.startsWith('wrld_') ? loc.split(':')[0] : '');
-          const worldName = cj.world?.name || cj.worldName || '';
-          if (!worldName && !worldId) continue;
+          // 缓存优先（与右端同口径）⇒ 私人房也能显示世界名与缩略图
+          const cachedName = row.wc_name || '';
+          const cachedImage = row.wc_image || '';
+          // 与右端 COALESCE(NULLIF(wc.name, ''), e.world_name, '') 字面对齐：缓存 -> 事件列 -> 载荷（载荷层为左端独有兜底）
+          const worldName = cachedName || row.e_world_name || cj.world?.name || cj.worldName || '';
+          if (!worldName && !worldId) {
+            // 判据是**「任何取不到世界信息的非 traveling/offline 位置」**，不只是已知的那几个纯值：
+            // 除 private / local / friends / group（生产里私人房是主导形态），未知形态（如 mystery / hidden）
+            // 也走这条 —— 它们同样是「紧邻的上一个位置」，跳过就会回退到更早的世界名，
+            // 与「左端只认紧邻的上一个位置」直接冲突（2026-10-18 复审 nixi ⚠️1）。
+            // 已知代价（有意取舍）：未知纯值没有中文标签 ⇒ 前端 prevLocationLabel 为空 ⇒ 左端整块隐藏；
+            // 这比「编造一个更早的世界名」正确，但将来出现新特殊值形态时会静默少一段左端 —— 要支持就补 specialLocationLabel 的映射。
+            prev = { location: loc, worldName: '', worldId: '', worldImageUrl: '' };
+            break;
+          }
           prev = {
             location: loc,
             worldName,
             worldId,
-            worldImageUrl: imgProxy(cj.world?.imageUrl || cj.world?.thumbnailImageUrl || ''),
+            worldImageUrl: imgProxy(cachedImage || cj.world?.imageUrl || cj.world?.thumbnailImageUrl || ''),
           };
           break;
         }
@@ -300,6 +456,66 @@ export function registerDashboardServices(loader, ctx) {
         region: rm ? rm[1] : '',
       };
     };
+    // ⭐ 2026-09-27（用户定案 B）：左侧圆头像一律取【该行当时】的图——
+    //   原先无图标载荷的行会回落到「好友当前图标」（friends 表实时值），于是同一列里
+    //   「当时快照」与「当前值」混排（用户截图：同一好友几行头像不一样）✗。
+    //   这里按 userId 取一段历史事件、抽出「带图标的那些」做时间 carry-forward：
+    //   该行有载荷图标 ⇒ 用它；否则取「该行时刻之前最近一次已知图标」；再没有才回落当前值（最老的行）。
+    // ⚠️1（审查 nixi-agent）：回填有上限，超出的行会静默沿用旧行为 ✗ ⇒ 必须留痕 ✓
+    // 💡1（审查 nixi-agent）：窗口按 created_at 排序（与索引 idx_events_user_time 同序；
+    //   实测 id 序 ≠ 时间序的老数据上，按 id 排序会让最近图标掉出窗口 ⇒ 静默失效）。
+    const HIST_CAP = 40;
+    const iconHistory = new Map();   // userId -> [{ t, icon }]（升序）
+    const histFailed = { n: 0 };
+    {
+      // ⚠️（审查 nixi-agent 指出「说明与代码不符」）：真正做【按需】—— 只取「本页里
+      //   是 friend-* 行、且载荷没带图标」的好友 id；通知类事件的 user_id 不再挤占名额 ✓
+      const needUids = [...new Set(rows.filter((r) => {
+        // ⚠️（审查 nixi-agent 第七轮）：把【本人行】也纳入 —— user-location / user-update 同样是
+        //   「位置/资料」行、同样可能没带图标；只认 friend-* 会让 SELF 行丢掉「该行当时」的图标回填
+        //   （实测 userIcon 由历史值变空；而动态流 playerAvatarOf 是 `x.userIcon || x.avatarUrl…` ⇒ **用户图标优先**
+        //   ⇒ 这条变化对默认前端【是可见的】（审查 EMeowAGENT 第五轮指出我此前写反了）⇒ 纳入本人行是必要的）✓ 仍排除 notification 等非人物行。
+        const rt = String(r.type || '');
+        if (!(rt.startsWith('friend-') || rt.startsWith('user-'))) return false;
+        let c = {};
+        try { c = JSON.parse(r.content_json || '{}'); } catch { /* 坏载荷按不需要处理 */ return false; }
+        const hasIcon = !!(c.userIcon || c.iconUrl || (c.user && (c.user.iconUrl || c.user.userIcon)));
+        return !hasIcon;
+      }).map((r) => r.user_id).filter(Boolean))];
+      const allUids = needUids;   // 语义别名（下方留痕沿用）
+      const uids = allUids.slice(0, HIST_CAP);
+      const tMax = rows.reduce((a, r) => (r.created_at > a ? r.created_at : a), '');
+      for (const uid of uids) {
+        try {
+          const histRows = ctx.storage.query(
+            `SELECT created_at AS t, content_json AS c FROM events WHERE user_id = $u AND created_at <= $t ORDER BY created_at DESC LIMIT 400`,
+            { $u: uid, $t: tMax });
+          const list = [];
+          for (const h of histRows) {
+            let c = {};
+            try { c = JSON.parse(h.c || '{}'); } catch { continue; }
+            const icon = c.userIcon || c.iconUrl || (c.user && (c.user.iconUrl || c.user.userIcon)) || '';
+            if (icon) list.push({ t: h.t, icon });
+          }
+          list.sort((a, b) => (a.t < b.t ? -1 : a.t > b.t ? 1 : 0));
+          iconHistory.set(uid, list);
+        } catch { histFailed.n++; }
+      }
+      // ⚠️1/⚠️2：截断与失败都按聚合留痕一行（本仓禁静默降级）✓
+      if (allUids.length > uids.length) {
+        log.info('头像历史回填按上限 ' + HIST_CAP + ' 截断：' + (allUids.length - uids.length) + ' 位好友未回填（其行仍回落「当前图标」）');
+      }
+      if (histFailed.n) {
+        log.warn('头像历史回填失败 ' + histFailed.n + ' 位好友（本次按「当前图标」回落）');
+      }
+    }
+    const histIconAt = (uid, t) => {
+      const list = iconHistory.get(uid);
+      if (!list || !list.length) return '';
+      let found = '';
+      for (const it of list) { if (it.t <= t) found = it.icon; else break; }
+      return found;
+    };
     const result = rows.map((row) => {
       // 无子类型的原始 friend-update/user-update 重推副本：diff 子事件已带完整详情，
       // 原始副本只会显示成无详情的"资料变化"噪音 → 不进动态流
@@ -314,7 +530,14 @@ export function registerDashboardServices(loader, ctx) {
       const world = content.world || {};
       const worldId = row.world_id || content.worldId || world.id || '';
       const worldName = row.world_name || world.name || '';
-      const location = content.location || '';
+      // VRChat 的「传送中」实际推的是 location = traveling:traveling（不是纯 traveling，2026-09-25 生产实测）：
+      //  它既躲过 parseLocInfo 的特殊值特判（instType 回落成 public、instId 变成 traveling），
+      //  也躲过前端 x.location === 'traveling' 的判断 ⇒ 位置行会渲染成荒谬的「公开 · traveling」。
+      //  在 DTO 层统一规范化：一处改动，历史事件同样生效，前端无需调整。
+      const rawLocation = content.location || '';
+      // 判据与 event-pipeline / previousLocationOf 保持统一：用【前缀】而不是精确比 ——
+      // 上游若再出现 traveling:<其他> 变体，两边不会出现「pipeline 已放行、DTO 仍漏」的不一致。
+      const location = rawLocation.startsWith('traveling:') ? 'traveling' : rawLocation;
       const locInfo = parseLocInfo(location);
       const prev = (row.type === 'friend-location' || row.type === 'user-location') ? previousLocationOf(row.user_id, row.id) : null;
       // 群组名解析（缓存优先）：group-joined/group-member-updated 平铺 groupId；
@@ -374,16 +597,15 @@ export function registerDashboardServices(loader, ctx) {
         contentItemTypeLabel: ({ prop: '道具', bundle: '捆绑包', accessory: '配件', shared: '共享物品' }[content.itemType] || content.itemType || '物品'),
         contentItemName: (content.itemId && invItemCache[content.itemId]) ? invItemCache[content.itemId].name || '' : '',
         contentItemImageUrl: imgProxy((content.itemId && invItemCache[content.itemId]) ? invItemCache[content.itemId].imageUrl || '' : ''),
-        avatarUrl: avatarOf(row.userIcon || user.iconUrl, row.avatarUrl || content.avatarImageUrl || user.currentAvatarImageUrl),
         location,
         summary: row.type === 'friend-location' ? '位置变化'
-          : row.type === 'friend-update' ? ({ avatar: '更换模型', status: '状态变化', bio: '简介变化', user_icon: '更新头像图标', pronouns: '更新代词' }[content.type] || '资料变化')
+          : row.type === 'friend-update' ? ({ avatar: '更换模型', status: '状态变化', bio: '简介变化', user_icon: '更新用户头像', pronouns: '更新代词' }[content.type] || '资料变化')
           : row.type === 'friend-online' ? '上线'
           : row.type === 'friend-offline' ? (content.reconcile ? '掉线期间离线' : '离线')
-          : row.type === 'friend-active' ? '状态变化'
+          : row.type === 'friend-active' ? (content.platform === 'web' ? '转网页端在线' : content.platform === 'nativemobile' ? '转App在线' : '状态变化')
           : row.type === 'notification' || row.type === 'notification-v2' ? (content.message || content.title || '通知')
           : row.type === 'notification-v2-update' || row.type === 'notification-update' ? (content.updates && content.updates.seen ? '通知已读' : '通知状态更新')
-          : row.type === 'user-update' ? ({ status: '状态变化', bio: '简介变化', avatar: '更换模型', user_icon: '更新头像图标' }[content.type] || '资料变化')
+          : row.type === 'user-update' ? ({ status: '状态变化', bio: '简介变化', avatar: '更换模型', user_icon: '更新用户头像' }[content.type] || '资料变化')
           : row.type === 'user-location' ? '我的位置变化'
           : row.type === 'friend-add' ? '新增好友'
           : row.type === 'friend-delete' ? '已解除好友'
@@ -402,24 +624,37 @@ export function registerDashboardServices(loader, ctx) {
         previousStatus: content.previousStatus || '',
         previousStatusDescription: content.previousStatusDescription || '',
         avatarName: content.avatarName || user.currentAvatarName || '',
-        previousAvatarName: content.previousAvatarName || '',
+        previousAvatarName: isPlausibleAvatarName(content.previousAvatarName) ? content.previousAvatarName : '',
         // avatarId 富化：WS 推送不含 currentAvatar，从 planet_cache 的 imageUrl→avatarId 映射反查（_syncFriendAvatars 建立）
         avatarId: content.avatarId || user.currentAvatar || (() => {
-          const fm = String(content.avatarImageUrl || '').match(/\/file\/(file_[a-f0-9-]+)/);
+          // 2026-09-22 #225：收敛到 avatarFileId()（原内联正则只认 /file/ ✗）
+          // 2026-09-22 评审纠正：avatarFileId() 返回**字符串**（不是正则 match 数组）✗
+          const fm = avatarFileId(content.avatarImageUrl) || '';
           if (!fm) return '';
           try {
-            const avr = ctx.storage.query(`SELECT payload FROM planet_cache WHERE key = $k`, { $k: `avimg:${fm[1]}` });
+            const avr = ctx.storage.query(`SELECT payload FROM planet_cache WHERE key = $k`, { $k: `avimg:${fm}` });
             if (avr[0]) { const v = JSON.parse(avr[0].payload); if (v && v.avatarId) return v.avatarId; }
           } catch { /* ignore */ }
           return '';
         })(),
+        // 模型图：只用事件载荷（已过 bannerType 门禁）或仍在的旧字段 ——
+        // 不能再回落 user.iconUrl（那是 users 表的原始值，非 avatarBanner 时不是模型图；
+        // 写入侧 event-pipeline 已按门禁存进 avatar_image_url，读取侧应与它统一口径）。
         avatarImageUrl: imgProxy(content.avatarImageUrl || user.currentAvatarImageUrl || ''),
         avatarThumbnailUrl: imgProxy(content.avatarThumbnailUrl || user.currentAvatarThumbnailImageUrl || (content.avatarImageUrl ? avatarThumb(content.avatarImageUrl) : '')),
         avatarTags: Array.isArray(content.avatarTags) ? content.avatarTags : (Array.isArray(user.currentAvatarTags) ? user.currentAvatarTags : []),
         previousAvatarImageUrl: imgProxy(content.previousAvatarImageUrl || ''),
         bio: content.bio || user.bio || '',
         previousBio: content.previousBio || '',
-        userIcon: imgProxy(content.userIcon || user.userIcon || ''),
+        userIcon: imgProxy(content.userIcon || user.userIcon || user.iconUrl || ''),
+        // 2026-09-22 用户报障「为什么会有没头像的（某非好友）」——实测：该用户 status 事件的载荷里
+        // `avatarImageUrl` **就是空串** ✗（WS 没带图），所以本块即使拼了 avatarUrl 也不会有图 ✓。
+        // 正解：回退到「该 userId **最近一次带图的事件**」（数据就在 events 表里 ✓ 不需要发 API ✓），带进程内缓存 + 负缓存 ✓。
+        // 2026-09-22 用户报障「为什么会有没头像的（某非好友，半天也不加载）」：
+        // 本块（profile 变更）**此前没有 avatarUrl** ✗，而前端 playerAvatarOf 优先读 avatarUrl ⇒ 非好友行头像空白 ✓。
+        // 数据其实就在事件载荷里（status 事件自带 avatarImageUrl ✓）—— 不是「没加载」，是没被拼进去 ✓。
+        avatarUrl: avatarOf(row.userIcon || user.userIcon, row.avatarUrl || content.avatarImageUrl || user.currentAvatarImageUrl)
+          || lastKnownAvatarUrl(row.user_id),
         previousUserIcon: content.previousUserIcon || '',
         pronouns: content.pronouns || user.pronouns || '',
         previousPronouns: content.previousPronouns || '',
@@ -450,13 +685,25 @@ export function registerDashboardServices(loader, ctx) {
         const rows = ctx.storage.query(`SELECT key, payload FROM planet_cache WHERE key LIKE 'avatar_name:%'`);
         for (const r of rows) {
           const fid = String(r.key).slice('avatar_name:'.length);
-          try { const v = JSON.parse(r.payload); if (v && v.name) anCache.set(fid, v.name); } catch { /* ignore */ }
+          try {
+            const v = JSON.parse(r.payload);
+            // 负缓存也要载入，否则每次翻页都会重试同一批不可解析的 fileId ✗
+            if (v && v.miss) { if (!v.until || v.until > Date.now()) anCache.set(fid, ''); }
+            else if (v && v.name) anCache.set(fid, v.name);
+          } catch { /* ignore */ }
         }
       } catch { /* 无表/查询失败则仅用内存缓存 */ }
     }
+    // 2026-09-22：补名**失败**时写负缓存（6 小时内不再重试同一 fileId）—— 深层页全是老数据，
+    // 其 fileId 多不可解析，若失败什么都不写就会每次翻页重试同一批 ⇒ 限流器被打爆（实测 40–105 秒等待/分钟）
+    const saveAvMiss = (fileId) => {
+      anCache.set(fileId, '');
+      try { ctx.storage.setPlanetCache(`avatar_name:${fileId}`, { name: '', miss: true, until: Date.now() + 6 * 3600 * 1000 }); } catch { /* 落盘失败不影响响应 */ }
+    };
     const saveAvName = (fileId, name) => {
-      anCache.set(fileId, name);
-      try { ctx.storage.setPlanetCache(`avatar_name:${fileId}`, { name, at: Date.now() }); } catch { /* 落盘失败不影响响应 */ }
+      const ok = isPlausibleAvatarName(name);   // 2026-09-27：blob/文件名类脏值不入缓存
+      anCache.set(fileId, ok ? name : '');
+      try { ctx.storage.setPlanetCache(`avatar_name:${fileId}`, ok ? { name, at: Date.now() } : { name: '', miss: true, until: Date.now() + 6 * 3600 * 1000 }); } catch { /* 落盘失败不影响响应 */ }
     };
     // 群组名后台补全（限流）：缓存未命中的群组事件拉 /groups/{id} 回填 group_cache，本次响应立即返回
     const needGroup = [...new Set(result
@@ -508,6 +755,15 @@ export function registerDashboardServices(loader, ctx) {
         { url: ev.avatarImageUrl, key: 'avatarName' },
         { url: ev.previousAvatarImageUrl, key: 'previousAvatarName' },
       ];
+      // 载荷没带新模型图时，只回落到【同一条事件】里已有的模型图字段（avatarThumbnailUrl）——
+      // ⚠️ 绝不跨事件取「该好友最近一次带图的那条」（2026-09-25 审查 EMeowAGENT 实测指出）：
+      //    那条对本事件而言是【更早或更晚】的模型（lastKnownAvatarUrl = ORDER BY created_at DESC，
+      //    无「created_at < 本事件」下界）⇒ 会把「未知模型」写成「确定但错误」的名（实测渲染成「模型B → 模型B」），
+      //    比留空更误导；且它带 6h 正缓存，新图到达不失效 ⇒ 回落名最多滞后 6 小时。
+      // 另：仅在 avatarName 为空时回落，避免覆盖本已正确的名字（有名字但无图的推送）。
+      if (!ev.avatarImageUrl && !ev.avatarName && ev.avatarThumbnailUrl) {
+        jobs.push({ url: ev.avatarThumbnailUrl, key: 'avatarName' });
+      }
       for (const j of jobs) {
         if (!j.url) continue;
         // j.url 已过 imgProxy 代理（/api/dashboard/image-proxy?url=<encodeURIComponent(原URL)>），
@@ -529,24 +785,84 @@ export function registerDashboardServices(loader, ctx) {
         for (const { ev, fileId, key } of pending) {
           try {
             const a = await ctx.rateLimiter.execute(() => ctx.api._request('GET', `/file/${fileId}`));
-            const nm = parseAvName(a && a.data && a.data.name);
-            if (nm) { ev[key] = nm; saveAvName(fileId, nm); }
-          } catch { /* 查询失败保留空名，下次再试 */ }
+            // 🔴 审查 EMeowAGENT 实测：本赋值发生在 DTO 出口过滤【之后】（异步 await 让出口循环先跑完），
+            //   故出口那层罩不住它 ⇒ 透出侧必须用同一判据过滤，否则 blob 名仍会作为模型名透出 ✓
+            const nmRaw = parseAvName(a && a.data && a.data.name);
+            const nm = isPlausibleAvatarName(nmRaw) ? nmRaw : '';
+            if (nm) { ev[key] = nm; saveAvName(fileId, nm); try { log.debug(`[模型名] 已解析 ${fileId.slice(0,20)}… → ${nm}`); } catch { /* 日志失败忽略 */ } }
+            else { log.info(`[模型名] 解析不出，落负缓存 6h：${fileId.slice(0,20)}…`); saveAvMiss(fileId); }   // 降级决策必须留痕 ✓
+          } catch (e) { log.warn('[模型名] 解析失败（保留空名，下次再试）：' + (e && e.message ? e.message : e)); }
         }
       })();
     }
-    // 数据库事件总数（同日期范围条件，供前端"已加载/总数"显示）
+    // 数据库事件总数（**同一套条件**，含类型筛选 ⇒ 前端"已加载/总数"显示的是筛选后的总数）
     let total = 0;
     try {
-      const tc = [];
-      const tp = {};
-      if (dateFrom) { tc.push('created_at >= $from'); tp.$from = dateFrom; }
-      if (dateTo) { tc.push('created_at <= $to'); tp.$to = dateTo; }
-      tc.push(`NOT (type IN ('friend-update','user-update') AND json_extract(content_json,'$.type') IS NULL)`);
-      const tw = tc.length ? 'WHERE ' + tc.join(' AND ') : '';
-      const trow = ctx.storage.query(`SELECT COUNT(*) AS c FROM events ${tw}`, tp);
-      total = trow[0] ? trow[0].c : 0;
+      // 2026-11-02 性能：这条计数原先把「NOT (type IN (...) AND json_extract(...) = '')」放在
+      // WHERE 里 ⇒ SQLite 对全表逐行反序列化 JSON（6.2 万行库实测 190-230ms），且该结构
+      // 让优化器无法走索引（EXPLAIN 显示 SCAN e）。改成**两条走 (type, content_subtype) 索引的**
+      // COUNT 相加：非 update 类 + update 类里子类型非空，语义与原 NOT(A AND B) 逐值等价
+      // （实测 48249 == 48249），耗时 208ms → 9ms。
+      // 依赖 storage 的迁移：events.content_subtype 生成列 + idx_events_type_subtype。
+      const tw = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
+      const hasJsonSubtypeCond = conds.some((c) => c.includes('json_extract'));
+      let totalRows;
+      if (hasJsonSubtypeCond && !utCond) {
+        // 只有「没有额外类型筛选」时才能拆：utCond 本身就是 json_extract 条件，拆开后无法分配到子查询
+        const rest = conds.filter((c) => !c.includes('json_extract'));
+        const restWhere = rest.length ? ' AND ' + rest.join(' AND ') : '';
+        const nonUpdate = ctx.storage.query(`SELECT COUNT(*) AS c FROM events e WHERE e.type NOT IN ('friend-update','user-update')${restWhere}`, params);
+        const withSubtype = ctx.storage.query(`SELECT COUNT(*) AS c FROM events e WHERE e.type IN ('friend-update','user-update') AND e.content_subtype IS NOT NULL AND e.content_subtype <> ''${restWhere}`, params);
+        totalRows = [{ c: (nonUpdate[0] ? nonUpdate[0].c : 0) + (withSubtype[0] ? withSubtype[0].c : 0) }];
+      } else {
+        totalRows = ctx.storage.query(`SELECT COUNT(*) AS c FROM events e ${tw}`, params);
+      }
+      total = totalRows[0] ? totalRows[0].c : 0;
     } catch { total = 0; }
+    // 💡1（审查 EMeowAGENT）：本出口只回填 userIcon；avatarUrl 仍走「好友当前值」⇒ 同一行两字段可能指向不同图。
+    //   前端左侧圆头像取 userIcon 优先，故显示正确；此处按现状保留（要彻底统一需另开 PR 把 avatarUrl 纳入同口径）。
+    // 2026-09-27（用户定案）：左侧圆头像一律取「该行当时」的图 —— 出口统一回填；
+    //   并把不可信的模型名（blob / 文件名类脏值）一并清掉。统一放出口，避免改动散落影响无关上下文。
+    for (const ev of result) {
+      if (!ev.userIcon) {
+        const hist = histIconAt(ev.userId, ev.createdAt);
+        if (hist) ev.userIcon = imgProxy(hist);
+      }
+      if (ev.avatarName && !isPlausibleAvatarName(ev.avatarName)) ev.avatarName = '';
+      if (ev.previousAvatarName && !isPlausibleAvatarName(ev.previousAvatarName)) ev.previousAvatarName = '';
+    }
+    // 世界名预热（2026-10-17 用户报「有些获取不到地图名」）：
+    // 事件列 e.world_name 是**写入那一刻**的快照；自己的位置事件写入时，那个世界往往还没进
+    // world_cache（只有好友列表 / 最近游玩那两条路会预热）⇒ 这些行永远只剩「好友＋ · JP · 12345」。
+    // 这里对本次窗口里**缺名字**的世界按同一「限流 + 失败冷却」回填。回源是异步的：
+    // **本次响应里这些行仍是空的**（首帧恒空），回填进 world_cache 后由 DTO 的
+    // COALESCE(world_cache.name, e.world_name) 在**下一次请求**起显示世界名 ✓
+    try {
+      const worldSvc = loader.services.get('dashboard.world');
+      if (worldSvc) {
+        const need = [...new Set(result
+          .filter((e) => e.worldId && String(e.worldId).startsWith('wrld_') && !e.worldName)
+          .map((e) => e.worldId))]
+          .filter((id) => !worldFetchCooldown.has(id) || Date.now() - worldFetchCooldown.get(id) >= WORLD_FETCH_COOLDOWN_MS)
+          .slice(0, 5);
+        if (need.length) {
+          (async () => {
+            for (const id of need) {
+              try {
+                const w = await worldFetchOnce(worldSvc, id);   // 与 friends 预热共享同一张 in-flight 表
+                if (w && w.unavailable) worldUnavailable.add(id);   // 404/403：本次取不到，供出口标注（取到名字时会撤销）
+                const name = w && w.name;
+                if (name) for (const ev of result) if (ev.worldId === id) ev.worldName = name;
+              } catch { /* 单个世界失败不影响响应（失败冷却由 dashboard.world 记录） */ }
+            }
+          })();
+        }
+      }
+    } catch { /* 预热失败不影响响应 */ }
+    // 世界名不可得标注（2026-10-17 用户定：显示成「404世界 + 完整 worldId」，房间号照旧保留）
+    for (const ev of result) {
+      if (ev.worldId && !ev.worldName && worldUnavailable.has(ev.worldId)) ev.worldNameUnavailable = true;
+    }
     return { events: result, total };
   });
   loader.serviceOwners.set('dashboard.events', 'core');
@@ -581,8 +897,9 @@ export function registerDashboardServices(loader, ctx) {
         createdAt: row.created_at,
         worldId: row.world_id || content.worldId || world.id || '',
         worldName: row.world_name || world.name || '',
-        avatarUrl: avatarOf(friend?.userIcon, friend?.avatarUrl),
-        summary: row.type === 'friend-location' ? '位置变化' : row.type === 'friend-online' ? '上线' : row.type === 'friend-offline' ? '离线' : row.type === 'friend-active' ? '状态变化' : row.type === 'friend-update' ? ({ avatar: '更换模型', status: '状态变化', bio: '简介变化', user_icon: '更新头像图标', pronouns: '更新代词', displayName: '改名' }[content.type] || '资料变化') : row.type === 'notification' || row.type === 'notification-v2' ? (content.message || content.title || '通知') : row.type === 'notification-v2-update' || row.type === 'notification-update' ? (content.updates && content.updates.seen ? '通知已读' : '通知状态更新') : row.type === 'user-update' ? ({ status: '状态变化', bio: '简介变化', avatar: '更换模型', user_icon: '更新头像图标', pronouns: '更新代词', displayName: '改名' }[content.type] || '资料变化') : row.type === 'user-location' ? '我的位置变化' : row.type === 'friend-add' ? '新增好友' : row.type === 'friend-delete' ? '已解除好友' : row.type === 'content-refresh' ? ('内容库：' + (content.actionType === 'add' ? '获得' : content.actionType === 'delete' ? '移除' : content.actionType || '更新') + ({ prop: '道具', bundle: '捆绑包' }[content.itemType] || content.itemType || '物品')) : row.type === 'group-joined' ? '加入群组' : row.type === 'group-member-updated' ? '群组成员信息更新' : row.type === 'group-role-updated' ? '群组角色更新' : row.type === 'hide-notification' ? ('通知已隐藏' + ((notificationTypeLabel(notiSrc) || notificationTypeLabel(content)) ? '：' + (notificationTypeLabel(notiSrc) || notificationTypeLabel(content)) + (notiSrc.senderUsername ? '（' + notiSrc.senderUsername + '）' : '') : '')) : row.type === 'see-notification' ? ('通知已读' + ((notificationTypeLabel(notiSrc) || notificationTypeLabel(content)) ? '：' + (notificationTypeLabel(notiSrc) || notificationTypeLabel(content)) + (notiSrc.senderUsername ? '（' + notiSrc.senderUsername + '）' : '') : '')) : row.type === 'unknown' ? '未知事件' : '未分类事件: ' + row.type,
+        // 非好友时 friend 为空 ⇒ 头像会空 ✗，回退到该用户最近一次带图的事件 ✓
+        avatarUrl: avatarOf(friend?.userIcon, friend?.avatarUrl) || lastKnownAvatarUrl(userId),
+        summary: row.type === 'friend-location' ? '位置变化' : row.type === 'friend-online' ? '上线' : row.type === 'friend-offline' ? '离线' : row.type === 'friend-active' ? (content.platform === 'web' ? '转网页端在线' : content.platform === 'nativemobile' ? '转App在线' : '状态变化') : row.type === 'friend-update' ? ({ avatar: '更换模型', status: '状态变化', bio: '简介变化', user_icon: '更新用户头像', pronouns: '更新代词', displayName: '改名' }[content.type] || '资料变化') : row.type === 'notification' || row.type === 'notification-v2' ? (content.message || content.title || '通知') : row.type === 'notification-v2-update' || row.type === 'notification-update' ? (content.updates && content.updates.seen ? '通知已读' : '通知状态更新') : row.type === 'user-update' ? ({ status: '状态变化', bio: '简介变化', avatar: '更换模型', user_icon: '更新用户头像', pronouns: '更新代词', displayName: '改名' }[content.type] || '资料变化') : row.type === 'user-location' ? '我的位置变化' : row.type === 'friend-add' ? '新增好友' : row.type === 'friend-delete' ? '已解除好友' : row.type === 'content-refresh' ? ('内容库：' + (content.actionType === 'add' ? '获得' : content.actionType === 'delete' ? '移除' : content.actionType || '更新') + ({ prop: '道具', bundle: '捆绑包' }[content.itemType] || content.itemType || '物品')) : row.type === 'group-joined' ? '加入群组' : row.type === 'group-member-updated' ? '群组成员信息更新' : row.type === 'group-role-updated' ? '群组角色更新' : row.type === 'hide-notification' ? ('通知已隐藏' + ((notificationTypeLabel(notiSrc) || notificationTypeLabel(content)) ? '：' + (notificationTypeLabel(notiSrc) || notificationTypeLabel(content)) + (notiSrc.senderUsername ? '（' + notiSrc.senderUsername + '）' : '') : '')) : row.type === 'see-notification' ? ('通知已读' + ((notificationTypeLabel(notiSrc) || notificationTypeLabel(content)) ? '：' + (notificationTypeLabel(notiSrc) || notificationTypeLabel(content)) + (notiSrc.senderUsername ? '（' + notiSrc.senderUsername + '）' : '') : '')) : row.type === 'unknown' ? '未知事件' : '未分类事件: ' + row.type,
       };
     });
   });
@@ -592,7 +909,7 @@ export function registerDashboardServices(loader, ctx) {
   loader.services.set('dashboard.recentWorlds', ({ limit = 12 } = {}) => {
     const l = Math.min(Math.max(Number(limit) || 12, 1), 60);
     const worlds = ctx.storage.query(`SELECT e.world_id AS worldId,
-        COALESCE(NULLIF(e.world_name,''), wc.name, '') AS worldName,
+        COALESCE(NULLIF(wc.name,''), e.world_name, '') AS worldName,
         wc.image_url AS imageUrl,
         wc.favorited AS favorited,
         MAX(wc.note) AS note,
@@ -630,6 +947,31 @@ export function registerDashboardServices(loader, ctx) {
       }
     }
     if (cur) { cur.end = cur.lastSeen; addMin(cur); }
+    // 补名：world_cache 无记录（事件与缓存皆无名字）的世界，fire-and-forget 走 dashboard.world
+    // （自带限流+10s 超时+upsert 缓存）拉取资料落库——本次响应不阻塞，下次查询即有名字。
+    // 触发频率受限：仅 world_cache 无记录、或空名占位已超 TTL 的世界触发；补名失败（404/私有/
+    // 不可见/瞬时超时）时 upsert 空名占位（负缓存，updated_at 刷新）走 emptyWorldIds 既有冷却
+    // 机制——TTL（24h）内不再对同一世界重复发起 API 尝试，超时自动放行一次重试（瞬时失败可自愈）。
+    const worldSvc = loader.services.get('dashboard.world');
+    const EMPTY_PLACEHOLDER_TTL_MS = 24 * 60 * 60 * 1000;
+    for (const w of worlds) {
+      if (!w.worldName && String(w.worldId).startsWith('wrld_') && worldSvc) {
+        const cached = ctx.storage.getWorldName(w.worldId);
+        let placeholderAge = NaN;
+        if (cached && !cached.name) {
+          // updated_at 为 SQLite datetime('now')（UTC 无时区串），补 Z 按 UTC 解析
+          placeholderAge = Date.now() - Date.parse(String(cached.updated_at || '').replace(' ', 'T') + 'Z');
+        }
+        const placeholderExpired = cached && !cached.name && (Number.isNaN(placeholderAge) || placeholderAge >= EMPTY_PLACEHOLDER_TTL_MS);
+        if (!cached || placeholderExpired) {
+          Promise.resolve(worldSvc({ worldId: w.worldId }))
+            .then((r) => {
+              if (!r || !r.name) ctx.storage.upsertWorld({ worldId: w.worldId, name: '' }); // 不可见/失败 → 空名占位（负缓存）
+            })
+            .catch(() => { /* 补名失败静默 */ });
+        }
+      }
+    }
     return worlds.map((w) => ({ ...w, visits: segCount.get(w.worldId) || 0, minutes: minutes.get(w.worldId) || 0 }));  // 保持数组契约（路由层再包 {worlds: [...]}）；visits 统一为进入段数
   });
   loader.serviceOwners.set('dashboard.recentWorlds', 'core');
@@ -707,6 +1049,8 @@ export function registerDashboardServices(loader, ctx) {
             groupName,
             title: annTitle,
             text: content.message || '',
+            // 公告封面图：content 顶层 imageUrl（notification-v2 群公告实测字段），经本地代理
+            imageUrl: imgProxy(content.imageUrl || (content.data && content.data.imageUrl) || ''),
           };
         }),
       };
@@ -729,15 +1073,21 @@ export function registerDashboardServices(loader, ctx) {
     try {
       const rows = ctx.storage.query(
         `SELECT t.user_id AS userId, t.display_name AS displayName, t.avatar_image_url AS avatarUrl,
-                t.status, t.status_description AS statusDescription, t.location,
+                t.status, t.status_description AS statusDescription, t.location, t.memo, t.trust_level AS trustLevel,   -- 2026-09-22：SELECT 是显式清单 ⇒ 新列必须显式加 ✗
                 t.added_at AS addedAt, t.last_refresh_at AS lastRefreshAt,
                 (SELECT e.created_at FROM events e
                   WHERE e.user_id = t.user_id AND e.type = 'friend-update' AND e.source = 'poll'
                   ORDER BY e.id DESC LIMIT 1) AS lastChangeAt
-         FROM tracked_non_friends t WHERE t.removed_at = '' ORDER BY t.last_refresh_at DESC, t.added_at DESC LIMIT $limit`,
+         FROM tracked_non_friends t
+         -- 权威源兜底(#164 补漏):列表只含"当前非好友"。friend-add 联动写 removed_at 是事件驱动,
+         -- 事件丢失(停机/断连窗口内加好友)会残留;LEFT JOIN friends 排除,若日后解除好友自动回列。
+         LEFT JOIN friends f ON f.user_id = t.user_id
+         WHERE t.removed_at = '' AND f.user_id IS NULL
+         ORDER BY t.last_refresh_at DESC, t.added_at DESC LIMIT $limit`,
         { $limit: Math.min(Math.max(Number(limit) || 200, 1), 500) });
       const selfId = getSelfUserId(ctx.storage);
-      return { tracked: rows.filter((r) => r.userId !== selfId).map((r) => ({ ...r, avatarUrl: avatarThumb(r.avatarUrl) || '' })) };
+      // 2026-09-22 用户报障「非好友追踪页全是大写首字母」：追踪表的 avatarUrl 常常是空的 ⇒ 回退到该用户最近一次带图的事件 ✓
+      return { tracked: rows.filter((r) => r.userId !== selfId).map((r) => ({ ...r, trustLevel: r.trustLevel || '', avatarUrl: avatarThumb(r.avatarUrl) || lastKnownAvatarUrl(r.userId) || '' })) };
     } catch {
       return { tracked: [] };
     }
@@ -758,7 +1108,7 @@ export function registerDashboardServices(loader, ctx) {
       `INSERT OR IGNORE INTO tracked_non_friends (user_id, display_name) VALUES ($u, $d)`,
       { $u: userId, $d: dn });
     // 重新添加：清除移除标记（若是历史移除过的用户）
-    ctx.storage.run(`UPDATE tracked_non_friends SET removed_at = '' WHERE user_id = $u`, { $u: userId });
+    ctx.storage.run(`UPDATE tracked_non_friends SET removed_at = '', fail_count = 0 WHERE user_id = $u`, { $u: userId });
     const added = !existing.length;
     return { ok: true, added, userId, displayName: dn };
   });
@@ -775,6 +1125,77 @@ export function registerDashboardServices(loader, ctx) {
     return { ok: true, removed: r.changes > 0, userId };
   });
   loader.serviceOwners.set('dashboard.trackedRemove', 'core');
+
+  // 备注非好友（自由文本，≤200 字符；空串=清除）。本地可恢复操作，无 safe-mode 拦截。
+  loader.services.set('dashboard.trackedMemo', ({ userId, memo } = {}) => {
+    if (typeof userId !== 'string' || !userId.startsWith('usr_')) {
+      throw new Error('userId 必须是 usr_ 开头的用户 ID');
+    }
+    // 码点级截断（review #173：UTF-16 slice 会把 emoji 切半成 U+FFFD）
+    const chars = Array.from(String(memo ?? '').trim());
+    const m = chars.length <= 200 ? chars.join('') : chars.slice(0, 200).join('');
+    const r = ctx.storage.run(
+      `UPDATE tracked_non_friends SET memo = $m WHERE user_id = $u AND removed_at = ''`,
+      { $m: m, $u: userId });
+    return { ok: true, updated: r.changes > 0, userId, memo: m };
+  });
+  loader.serviceOwners.set('dashboard.trackedMemo', 'core');
+
+  // VRChat 官方活动日历（/calendar 三态：全部/精选/关注的群组活动；2026-09-10 探测验证可用）
+  // 新分页风格：{ hasNext, results, totalCount }。只读探测，8s 竞速超时，失败降级空列表。
+  loader.services.set('dashboard.calendar', async ({ scope = 'all', n = 30, offset = 0 } = {}) => {
+    if (!ctx.api) return { events: [], hasNext: false, totalCount: null };
+    const lim = Math.min(Math.max(Number(n) || 30, 1), 50);
+    const off = Math.max(Number(offset) || 0, 0);
+    const suffix = off ? `&offset=${off}` : '';
+    const p = scope === 'featured' ? `/calendar/featured?n=${lim}${suffix}`
+      : scope === 'following' ? `/calendar/following?n=${lim}${suffix}`
+      : `/calendar?n=${lim}${suffix}`;
+    try {
+      const r = await Promise.race([
+        ctx.api._request('GET', p),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000)),
+      ]);
+      const d = r.data || {};
+      const list = Array.isArray(d.results) ? d.results : [];
+      return {
+        events: list.map((e) => ({
+          id: e.id, title: e.title || '', category: e.category || '',
+          description: (e.description || '').slice(0, 600),
+          startsAt: e.startsAt || '', endsAt: e.endsAt || '',
+          featured: !!e.featured, interestedUserCount: e.interestedUserCount ?? null,
+          ownerId: e.ownerId || null, accessType: e.accessType || '',
+          imageUrl: e.imageUrl ? imgProxy(e.imageUrl) : '',
+        })),
+        hasNext: !!d.hasNext, totalCount: d.totalCount ?? null,
+      };
+    } catch { return { events: [], hasNext: false, totalCount: null }; }
+  });
+  loader.serviceOwners.set('dashboard.calendar', 'core');
+  // 群组帖子（/groups/{gid}/posts：群组通知/公告类帖子流；2026-09-10 探测验证可用）
+  loader.services.set('dashboard.groupPosts', async ({ groupId, n = 20, offset = 0 } = {}) => {
+    if (typeof groupId !== 'string' || !groupId.startsWith('grp_')) throw new Error('groupId 必须是 grp_ 开头的群组 ID');
+    if (!ctx.api) return { posts: [], total: null };
+    const lim = Math.min(Math.max(Number(n) || 20, 1), 50);
+    const off = Math.max(Number(offset) || 0, 0);
+    const suffix = off ? `&offset=${off}` : '';
+    try {
+      const r = await Promise.race([
+        ctx.api._request('GET', `/groups/${groupId}/posts?n=${lim}${suffix}`),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000)),
+      ]);
+      const d = r.data || {};
+      return {
+        posts: (Array.isArray(d.posts) ? d.posts : []).map((p) => ({
+          id: p.id, title: p.title || '', text: (p.text || '').slice(0, 800),
+          authorId: p.authorId || null, createdAt: p.createdAt || '', updatedAt: p.updatedAt || '',
+          imageUrl: p.imageUrl ? imgProxy(p.imageUrl) : null, visibility: p.visibility || '',
+        })),
+        total: d.total ?? null,
+      };
+    } catch (e) { throw new Error(`群组帖子获取失败: ${String(e.message || e).slice(0, 60)}`); }
+  });
+  loader.serviceOwners.set('dashboard.groupPosts', 'core');
 
   // 非好友资料变化历史：start-monitor.js _recordNonFriendChange 把 bio/status 变化写成
   // friend-update 事件（content.type=bio/status，含 previousX 对比，source=poll）——此处只读查询展示
@@ -801,6 +1222,10 @@ export function registerDashboardServices(loader, ctx) {
             previousStatus: c.previousStatus || '',
             previousStatusDescription: c.previousStatusDescription || '',
             avatarImageUrl: c.avatarImageUrl ? avatarThumb(c.avatarImageUrl) : '',
+            location: c.location || '',
+            previousLocation: c.previousLocation || '',
+            worldId: c.worldId || '',
+            worldName: c.worldName || '',
             previousAvatarImageUrl: c.previousAvatarImageUrl ? avatarThumb(c.previousAvatarImageUrl) : '',
           };
         }),
@@ -896,11 +1321,15 @@ export function registerDashboardServices(loader, ctx) {
           new Promise((_, rej) => setTimeout(() => rej(new Error('world fetch timeout')), 10000)),
         ]);
         if (result.status === 200 && result.data) {
+          worldUnavailable.delete(worldId);   // 之前判过不可见、现在能取到 ⇒ 撤销标记
           const w = result.data;
           ctx.storage.upsertWorld({ worldId, name: w.name || '', authorId: w.authorId || '', authorName: w.authorName || '', imageUrl: w.imageUrl || '', description: w.description || '', tags: w.tags || [] });
           return pick(w);
         }
+        // VRChat 对无权查看/已下架的世界返回 404（不是 403）⇒ 先记下来供界面标注；若之后取到名字会撤销标记（404 实测有过暂时态）
+        if (result.status === 404 || result.status === 403) worldUnavailable.add(worldId);
       } catch { /* 超时/失败返回 null，由调用方回退缓存或占位 */ }
+      worldFetchCooldown.set(worldId, Date.now());   // 失败冷却（💡1），避免每请求重试一个不可见世界
       return null;
     };
     const cached = ctx.storage.getWorldName(worldId);
@@ -909,12 +1338,12 @@ export function registerDashboardServices(loader, ctx) {
       let cachedTags = cached.tags;
       if (typeof cachedTags === 'string') { try { cachedTags = JSON.parse(cachedTags || '[]'); } catch { cachedTags = []; } }
       // 缓存含标签且带 version 才视为完整（旧缓存缺 version/heat 等字段，需 fetchFresh 补齐一次）
-      if (cached.description && Array.isArray(cachedTags) && cachedTags.length && cached.version != null) return { ...pick(cached), tags: cachedTags, note: cached.note || '' };
+      if (cached.description && Array.isArray(cachedTags) && cachedTags.length && cached.version != null) return { ...pick(cached), tags: cachedTags, note: cached.note || '', unavailable: worldUnavailable.has(worldId) };
       const fresh = await fetchFresh().catch(() => null);
-      return fresh ? { ...fresh, note: cached.note || '' } : { ...pick(cached), tags: cachedTags, note: cached.note || '' };
+      return fresh ? { ...fresh, note: cached.note || '', unavailable: worldUnavailable.has(worldId) } : { ...pick(cached), tags: cachedTags, note: cached.note || '', unavailable: worldUnavailable.has(worldId) };
     }
     const fresh = await fetchFresh().catch(() => null);
-    return fresh || { worldId, name: '' };
+    return { ...(fresh || { worldId, name: '' }), unavailable: worldUnavailable.has(worldId) };
   });
   loader.serviceOwners.set('dashboard.world', 'core');
 
@@ -1105,21 +1534,20 @@ export function registerDashboardServices(loader, ctx) {
       } catch { return null; }
     };
     const uid = encodeURIComponent(userId);
-    let user, friendsList, groups, worlds, avatars, favoriteWorlds;
+    let user, groups, worlds, avatars, favoriteWorlds;
     const cached = userProfileCache.get(userId);
     if (cached && Date.now() - cached.time < UP_TTL) {
-      ({ user, friendsList, groups, worlds, avatars, favoriteWorlds } = cached);
+      ({ user, groups, worlds, avatars, favoriteWorlds } = cached);
     } else {
       const selfId = (ctx.api && ctx.api.currentUser && ctx.api.currentUser.id) || '';
-      const [u, fl, g, w, av] = await Promise.all([
+      const [u, g, w, av] = await Promise.all([
         fetchApi(`/users/${uid}`),
-        fetchApi(`/users/${uid}/friends`),
         fetchApi(`/users/${uid}/groups`),
         fetchApi(`/worlds?userId=${uid}&n=50`),
         // 他人模型列表 VRChat 403（只能查自己）——跳过避免白等，弹窗仍可看群组/世界/共同好友
         userId === selfId ? fetchApi(`/avatars?userId=${uid}&n=50`) : Promise.resolve(null),
       ]);
-      user = u; friendsList = fl; groups = g; worlds = w; avatars = av;
+      user = u; groups = g; worlds = w; avatars = av;
       // 该用户的收藏世界（VRChat 公开收藏：/favorite/groups?ownerId + /worlds/favorites?ownerId&tag，VRCX 同款）
       favoriteWorlds = [];
       try {
@@ -1144,12 +1572,15 @@ export function registerDashboardServices(loader, ctx) {
           favoriteWorlds = (await Promise.all(groupTasks)).filter(Boolean);
         }
       } catch { favoriteWorlds = []; }
-      userProfileCache.set(userId, { time: Date.now(), user, friendsList, groups, worlds, avatars, favoriteWorlds });
+      userProfileCache.set(userId, { time: Date.now(), user, groups, worlds, avatars, favoriteWorlds });
     }
     // 共同好友：VRChat 专用端点 /users/{id}/mutuals/friends（服务器直接算共同好友，无需对方开启"共享好友列表"）
     // 旧实现用 /users/{id}/friends（对方全部好友）+ 本地交集，对方关闭共享时为空 → 共同好友不显示
     const mf = await fetchApi(`/users/${uid}/mutuals/friends`);
     const mutualFriends = Array.isArray(mf) ? mf : [];
+    // 共同群组：对称共同好友（/users/{id}/mutuals/groups，2026-09-10 探测验证可用）
+    const mg = await fetchApi(`/users/${uid}/mutuals/groups`).catch(() => null);
+    const mutualGroups = Array.isArray(mg) ? mg : [];
     // 本地统计（events 表）
     const q1 = (sql, p) => { try { return ctx.storage.query(sql, p); } catch { return []; } };
     const lastActivityRow = q1(`SELECT MAX(created_at) v FROM events WHERE user_id=$u`, { $u: userId })[0];
@@ -1193,12 +1624,13 @@ export function registerDashboardServices(loader, ctx) {
     // 模型名（currentAvatarImageUrl → file id → planet_cache avatar_name）
     let avatarName = '';
     try {
-      const fm = String(user && (user.currentAvatarImageUrl || user.currentAvatarThumbnailImageUrl) || '').match(/\/file\/(file_[a-f0-9-]+)/);
-      if (fm) {
+      // 2026-09-22 评审纠正：本处原来漏改（仍是旧正则 ✗）且条件里用了未绑定的 fid ✗ ⇒ ReferenceError 被 catch 吞掉 ⇒ 模型名恒空
+      const fid = avatarFileId(user && (user.currentAvatarImageUrl || user.currentAvatarThumbnailImageUrl || user.iconUrl) || '') || '';
+      if (fid) {   // 2026-09-22 #225：原为 if (fm) ✗ —— 非好友/无 avimg 映射时整段被跳过 ⇒ 好友详情模型名恒空 ✓
         const anCache = loader._avatarNameCache || (loader._avatarNameCache = new Map());
-        if (anCache.has(fm[1])) avatarName = anCache.get(fm[1]);
+        if (fid && anCache.has(fid)) avatarName = anCache.get(fid);
         else {
-          const ar = ctx.storage.query(`SELECT payload FROM planet_cache WHERE key=$k`, { $k: `avatar_name:${fm[1]}` })[0];
+          const ar = ctx.storage.query(`SELECT payload FROM planet_cache WHERE key=$k`, { $k: `avatar_name:${fid}` })[0];
           if (ar) { try { const v = JSON.parse(ar.payload); if (v && v.name) avatarName = v.name; } catch { /* ignore */ } }
         }
       }
@@ -1216,12 +1648,21 @@ export function registerDashboardServices(loader, ctx) {
     const pickGroup = (g) => ({ id: g.id || g.groupId || '', name: g.name || '', iconUrl: imgProxy(g.iconUrl || g.$thumbnailUrl || ''), memberCount: g.memberCount || 0, shortCode: g.shortCode || '', isRepresenting: !!g.isRepresenting });
     const pickWorld = (w) => ({ id: w.id || '', name: w.name || '', imageUrl: imgProxy(w.imageUrl || w.thumbnailImageUrl || ''), authorName: w.authorName || '', description: w.description || '', capacity: w.capacity || 0, favorites: w.favorites || 0, visits: w.visits || 0, releaseStatus: w.releaseStatus || '', createdAt: w.createdAt || '' });
     const pickAvatar = (a) => ({ id: a.id || '', name: a.name || '', thumbnailImageUrl: imgProxy(a.thumbnailImageUrl || ''), imageUrl: imgProxy(a.imageUrl || ''), releaseStatus: a.releaseStatus || '', tags: Array.isArray(a.tags) ? a.tags : [] });
+    // 2026-09-22：把追踪行的本地备注一起带出（弹窗里直接编辑；免得多挂一个常驻 Dialog）
+    let trackedMemo = '';
+    try {
+      const tm = ctx.storage.query('SELECT memo FROM tracked_non_friends WHERE user_id = $u', { $u: uid })[0];
+      trackedMemo = (tm && tm.memo) || '';
+    } catch { /* 忽略 */ }
     return {
       user,
       avatarName,
+      trackedMemo,   // 2026-09-22：追踪行备注（弹窗可编辑）
       representedGroup: representedGroup ? pickGroup(representedGroup) : null,
       mutualFriendCount: mutualFriends.length,
       mutualFriends: mutualFriends.map((f) => ({ id: f.id, displayName: f.displayName || '', avatarUrl: avatarOf(f.userIcon, f.currentAvatarImageUrl || f.currentAvatarThumbnailImageUrl) })),
+      mutualGroupCount: mutualGroups.length,
+      mutualGroups: mutualGroups.map(pickGroup),
       groups: groupArr.map(pickGroup),
       favoriteWorlds,
       worlds: Array.isArray(worlds) ? worlds.map(pickWorld) : [],
@@ -1243,4 +1684,61 @@ export function registerDashboardServices(loader, ctx) {
     };
   });
   loader.serviceOwners.set('dashboard.userProfile', 'core');
+
+  // ── 动态状态（按在线好友数量自动更新自定义状态）──
+  // 读写走 ctx.statusSync（DynamicStatusSync，start-monitor 初始化；默认关闭，config 表 dynamic_status 键）。
+  // service 层只做转发——引擎逻辑（限流/冷却/PUT）见 core/status-sync.js。
+  loader.services.set('dashboard.dynamicStatusGet', () => {
+    const sync = ctx.statusSync;
+    if (!sync) return { enabled: false, template: '', error: 'status-sync 未初始化' };
+    return {
+      ...sync.config,
+      onlineNow: ctx.friendState?.getOnlineCount() ?? null,
+      lastSent: sync._lastSent || '',
+      lastAt: sync._lastAt ? new Date(sync._lastAt).toISOString() : '',
+      lastPutError: sync._lastPutError || '',
+      minIntervalMs: 65_000,
+    };
+  });
+  loader.serviceOwners.set('dashboard.dynamicStatusGet', 'core');
+  // ⚠️ 这里必须是 async：await_handle_sync 返回 Promise，同步 service 会把它原样塞进响应
+  // （JSON 序列化成 {}）⇒ 面板永远拿不到 syncResult（action/reason），「保存并立即同步」形同没同步。
+  loader.services.set('dashboard.dynamicStatusSet', async ({ enabled, mode, template, separator, syncNow = true } = {}) => {
+    const sync = ctx.statusSync;
+    if (!sync) return { ok: false, error: 'status-sync 未初始化' };
+    if (enabled !== undefined && typeof enabled !== 'boolean') return { ok: false, error: 'enabled 必须是 boolean' };
+    if (template !== undefined && typeof template !== 'string') return { ok: false, error: 'template 必须是 string' };
+    if (mode !== undefined && mode !== 'fixed' && mode !== 'suffix') return { ok: false, error: 'mode 必须是 fixed / suffix' };
+    if (separator !== undefined && typeof separator !== 'string') return { ok: false, error: 'separator 必须是 string' };
+    const config = sync.setConfig({
+      ...(enabled !== undefined ? { enabled } : {}),
+      ...(mode !== undefined ? { mode } : {}),
+      ...(template !== undefined ? { template } : {}),
+      ...(separator !== undefined ? { separator } : {}),
+    });
+    // ⚠️ 这里必须 await：await_handle_sync 是 async 函数，漏掉 await 会把 Promise 直接放进响应
+    // （JSON 序列化成 {}）⇒ 面板拿不到 syncResult（action/reason/statusDescription）。
+    const syncResult = syncNow ? await await_handle_sync(sync, config.enabled) : { action: 'skipped', reason: 'not-sync-now' };
+    return { ok: true, config, syncResult };
+  });
+  loader.serviceOwners.set('dashboard.dynamicStatusSet', 'core');
+
+  // ── 好友地图统计（#165 数据层的 dashboard 消费面）──
+  // 复用 MCP 工具 handler（同一 ctx 单例）；imageUrl 转 imgProxy 供前端 <img> 直连。
+  loader.services.set('dashboard.friendWorldStats', ({ days = 30, limit = 20 } = {}) => {
+    const r = handleGetFriendWorldStats({ days, limit });
+    return {
+      ...r,
+      stats: r.stats.map((s) => ({
+        ...s,
+        imageUrl: s.imageUrl ? `/api/dashboard/image-proxy?url=${encodeURIComponent(s.imageUrl)}` : '',
+      })),
+    };
+  });
+  loader.serviceOwners.set('dashboard.friendWorldStats', 'core');
+}
+
+// 动态状态 Set 的立即同步（service 内 await 引擎；force=绕过开关与冷却——用户显式保存即意图明确）
+async function await_handle_sync(sync, enabled) {
+  try { return await sync.sync(enabled); } catch (e) { return { action: 'failed', reason: String(e.message || e) }; }
 }

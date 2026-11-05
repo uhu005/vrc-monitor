@@ -16,6 +16,41 @@ export function handleGetDatabaseStats() {
   };
 }
 
+// ── 动态状态（按在线好友数更新自定义状态，issue 需求 2026-09-07）──
+
+/** 查询动态状态配置与引擎状态（在线数/最近一次提交文本） */
+export function handleGetDynamicStatus() {
+  const sync = ctx.statusSync;
+  if (!sync) throw new Error('动态状态引擎未初始化（服务版本过旧或启动异常）');
+  const cfg = sync.config;
+  return {
+    ...cfg,
+    onlineNow: ctx.friendState?.getOnlineCount() ?? null,
+    lastSent: sync._lastSent || '',
+    lastAt: sync._lastAt ? new Date(sync._lastAt).toISOString() : '',
+    minIntervalMs: 65_000,
+  };
+}
+
+/** 设置动态状态（开关/模式/模板/分隔符），可选立即生效（绕过冷却强制同步一次） */
+export async function handleSetDynamicStatus({ enabled, mode, template, separator, syncNow = true } = {}) {
+  const sync = ctx.statusSync;
+  if (!sync) throw new Error('动态状态引擎未初始化（服务版本过旧或启动异常）');
+  if (enabled !== undefined && typeof enabled !== 'boolean') throw new Error('enabled 必须是 boolean');
+  if (mode !== undefined && mode !== 'fixed' && mode !== 'suffix') throw new Error('mode 必须是 fixed / suffix');
+  if (template !== undefined && typeof template !== 'string') throw new Error('template 必须是 string');
+  if (separator !== undefined && typeof separator !== 'string') throw new Error('separator 必须是 string');
+  if (separator !== undefined && Array.from(separator).length > 4) throw new Error('separator 最长 4 个字符（超长会挤掉正文空间）');
+  const cfg = sync.setConfig({
+    ...(enabled !== undefined ? { enabled } : {}),
+    ...(mode !== undefined ? { mode } : {}),
+    ...(template !== undefined ? { template } : {}),
+    ...(separator !== undefined ? { separator } : {}),
+  });
+  const result = syncNow ? await sync.sync(cfg.enabled) : { action: 'skipped', reason: 'not-sync-now' };
+  return { ok: true, config: cfg, syncResult: result };
+}
+
 export function handleGetServerStatus() {
   const { storage, wsManager, friendState, eventPipeline, serverState } = ctx;
   return {
@@ -223,8 +258,66 @@ export function handleGetNewWorlds({ onlyUnvisited = false, limit = 10, sortBy =
   return { total, worlds };
 }
 
+/**
+ * 兜底行的元数据回填（恢复 issue #76 / PR #77 的修复语义）。
+ *
+ * rate_world / mark_world_visited / set_world_sleep / add_to_backlog 在目标世界不在
+ * world_kb 时只插一条「只有 world_id」的兜底行：world_name / author_name / created_at 恒空
+ * —— get_backlog 的列表读不到名字，推荐侧依赖 created_at 的新图加权对这类行永久失效。
+ *
+ * 回填顺序：本地 world_cache（零成本）→ 缓存缺失才按限流拉一次 /worlds/{id} 并写回缓存。
+ * 幂等：backfillWorldKbInfo 仅在对应列为空时写入，不覆盖已有真实值。
+ * 任何一步失败都只记日志、不阻断主操作（回填属增强，缺元数据不该让写入失败）。
+ * 可观测性：缓存/API 回填成功各记一行 [世界KB] 兜底行回填(<来源>)，API 非 200 记一行"跳过"，
+ * 异常记一行"失败"——即每次触发恰好 1 行日志，成功与降级都不静默。
+ */
+async function ensureWorldKbInfo(worldId) {
+  const { storage, api, rateLimiter } = ctx;
+  if (!worldId) return null;
+  try {
+    const cached = storage.getWorldName(worldId);
+    // 判据用 name（主显示诉求）：只有 name 命中才算缓存可用；name 缺失就走 API 补全
+    // （避免 world_cache 里只有 author/note、没有名字的行把回填挡在门外，#183 review 💡1）
+    if (cached && cached.name) {
+      const info = storage.backfillWorldKbInfo({
+        worldId,
+        name: cached.name || '',
+        authorName: cached.author_name || '',
+        authorId: cached.author_id || '',
+      });
+      log(`[世界KB] 兜底行回填(缓存): ${worldId} → ${info.worldName || '(空)'}${info.authorName ? ` / ${info.authorName}` : ''}`);
+      return info;
+    }
+    if (!api) {
+      log(`[世界KB] 兜底行回填跳过（无 API 客户端，缓存也未命中）: ${worldId}`);
+      return null;
+    }
+    const fetchWorld = () => api._request('GET', `/worlds/${worldId}`);
+    const r = rateLimiter ? await rateLimiter.execute(fetchWorld) : await fetchWorld();
+    if (!r || r.status !== 200 || !r.data || !r.data.id) {
+      log(`[世界KB] 兜底行回填跳过（API ${r ? r.status : '无响应'}）: ${worldId}`);
+      return null;
+    }
+    const w = r.data;
+    storage.upsertWorld({
+      worldId: w.id, name: w.name || '', authorId: w.authorId || '', authorName: w.authorName || '',
+      capacity: w.capacity, favorites: w.favorites, releaseStatus: w.releaseStatus || '',
+      tags: w.tags || [], description: w.description || '', imageUrl: w.imageUrl || '',
+    });
+    const info = storage.backfillWorldKbInfo({
+      worldId, name: w.name || '', authorName: w.authorName || '',
+      authorId: w.authorId || '', createdAt: w.created_at || '',
+    });
+    log(`[世界KB] 兜底行回填(API): ${worldId} → ${info.worldName || '(空)'}${info.authorName ? ` / ${info.authorName}` : ''}`);
+    return info;
+  } catch (e) {
+    log(`[世界KB] 兜底行元数据回填失败（不影响主操作）: ${worldId} ${String(e && e.message || e)}`);
+    return null;
+  }
+}
+
 /** 用户反馈：好图/烂图标记（Issue #19） */
-export function handleRateWorld({ worldId, rating = 0 }) {
+export async function handleRateWorld({ worldId, rating = 0 }) {
   const { storage } = ctx;
   if (!worldId) throw new Error('worldId is required');
   const r = parseInt(rating, 10);
@@ -232,26 +325,32 @@ export function handleRateWorld({ worldId, rating = 0 }) {
     throw new Error('rating must be -1 (junk), 0 (clear), or 1 (good)');
   }
   const result = storage.rateWorld({ worldId, rating: r });
-  log(`⭐ 用户反馈: ${worldId} → rating=${result.userRating}${result.worldName ? ` (${result.worldName})` : ''}`);
-  return result;
+  await ensureWorldKbInfo(worldId);
+  const worldName = storage.getWorldKbInfo(worldId).worldName || result.worldName;
+  log(`[反馈] 用户反馈: ${worldId} → rating=${result.userRating}${worldName ? ` (${worldName})` : ''}`);
+  return { ...result, worldName };
 }
 
 /** 显式确认逛过某世界（Issue #19 痛点 3） */
-export function handleMarkWorldVisited({ worldId }) {
+export async function handleMarkWorldVisited({ worldId }) {
   const { storage } = ctx;
   if (!worldId) throw new Error('worldId is required');
   const result = storage.markWorldVisited({ worldId });
-  log(`✅ 手动标记 visited: ${worldId}${result.worldName ? ` (${result.worldName})` : ''}`);
-  return result;
+  await ensureWorldKbInfo(worldId);
+  const worldName = storage.getWorldKbInfo(worldId).worldName || result.worldName;
+  log(`[成功] 手动标记 visited: ${worldId}${worldName ? ` (${worldName})` : ''}`);
+  return { ...result, worldName };
 }
 
 /** 待逛列表：加入/更新（幂等） */
-export function handleAddToBacklog({ worldId, reason = '', priority = 0 }) {
+export async function handleAddToBacklog({ worldId, reason = '', priority = 0 }) {
   const { storage } = ctx;
   if (!worldId) throw new Error('worldId is required');
   const result = storage.addToBacklog({ worldId, reason, priority });
-  log(`📌 加入待逛: ${worldId}${result.worldName ? ` (${result.worldName})` : ''} priority=${result.priority}`);
-  return result;
+  await ensureWorldKbInfo(worldId);
+  const worldName = storage.getWorldKbInfo(worldId).worldName || result.worldName;
+  log(`[待办] 加入待逛: ${worldId}${worldName ? ` (${worldName})` : ''} priority=${result.priority}`);
+  return { ...result, worldName };
 }
 
 /** 待逛列表：查询 */
@@ -264,7 +363,7 @@ export function handleRemoveFromBacklog({ worldId }) {
   const { storage } = ctx;
   if (!worldId) throw new Error('worldId is required');
   const result = storage.removeFromBacklog({ worldId });
-  log(`🗑 移出待逛: ${worldId}`);
+  log(`[删除] 移出待逛: ${worldId}`);
   return result;
 }
 
@@ -324,7 +423,7 @@ export function handleSetNickname({ userId, nickname, displayName }) {
 export async function handleBackupDatabase() {
   try {
     const result = await ctx.storage.backup(ctx.paths.BACKUP_DIR);
-    log(`💾 手动备份完成: ${result.path} (${result.size} bytes)`);
+    log(`[备份] 手动备份完成: ${result.path} (${result.size} bytes)`);
     return result;
   } catch (e) {
     return { ok: false, error: String(e.message || e) };
@@ -332,12 +431,14 @@ export async function handleBackupDatabase() {
 }
 
 /** 手动标记某世界为适合睡觉的地图（recommend 用 sleep_ok 强信号） */
-export function handleSetWorldSleep({ worldId, isSleep = true }) {
+export async function handleSetWorldSleep({ worldId, isSleep = true }) {
   const { storage } = ctx;
   if (!worldId) throw new Error('worldId is required');
   const result = storage.setWorldSleep({ worldId, isSleep: !!isSleep });
-  log(`${result.isSleep ? '🛏' : '✖️'} 标记睡觉图: ${worldId}${result.worldName ? ` (${result.worldName})` : ''} → sleep_ok=${result.isSleep ? 1 : 0}`);
-  return result;
+  await ensureWorldKbInfo(worldId);
+  const worldName = storage.getWorldKbInfo(worldId).worldName || result.worldName;
+  log(`${result.isSleep ? '[睡眠]' : '[取消]'} 标记睡觉图: ${worldId}${worldName ? ` (${worldName})` : ''} → sleep_ok=${result.isSleep ? 1 : 0}`);
+  return { ...result, worldName };
 }
 
 export async function handleSearchWorlds({ query, n }) {
@@ -376,6 +477,34 @@ export async function handleSearchWorlds({ query, n }) {
 }
 
 // ── MCP 自声明工具表 ──
+/** 全局物品栏（账号级物品，含装备槽/描述；self-only 端点） */
+export async function handleGetInventoryGlobal({ n = 50 } = {}) {
+  const { api } = ctx;
+  if (!api) throw new Error('VRChat API 客户端尚未初始化');
+  const lim = Math.min(Math.max(Number(n) || 50, 1), 100);
+  const r = await api._request('GET', `/inventory/global?n=${lim}`);
+  if (r.status !== 200) throw new Error(`API error: ${r.status}`);
+  const list = Array.isArray(r.data) ? r.data : [];
+  return { total: list.length, items: list.map(it => ({
+    id: it.id || null, name: it.name || null, description: it.description ? String(it.description).slice(0, 200) : null,
+    equipSlot: it.equipSlot || null, equipSlots: Array.isArray(it.equipSlots) ? it.equipSlots : [],
+    acquisition: it.acquisition || null, itemType: it.itemType || null,
+  })) };
+}
+
+/** 待领取掉落（inventory drops；空数组=当前无掉落） */
+export async function handleGetInventoryDrops() {
+  const { api } = ctx;
+  if (!api) throw new Error('VRChat API 客户端尚未初始化');
+  const r = await api._request('GET', '/inventory/drops');
+  if (r.status !== 200) throw new Error(`API error: ${r.status}`);
+  const list = Array.isArray(r.data) ? r.data : [];
+  return { total: list.length, drops: list.map(it => ({
+    id: it.id || null, name: it.name || null, description: it.description ? String(it.description).slice(0, 200) : null,
+    expiresAt: it.expiresAt || null,
+  })) };
+}
+
 export const tools = [
   {
     "name": "get_database_stats",
@@ -559,5 +688,43 @@ export const tools = [
       "properties": {}
     },
     handler: async (args) => handleBackupDatabase(args)
+  },
+  {
+    "name": "get_dynamic_status",
+    "description": "[query] 查询动态状态（按在线好友数量自动更新自定义状态）引擎配置与运行状态：enabled（开关,默认关闭）、mode（fixed=整段按模板覆盖 / suffix=保留使用者手写的正文、只在结尾维护后缀）、template（fixed 下是整段模板; suffix 下是后缀模板,{total}（总在线）/ {webOnline}（网页/App 在线）/ {gameOnline}（游戏内在线）占位符替换为对应计数（旧模板的 {online} 仍兼容、等同 {total} —— ⚠️ 语义已变：现在与 {total} 同源（绝对计数），**不再受 VRC_MONITOR_ONLINE_INCLUDE_WEB 开关约束**））、separator（suffix 模式的分隔符,默认「 · 」）、onlineNow（当前在线好友数）、lastSent/lastAt（最近一次实际提交的文本与时间）。",
+    "inputSchema": { "type": "object", "properties": {} },
+    handler: async (args) => handleGetDynamicStatus(args)
+  },
+  {
+    "name": "set_dynamic_status",
+    "description": "[manage] 设置动态状态：enabled 开关（默认关闭）、mode（fixed=整段覆盖,默认; suffix=**保留你自己写的正文,只在结尾维护后缀** —— 你在 VRChat 里手打「打机中」会变成「打机中 · 在线 5 人」,你改文字后不覆盖、只在结尾补/更新那截）、template（fixed: 整段模板; suffix: 后缀模板；占位符 {total}|{总在线} / {webOnline}|{web在线} / {gameOnline}|{非web在线},旧的 {online} 仍兼容等同 {total}；⚠️ {online} 现在是**绝对计数**、不再随 VRC_MONITOR_ONLINE_INCLUDE_WEB 变化）、separator（suffix 模式分隔符,默认 ' · '）、syncNow 保存后是否立即强制同步一次（默认 true,绕过冷却）。上限 64 字符:suffix 模式超长时**先截断正文、保证计数完整**。频繁变更受 VRChat 限频,引擎内置 65s 冷却 + 文本无变化不提交 + 写回不自触发（unchanged 早退）。⚠️ 与插件 set_presence_status（按是否在游戏内切换状态文字）写同一个 statusDescription:fixed 模式两者会互相覆盖,建议只启用其一;suffix 模式下两者可共存（插件写入后本引擎补/更新后缀,插件也容忍后缀,不会反复抹除）。",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean", "description": "开关（默认关闭）" },
+        "mode": { "type": "string", "enum": ["fixed", "suffix"], "description": "fixed=整段覆盖（默认）；suffix=保留使用者手写正文、只在结尾维护后缀" },
+        "template": { "type": "string", "description": "文本模板（suffix 模式下为后缀模板），{total}/{webOnline}/{gameOnline} 占位符替换为对应计数" },
+        "separator": { "type": "string", "description": "suffix 模式的正文与后缀分隔符（默认 ' · '）" },
+        "syncNow": { "type": "boolean", "description": "保存后立即强制同步一次(默认 true)" }
+      }
+    },
+    handler: async (args) => handleSetDynamicStatus(args)
+  },
+  {
+    "name": "get_inventory_global",
+    "description": "[inventory] List account-wide global inventory items (equip slots/description). Self only.",
+    inputSchema: {
+      "type": "object",
+      "properties": {
+        "n": { "type": "number", "default": 50, "description": "Max items (1-100, default 50)" }
+      }
+    },
+    handler: async (args) => handleGetInventoryGlobal(args)
+  },
+  {
+    "name": "get_inventory_drops",
+    "description": "[inventory] List pending inventory drops (empty = none pending). Fields (name/expiresAt) come straight from the /inventory/drops response. Self only.",
+    inputSchema: { "type": "object", "properties": {} },
+    handler: async (args) => handleGetInventoryDrops(args)
   }
 ];

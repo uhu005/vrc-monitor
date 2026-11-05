@@ -46,6 +46,46 @@ export function worldLabel(x) {
   return x.worldId || '未公开位置';
 }
 
+/** 特殊位置的中文名（不是"世界:实例"格式的那些值）：private→私人房间 / offline→离线 / traveling→传送中 / local→本地房间。
+ * 用途：位置行在拿不到世界名时的兜底标签（用户 2026-09-22 定：拿不到世界名就写"私人房间"）。 */
+export function specialLocationLabel(loc) {
+  const v = String(loc || "").toLowerCase();
+  // 纯特殊值直接给中文名（本地图 / 离线 / 传送）
+  const direct = {
+    private: "私人房间",  // 纯值形态（1fdce1f 那天覆盖的情况，不能丢）
+    offline: "离线", "offline:offline": "网页在线", traveling: "传送中",
+    local: "本地房间", friends: "好友房间", group: "群组房间",
+  }[v];
+  if (direct) return direct;
+  // 2026-09-24 用户定：拿不到信息的那种私人实例显示「私人房间」（能获取到的照常显示）
+  // 两条判据【并存】：①纯值形态（private / offline / traveling…）由上面的 direct 映射覆盖——
+  // 1fdce1f 那天修的就是它，不能删；②带 worldId 的实例串（wrld_xxx:12345~private(usr_xxx)）由下面 parseLoc 覆盖
+  // 判据必须走 parseLoc —— 真实位置形如 wrld_xxx:12345~private(usr_xxx)，整串相等永远不命中
+  // 且**统一走 isPrivateInstance()**：它只认 private / invite+（parseLoc 从不产出 invite）——
+  // 这里原本内联的那份判据里 'invite' 恒假，属同类死判据（2026-10-18 复审 nixi 💡1 指出，已收敛）
+  if (isPrivateInstance(v)) return "私人房间";
+  return "";
+}
+
+/** 仅邀请 / 私人实例的**唯一判据入口**（位置行左右两端共用，别再各写一份）。
+ *  ⚠️ 只管这两个类型：`parseLoc` 对真实位置串只会产出 `private`（`~private(usr)`）或 `invite+`（再带 `~canRequestInvite`）——
+ *  **不会产出 `invite`**，所以写 p.type === 'invite' 是恒假死判据（2026-10-18 复审 💡1 指出）。
+ *  纯值 `private` 走 specialLocationLabel 的 direct 映射，不进这里。 */
+export function isPrivateInstance(loc) {
+  const p = parseLoc(loc || '');
+  return !!(p && (p.type === 'private' || p.type === 'invite+'));
+}
+
+/** 位置行左端「从哪来」的**兜底标签**（用户 2026-10-17 定）：只认**紧邻的上一个位置**。
+ *  私人/仅邀请实例给「私人房间」这件事由 `specialLocationLabel()` 负责（它已覆盖 private / invite+），
+ *  本函数**不再重复一套判据**（2026-10-18 复审 💡1：原来那段 parseLoc 判断因第一分支必然先命中而不可达）。
+ *  抽成纯函数是为了能被 test/location-labels-pure.test.mjs 直接断言（源码正则钉不住行为）。 */
+export function prevLocationLabel(previousLocation, previousWorldName) {
+  // 私人实例优先于世界名：这是用户 2026-10-17 的定案「上次是私人房间就私人房间」；
+  // 模板侧必须与这里一致（先把私人房渲染成「私人房间」，再考虑 worldId → 世界名）。
+  return specialLocationLabel(previousLocation) || previousWorldName || '';
+}
+
 export function parseLoc(loc) {
   if (!loc) return null;
   // 特殊值：offline / offline:offline / traveling 表示离线/传送状态，不是"世界:实例"格式，
@@ -180,6 +220,7 @@ export function trustColor(t) {
 // 等级名标准化为 VRCX 英文名（tags / 旧推断值 Visitor·New·User·Known·Trusted·Veteran → 规范名）
 export const TRUST_TAG_NAMES = {
   veteran: 'Trusted User',
+  legend: 'Trusted User',   // #222 审核 💡4：与 DB 侧写入值对齐（否则弹窗会显示原样 'legend'）
   trusted: 'Known User',
   known: 'User',
   basic: 'New User',

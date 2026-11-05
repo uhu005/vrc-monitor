@@ -1,7 +1,7 @@
 # Dashboard 开发状态档案
 
 > 由 filesystem-context 技能（Plan Persistence 模式）维护。跨会话/上下文压缩后先读本文件恢复状态。
-> 最后更新：2026-08-30
+> 最后更新：2026-10-07
 
 ## 当前目标
 
@@ -84,7 +84,7 @@
 - **GameLog 游戏日志**：后端 `dashboard.gameSessions` 服务 + `GET /api/dashboard/game-sessions`（user-location 聚合会话）；前端 logs 视图（会话数/总时长/会话时间线）。实测：最近 7 天 72 会话/785 分钟
 - **请求加入（VRCX 邀请对齐）**：后端 `POST /api/dashboard/invite-request`（request_invite 工具）；资料弹窗给在线好友显示「请求加入」按钮（toast 反馈）
 - **快速搜索 Ctrl+K（VRCX Quick Search 对齐）**：任意页面按 Ctrl+K/Cmd+K 弹出快速搜索覆盖层，输入即时匹配本地好友 + VRChat 用户搜索（防抖 300ms），点击打开资料；Esc 关闭
-- **状态预设（VRCX Social Status Presets 对齐）**：右侧栏状态预设（在线/加入我/问我/忙碌）+ 状态描述输入；`POST /api/dashboard/status`（PUT /auth/user/status）
+- **状态预设（VRCX Social Status Presets 对齐）**：右侧栏状态预设（在线/欢迎加入/忙碌/请勿打扰）+ 状态描述输入；`POST /api/dashboard/status`（PUT /auth/user/status）
 - **VRChat 服务器状态指示（受限）**：状态栏 `#vrcs` 显示 VRChat 服务器状态（`GET /api/dashboard/vrc-status`，status.vrchat.com）。**诚实限制**：路由器无法访问 status.vrchat.com（被墙/不可达），VRChat API 无替代公开端点——接口保留，失败时显示 VRC —
 - **好友备注全局显示（VRCX 对齐）**：`GET /api/dashboard/nicknames-all` 加载全部备注到 `state.nicknameMap`，`nameFor` 优先用备注名替换显示名（好友列表/事件流/资料统一显示备注名）
 - **Tools 快捷工具页**：世界/模型/用户/群组 ID → 生成 VRChat 链接（可打开/复制）
@@ -301,7 +301,9 @@
 用户选定 **PrimeVue 4 + Vite 构建**，允许全面重写前端（保留后端 API 与信息架构），目标桌面+移动双端。
 
 **关键决策**：
-- 构建在本地跑（路由器只发产物，Dockerfile `COPY . .` 直接带 `ui/dist`）；`vite-plugin-singlefile` 把所有 JS/CSS 打进一个 index.html（~1.06MB）→ `/dashboard` 仍是单文件请求，**无需静态资源鉴权白名单**（PrimeIcons 的 woff2/woff/eot 已内联，仅 SVG 因 `?#primeicons` 片段留在外部但现代浏览器走 woff2 不会请求，已从 dist 删除）
+> ⚠️ **本节决策已失效（2026-09-13，issue #186 方案 A）**：`ui/dist` 已出库，改为安装期（`npm run install-plugins` / `npm run build:dashboard`）与 Dockerfile 的 ui-builder 阶段构建；保留以下原始记录供追溯。
+
+- ~~构建在本地跑（路由器只发产物，Dockerfile `COPY . .` 直接带 `ui/dist`）~~；`vite-plugin-singlefile` 把所有 JS/CSS 打进一个 index.html（~1.06MB）→ `/dashboard` 仍是单文件请求，**无需静态资源鉴权白名单**（PrimeIcons 的 woff2/woff/eot 已内联，仅 SVG 因 `?#primeicons` 片段留在外部但现代浏览器走 woff2 不会请求，已从 dist 删除）
 - 认证不变：`?token=`/Header 鉴权；`/dashboard?legacy=1` 回退旧版 UI
 
 **里程碑 1 已部署（plugins/official/web-dashboard/ui/）**：
@@ -726,7 +728,7 @@ git diff --check
 
 - **非好友追踪 UI 重做**（用户反馈驱动）：卡片化列表 + 添加追踪面板（搜索用户→加入，幂等+立即刷新）+ 移除追踪（removed_at 标记持久化，种子不再复活）+ 打开资料/移除带文字按钮
 - **修复：自己误入追踪列表**——启动早期 /auth/user 失败时 selfId 为空；改为事件表推导（user-location/user-update 只会是自己的事件）+ API 兜底 + 启动清理 + 列表过滤 + 添加拒绝，四层防护
-- **在线状态显示**：刷新循环落库 status/statusDescription/location（迁移加列）；列表绿色圆点+状态徽章（在线/加入我/问我/忙碌/离线，对齐好友页）；在线优先排序
+- **在线状态显示**：刷新循环落库 status/statusDescription/location（迁移加列）；列表绿色圆点+状态徽章（在线/欢迎加入/忙碌/请勿打扰/离线，对齐好友页）；在线优先排序
 - **动态页「只看追踪」筛选**：trackedIds 加载 + 望远镜 chip，与只看关注/只看我并列；空态引导
 - **变化时间线类型筛选**：全部/头像/简介/状态 chips
 - **X 抓取尝试与回退**：chromium+Xvfb+代理基建验证可用，但 2026 X 全匿名通道封锁（Nitter 全灭/GraphQL 404/登录墙）——已回退基建保留 UI，文档注明环境限制
@@ -925,3 +927,85 @@ git diff --check
   - core 新增 `groups.resolve` 服务（group_cache 缓存优先 TTL 7 天 + API 回填）；events 挖掘改 consume 该服务，maxMine 默认 60→30
   - core 新增 `dashboard.isSelfOnline` 服务（events 表 user-location 最新一条判定；超 1h 无新事件的在线记录保守返回 null）
   - events 插件每日离线刷新调度器：首次 1h 后检查，在线/无法判定推迟 30min，离线重挖 week/month/tonight（maxMine=30）+ 清理 `start_iso < now` 过期活动；setTimeout 链 + unref + dispose 清理
+
+## 2026-09-25 动态页三处修复 + 头像优先级改版（上游 PR #249~#259）
+
+**问题（用户报障 → 根因）**：
+
+1. **事件行头像偶发「雷霆大头像」** —— `.world-link {` **少了一个闭合 `}`**，紧随其后的
+   `.uicon { width: 26px; … }` 被 CSS 嵌套解析成 `.world-link .uicon` ⇒ 那条 26px 只在"世界名链接内部"生效
+   ⇒ 事件行里的头像不受任何尺寸约束、按原图撑开。
+   ⚠️ **坑**：花括号全局是配平的（390/390，少的一个与别处多出的正好抵消）⇒ **"配平"不能当判据**；
+   判据是**构建产物里那条规则的选择器形态**（`.world-link .uicon[data-v-…]` = 被吞 / `.uicon[data-v-…]` = 独立）。
+   修法是**把规则搬出去**，不是补一个 `}`（那个位置不缺，补了会构建失败）。
+2. **三个按钮是空白** —— `pi-binoculars` / `pi-user-check` / `pi-check-double` 在 primeicons 里
+   **不存在**（`.pi-xxx:before` 规则数 = 0）⇒ 渲染成空白，看起来像"坏掉的空按钮"。
+   判据：**CSS 里有没有 `.pi-xxx:before`**；全仓扫描法：列出用到的全部 `pi-*` 类逐个查规则数
+   （本次 77 个里只有这 3 个缺；`pi-spin` 是动画类、会误报）。
+3. **事件行左侧位置信息不显示** —— 自造函数引用了未导入的 `parseLoc` ⇒ ReferenceError；后被重写吃掉。
+
+**改动**：
+
+- 位置行显示「**状态 → 状态**」（左端优先状态中文名如"私人房间/传送中"、右端世界名）；
+  取不到世界名时给人话而不是裸 ID；左端补「图 + 世界名 + 实例信息」。
+- **头像显示改为「用户图标优先、无则回落模型图」**（用户定案）—— 上游原为 `avatarUrl || userIcon`
+  ⇒ **用户设了自己的图标也看不到**。全站 8 文件 15 处调换；两个字段独立，一个变另一个不跟着变。
+- 顶栏去噪：删「导出当前筛选结果」按钮与 `exportRows()`、删「数据库共 N 条」、去掉纯图标按钮的 `(N)`；
+  补 `.feed-head { display:flex; align-items:center }` —— 上游给 `.feed-count` 写了 `margin-left:auto`
+  但**标题行没有 flex 容器** ⇒ 计数贴不到最右。
+- `user_icon` 事件文案「更新头像图标」→「**更新用户头像**」（与「更换模型」明确区分）。
+- 三处不存在的图标类换成语义等价的现有类。
+
+**后端同批（由同一批报障引出）**：
+
+- `event-pipeline.js`：`avatarChanged` 判据读的是**上游自己已移除**的 `currentAvatarImageUrl` ⇒ 恒假
+  ⇒ **永远检测不到「更换模型」**；事件 payload 与回写同样恒空 ⇒ 动态流显示「未知模型」。
+  改用 `iconUrl`，并**把它依赖的前置条件写进代码**：`bannerType === 'avatarBanner'` 时 `iconUrl` 才是模型图
+  （实测近 3 天分布 avatarBanner 267 / null 106 / color 87 ⇒ 约 42% 的推送里它不是模型图）。
+  抽 `avatarImageUrlFromUser()` 供两处共用，配 6 条行为断言。
+- 用户图标字段改名后仍有 5 处读旧名（`event-pipeline` 4 + `friend-refresh` 1）⇒ 写入恒空；
+  改 `iconUrl || userIcon` 兜底。
+- 对账补记离线的窗口下界改用 `pickOfflineWindowStart()`（= max(他最后一次活动, 最近一次对账确认他在线,
+  WS 断开时刻)）⇒ 修「一次 2 秒瞬断被放大成 4.5 小时」的窗口。
+- 在线计数**含「网页在线」** + 开关 `VRC_MONITOR_ONLINE_INCLUDE_WEB`；重连后对账**周期化**（5 分钟一次）
+  ⇒ 修"首轮之后再漂移就修不回来"。口径抽成 `core/online-count-policy.js`，配 7 条断言。
+- **同世界同实例的重复 `friend-location` 去重**（`VRC_MONITOR_DEDUP_SAME_INSTANCE_LOCATION` 默认开、
+  `_WINDOW_SECONDS` 默认 300s；窗口外的重复仍落一条"心跳"）⇒ 修「好友改模型被呈现成一直在换世界」。
+
+**验证**：`npm test` 全量 **275/275** 通过 · `test-registry` **PASS**（122 工具 order+defs OK）·
+`check-doc-drift --json` 干净 · ui/ `vite build` 通过 + `vitest run` **44/44** ·
+已部署并验证容器 healthy（带 token 打 `/health`：auth=true / ws=connected / plugins=15）。
+
+## 2026-10-07 动态流类型筛选服务端化（修「筛选简介加载慢 / signal timed out」）
+
+**报障**：手机上（公网域名）点「简介变更」筛选 —— 加载很慢，半数请求 `加载失败：signal timed out`。
+
+**根因**：类型筛选是**纯客户端**的 —— 先按 50 条/页拉全量、再在浏览器里过滤，且 `fillFeed()` 会为凑够
+50 条匹配**一路翻到数据库底部**（本库 1.8 万+ 事件 ⇒ 数百个请求；公网 400-500ms/请求 ⇒ 25s 超时）。
+（同一次报障里「全是已清空」是**另一个**根因：VRChat 把 bio 移出了 user 对象，另案修复，与本 PR 无依赖。）
+
+**修法**：把**可由 `content_json.type` 判定**的筛选值下沉到 SQL —— `dashboard.events` 新增 `updateTypes`
+参数（`core/dashboard-services.js` 的 `UI_UPDATE_TYPE_SQL` / `updateTypeConds`），主查询与 `total` 计数
+共用同一套条件；路由 `/api/dashboard/events?updateTypes=bio,avatar` 透传；前端仅在**选中的筛选值全部
+可服务端过滤**时才下发（其余/混选保持原行为）。
+⚠️ 映射**逐字对齐前端 `typeOf()`**（含非直觉分支：`friend-active` 与 `user-update` 的非显式子类型都算
+status；`user-update + trust_level` 也是 status ⇒ `trustLevel` 只认 `friend-update`），由
+`test/dashboard-events-type-filter.test.mjs` 用同一批样本对「SQL 结果 vs `typeOf` 过滤结果」做集合
+等价断言（变异自检：改回错映射即红）。
+
+**验证**：新增用例见 `test/dashboard-events-type-filter.test.mjs` 与 ui `event-types.test.js`（均含变异/防漂移断言，条数不写在这里）；
+`npm test`、`test-registry`、`check-doc-drift`、ui `vitest run` 全部通过
+（**具体用例数随仓库演进而变，不写死在这里**）。生产实测：`?updateTypes=bio` 一次请求 196ms 返回
+10 条全为 bio（total 79；未过滤 total 21538）。
+
+## 2026-10-13 服务日志页补齐「接口 / 外部服务」两个类别
+
+- **现象**：`ops_log` 表的 kind 由 `core/ops-log.js` 定义为五类（auth / ws / ops / api / ext），而日志页「数据库」来源只映射并提供了 认证 / 连接 / 运维 三个筛选项 ⇒ `api`（VRChat REST 调用失败/超时，生产实测 138 条）与 `ext`（外部服务失败/降级）的行**没有中文类别**，模板回落到显示英文 `api`，顶部也没有对应筛选。
+- **修法**：`ui/src/views/LogsView.vue` 的 `KINDS` 增加「接口 / 外部服务」，`KIND_LABEL` 补齐五类，顶栏说明同步为「认证 / 连接 / 运维 / 接口 / 外部服务生命周期打点」；**后端无需改动** —— `get_ops_log` 与 `storage.getOpsLog` 本就按 `kind` 原样 `WHERE kind = $kind` 过滤。
+- **触发**：用户看到动态流一条「未知事件」（VRChat 推来一帧缺 `type` 的消息 ⇒ `ws-manager` 记为 `unknown`、载荷空对象）后追问，顺带核对日志页发现上述缺口。
+
+## 2026-10-12 设置页 · 动态状态新增模式选择
+
+- 设置页「动态状态」卡片新增 **模式**（整段覆盖 / 保留我写的正文、只在结尾加后缀）与 **分隔符** 两个控件；模板输入框在 suffix 模式下标注为「后缀文本模板」，并说明超长时先截正文保计数。
+- 后端：`POST /api/dashboard/dynamic-status` 透传 `mode` / `separator` 到 `dashboard.dynamicStatusSet`（校验：mode ∈ fixed|suffix）。
+- 现象对照：旧实现下使用者在 VRChat 里手输的状态会被整段覆盖 ⇒ 新模式的动机；详见 `docs/history/2026-10.md` 同日条目。

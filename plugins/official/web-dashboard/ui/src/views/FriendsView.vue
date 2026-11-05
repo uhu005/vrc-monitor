@@ -5,7 +5,7 @@ import { trustColor, avatarLabel, platformLabel, platformIcon, locLabelFull } fr
 import { useFriendGroups, friendDotStyle } from '../composables/useFriendGroups.js';
 
 // 分组/折叠/签名/状态点统一走公共 composable（C5，与右侧好友栏同源）
-const { collapsed, toggleGroup, isCollapsed, sameInstanceOf, sameWorldOf, groupByWorld, statusText, locText, avatarOf, groupIcon, nameFor } = useFriendGroups();
+const { collapsed, toggleGroup, isCollapsed, sameInstanceOf, sameWorldOf, groupByWorld, statusText, locText, avatarOf, groupIcon, nameFor, roomLabelOf } = useFriendGroups();
 
 const tabOptions = [
   { label: '全部', value: 'all' },
@@ -88,7 +88,7 @@ function offlineSince(f) {
     <template v-else>
       <!-- 同实例 -->
       <div v-if="grouped.same.length" class="fg">
-        <div class="fg-head accent" role="button" tabindex="0" title="点击折叠/展开" @click="toggleGroup('same')" @keydown.enter="toggleGroup('same')">
+        <div class="fg-head accent" title="点击折叠/展开" v-clickable="(e) => (toggleGroup('same'))" >
           <i class="pi pi-map-marker"></i>
           <span>同实例好友</span>
           <span v-if="locLabelFull(store.me.location)" class="fg-loc" @click.stop="openInstance(store.me.location)" :title="'查看房间信息'">{{ locLabelFull(store.me.location) }}</span>
@@ -96,7 +96,7 @@ function offlineSince(f) {
           <i class="pi fg-arrow" :class="isCollapsed('same') ? 'pi-chevron-down' : 'pi-chevron-up'"></i>
         </div>
         <div v-if="!isCollapsed('same')" class="fg-body">
-          <div v-for="f in grouped.same" :key="f.userId" class="friend-card" @click="openUser(f.userId)" role="button" tabindex="0" @keydown.enter="openUser(f.userId)">
+          <div v-for="f in grouped.same" :key="f.userId" class="friend-card" v-clickable="(e) => (openUser(f.userId))" >
             <Avatar :image="avatarOf(f)" shape="circle" :label="avatarLabel(avatarOf(f), f.displayName)" />
             <div class="fc-text">
               <b :style="{ color: trustColor(f.trustLevel) }">{{ nameFor(f) }}</b>
@@ -110,7 +110,7 @@ function offlineSince(f) {
 
       <!-- 同世界（同世界不同实例） -->
       <div v-if="grouped.sworld && grouped.sworld.length" class="fg">
-        <div class="fg-head" role="button" tabindex="0" title="同世界、不同实例的在线好友，点击折叠/展开" @click="toggleGroup('sworld')" @keydown.enter="toggleGroup('sworld')">
+        <div class="fg-head" title="同世界、不同实例的在线好友，点击折叠/展开" v-clickable="(e) => (toggleGroup('sworld'))" >
           <i class="pi pi-compass"></i>
           <span>同世界好友</span>
           <span v-if="locLabelFull(store.me.location)" class="fg-loc" @click.stop="openInstance(store.me.location)" :title="'查看我所在房间'">{{ locLabelFull(store.me.location) }}</span>
@@ -118,12 +118,12 @@ function offlineSince(f) {
           <i class="pi fg-arrow" :class="isCollapsed('sworld') ? 'pi-chevron-down' : 'pi-chevron-up'"></i>
         </div>
         <div v-if="!isCollapsed('sworld')" class="fg-body">
-          <div v-for="f in grouped.sworld" :key="f.userId" class="friend-card" @click="openUser(f.userId)" role="button" tabindex="0" @keydown.enter="openUser(f.userId)">
+          <div v-for="f in grouped.sworld" :key="f.userId" class="friend-card" v-clickable="(e) => (openUser(f.userId))" >
             <Avatar :image="avatarOf(f)" shape="circle" :label="avatarLabel(avatarOf(f), f.displayName)" />
             <div class="fc-text">
               <b :style="{ color: trustColor(f.trustLevel) }">{{ nameFor(f) }}</b>
               <small v-if="f.memo" class="fc-memo" :title="'备注：' + f.memo">{{ f.memo }}</small>
-              <small v-if="f.worldName" class="fc-loc" @click.stop="openWorld(f.worldId)" :title="'打开世界：' + f.worldName"><i class="pi pi-globe"></i> {{ f.worldName }}</small>
+              <small v-if="roomLabelOf(f)" class="fc-loc" @click.stop="openInstance(f.location)" :title="'查看房间信息（同一世界下的不同房间会分别标注）'"><i class="pi pi-map-marker"></i> {{ roomLabelOf(f) }}</small>
               <small><span class="fc-dot" :style="friendDotStyle(f)"></span>{{ statusText(f) }}<span v-if="locText(f)"> · {{ locText(f) }}</span><i v-if="platformIcon(f.platform)" class="pi fc-plat" :class="platformIcon(f.platform)" :title="platformLabel(f.platform)"></i><template v-if="onlineSince(f)"> · {{ onlineSince(f) }}</template></small>
             </div>
           </div>
@@ -131,21 +131,22 @@ function offlineSince(f) {
       </div>
 
       <!-- 世界分组 -->
-      <div v-for="g in grouped.groups" :key="g.label" class="fg">
-        <div class="fg-head" role="button" tabindex="0" title="点击折叠/展开" @click="toggleGroup('w:' + (g.worldId || g.label))" @keydown.enter="toggleGroup('w:' + (g.worldId || g.label))">
+      <div v-for="(g, gi) in grouped.groups" :key="(g.worldId || g.label) + '#' + gi" class="fg">
+        <div class="fg-head" title="点击折叠/展开" v-clickable="(e) => (toggleGroup('w:' + (g.worldId || g.label)))" >
           <img v-if="groupIcon(g)" :src="groupIcon(g)" class="fg-thumb" alt="" loading="lazy" />
           <span>{{ g.label }}</span>
-          <span v-if="g.loc" class="fg-loc" @click.stop="openInstance(g.list[0].location)" :title="'查看房间信息'">{{ g.loc }}</span>
+          <span v-if="g.loc && !g.mixedRooms" class="fg-loc" @click.stop="openInstance(g.list[0].location)" :title="'查看房间信息'">{{ g.loc }}</span>
+          <span v-if="g.mixedRooms" class="fg-mixed" :title="'该世界下有多个房间，成员分别在不同房间'">（{{ g.roomCount }} 个房间）</span>
           <span class="fg-count">{{ g.list.length }}</span>
           <i class="pi fg-arrow" :class="isCollapsed('w:' + (g.worldId || g.label)) ? 'pi-chevron-down' : 'pi-chevron-up'"></i>
         </div>
         <div v-if="!isCollapsed('w:' + (g.worldId || g.label))" class="fg-body">
-          <div v-for="f in g.list" :key="f.userId" class="friend-card" @click="openUser(f.userId)" role="button" tabindex="0" @keydown.enter="openUser(f.userId)">
+          <div v-for="f in g.list" :key="f.userId" class="friend-card" v-clickable="(e) => (openUser(f.userId))" >
             <Avatar :image="avatarOf(f)" shape="circle" :label="avatarLabel(avatarOf(f), f.displayName)" />
             <div class="fc-text">
               <b :style="{ color: trustColor(f.trustLevel) }">{{ nameFor(f) }}</b>
               <small v-if="f.memo" class="fc-memo" :title="'备注：' + f.memo">{{ f.memo }}</small>
-              <small v-if="f.worldName" class="fc-loc" @click.stop="openWorld(f.worldId)" :title="'打开世界：' + f.worldName"><i class="pi pi-globe"></i> {{ f.worldName }}</small>
+              <small v-if="g.mixedRooms && roomLabelOf(f)" class="fc-loc" @click.stop="openInstance(f.location)" :title="'查看房间信息（同一世界下的不同房间会分别标注）'"><i class="pi pi-map-marker"></i> {{ roomLabelOf(f) }}</small>
               <small><span class="fc-dot" :style="friendDotStyle(f)"></span>{{ statusText(f) }}<i v-if="platformIcon(f.platform)" class="pi fc-plat" :class="platformIcon(f.platform)" :title="platformLabel(f.platform)"></i><template v-if="onlineSince(f)"> · {{ onlineSince(f) }}</template></small>
             </div>
           </div>
@@ -159,7 +160,7 @@ function offlineSince(f) {
           <span class="fg-count">{{ grouped.offline.length }}</span>
         </div>
         <div class="fg-body">
-          <div v-for="f in grouped.offline" :key="f.userId" class="friend-card" @click="openUser(f.userId)" role="button" tabindex="0" @keydown.enter="openUser(f.userId)">
+          <div v-for="f in grouped.offline" :key="f.userId" class="friend-card" v-clickable="(e) => (openUser(f.userId))" >
             <Avatar :image="avatarOf(f)" shape="circle" :label="avatarLabel(avatarOf(f), f.displayName)" />
             <div class="fc-text">
               <b :style="{ color: trustColor(f.trustLevel) }">{{ nameFor(f) }}</b>
@@ -218,6 +219,11 @@ function offlineSince(f) {
 .fg-head.accent { color: var(--accent); border-left-color: var(--accent); }
 .fg-arrow { flex: none; font-size: 9px; opacity: 0.7; margin-left: 2px; }
 .fg-count { margin-left: auto; flex: none; font-size: 10.5px; color: var(--text-dim); background: var(--surface-3); padding: 1px 7px; border-radius: 10px; }
+.fg-mixed {
+  font-size: 11px;
+  color: var(--text-dim, #8a93a3);
+  white-space: nowrap;
+}
 .fg-loc {
   font-size: 10.5px;
   color: var(--text-dim);

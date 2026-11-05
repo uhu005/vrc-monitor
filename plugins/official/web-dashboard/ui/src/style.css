@@ -24,6 +24,28 @@
   --footer-h: 30px;
 }
 
+/* ── 浅色主题：html 无 .app-dark 时生效（PrimeVue 用 darkModeSelector='.app-dark' 对齐）──
+   语义与深色一一对应（surface 序号越小越靠近背景），只换色值不换布局。 */
+html:not(.app-dark) {
+  --bg: #f7f7f8;
+  --surface: #ffffff;
+  --surface-2: #f2f2f4;
+  --surface-3: #e8e8ec;
+  --border: #dcdce1;
+  --border-soft: #ebebef;
+  --text: #16161a;
+  --text-dim: #61616b;
+  --accent: #7c3aed;
+  --accent-2: #0891b2;
+  --ok: #15803d;
+  --warn: #ea580c;
+  --info: #2563eb;
+  --danger: #dc2626;
+  --star: #b8860b;   /* 浅底上 #ffca28 只有 1.53:1（几乎看不见）⇒ 提到 3.25:1，仍是金色观感 */
+}
+html:not(.app-dark) ::-webkit-scrollbar-thumb { background: #c9c9d0; }
+html:not(.app-dark) ::-webkit-scrollbar-thumb:hover { background: #b0b0b9; }
+html:not(.app-dark) * { scrollbar-color: #c9c9d0 transparent; }
 * { box-sizing: border-box; }
 html, body, #app { height: 100%; margin: 0; }
 /* 修复 iOS：软键盘弹出时 100dvh 固定布局被顶飞（fixed tabbar/header 消失或悬空）。
@@ -205,8 +227,26 @@ body {
 /* 滚动区域圆角统一 */
 .rounded { border-radius: var(--radius); }
 
+/* 键盘焦点可见性（2026-11-02）：51 个可聚焦元素（tabindex="0" 的 span/div/img）里
+   有 10 个文件此前完全没有焦点指示 —— 键盘用户看不见焦点落在哪，等于不可用。
+   这些元素分属五花八门的业务类（world-link / friend-card / mini-row / inst-member …），
+   逐个类补会漏，故用属性选择器统一兜住：只作用于**通过键盘到达**的元素，鼠标点击不出现描边。
+   已有的 per-view focus-visible 规则优先级更高（同为 0,1,0 但后定义），不受影响。 */
+[tabindex="0"]:focus-visible, [tabindex]:not([tabindex="-1"]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+/* 弹窗/浮层内同理（.p-dialog 等自带 outline: none，这里补回来） */
+.p-dialog [tabindex="0"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
 /* PrimeVue 暗色微调 */
 .p-button:focus-visible, .p-drawer, .p-inputtext:focus { outline-color: var(--accent); }
+
+/* icon-only 按钮触控热区修复：aura 主题的 icon-only padding 变量未定义，
+   导致 .p-button-icon-only 左右 padding 归零（实测按钮宽 2px，图标溢出但热区几乎为零，
+   移动端点菜单/操作经常无响应）。补标准方形热区 40x40（图标 16 + padding 12×2）。 */
+.p-button.p-button-icon-only { padding: 0.5rem; min-width: 2.5rem; min-height: 2.5rem; }
 
 /* B5 弹窗内容超高时在视口内滚动（移动端尤其需要，100dvh 适配地址栏伸缩） */
 .p-dialog .p-dialog-content { max-height: calc(100dvh - 130px); overflow-y: auto; }
@@ -217,8 +257,9 @@ body {
   .chip { height: 34px; padding: 4px 14px; font-size: 12px; }
   .vt-actions .chip { height: 34px; padding: 4px 12px; font-size: 12px; }
   .vt-actions .chip i { font-size: 12px; }
-  /* 页脚多条目（AUTH/WS/SSE/DB/运行时长/安全模式）窄屏换行，避免 overflow 裁剪 */
-  .app-footer { flex-wrap: wrap; height: auto; min-height: var(--footer-h); padding-top: 6px; padding-bottom: calc(6px + env(safe-area-inset-bottom, 0px)); gap: 4px 14px; margin-bottom: calc(56px + env(safe-area-inset-bottom, 0px)); }
+  /* 页脚多条目（AUTH/WS/SSE/DB/运行时长/安全模式）窄屏换行，避免 overflow 裁剪；
+     margin-bottom 去除——tabbar 改流内后 footer 直接贴 tabbar（不再为 fixed 浮层预留空隙） */
+  .app-footer { flex-wrap: wrap; height: auto; min-height: var(--footer-h); padding-top: 6px; padding-bottom: 6px; gap: 4px 14px; }
   :root { --rail-w: 0px; --rightbar-w: 0px; }
   /* C3：顶部 safe-area（刘海屏/挖孔屏状态栏不遮挡），header 内容随之居中下沉 */
   .app-header {
@@ -227,14 +268,15 @@ body {
   }
   .nav-rail { display: none; }
   .rightbar { display: none; }
-  .main-viewport { padding: 10px 12px 70px; }
+  .main-viewport { padding: 10px 12px 12px; }
   .brand-sub { display: none; }
   /* B6：手机上隐藏右侧副标语，避免底部状态栏截断 */
   .footer-brand { display: none; }
-  /* 移动端底部导航 */
+  /* 移动端底部导航：flex 流内（app-shell 100dvh 的最后一个子项）而非 fixed——
+     Android Chrome 地址栏显示时 fixed bottom:0 元素被压在地址栏后面（layout viewport
+     基准为收起态最大高度），流内则恒贴可见视口底且与 footer 自然衔接 */
   .mobile-tabbar {
-    position: fixed;
-    left: 0; right: 0; bottom: 0;
+    flex: none;
     height: 56px;
     background: color-mix(in srgb, var(--surface) 92%, transparent);
     backdrop-filter: blur(12px);
@@ -409,4 +451,16 @@ button { font-family: inherit; }
 /* 移动端全局 chips 34px——置于文件末尾确保覆盖主定义（同 specificity 后者胜） */
 @media (max-width: 899px) {
   .chip { height: 34px; padding: 4px 14px; font-size: 12px; }
+}
+
+/* 2026-09-22 手机端横向溢出修复（用户截图：页面能左右滑、左边内容被切 ✗）
+   实测 390px 视口下文档宽 429px ⇒ 罪魁是顶栏右侧图标组 .header-right（right=429 分毫不差 ✓）
+   注：.ft-chips 的 right=610 是"滚动区内的正常位置"，不是溢出源（它有 min-width:0 + overflow-x:auto ✓） */
+@media (max-width: 899px) {
+  .header-right { gap: 2px; }
+  .header-right .p-button { width: 34px; height: 34px; min-width: 34px; padding: 0; }
+  /* 2026-09-22 第二轮：用户要保留「好友列表」图标 ⇒ 不再隐藏，改为收小尺寸 + 让标题可缩 ✓ */
+  /* （评审 💡1：原先那条 :has(.pi-users) { display: inline-flex } 是死规则 —— 没有任何规则隐藏过该按钮 ⇒ 已删，避免后人误以为此处有显隐逻辑 ✓）*/
+  .header-left, .app-header > :first-child { min-width: 0; }
+  .app-header .brand, .app-header .app-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 }

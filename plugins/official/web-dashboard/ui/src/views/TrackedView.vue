@@ -1,10 +1,10 @@
 <script setup>
-import { ref, onMounted, computed } from 'vue';
+import { ref, onMounted, computed, onUnmounted } from 'vue';
 import { get, post } from '../api.js';
-import { time, date, dateTime, avatarLabel , reltime } from '../utils.js';
+import { time, date, dateTime, avatarLabel , reltime, statusLabels, trustColor, platformIcon, platformLabel } from '../utils.js';
+import { statusColor } from '../composables/useFriendGroups.js';
 import { openUser } from '../store.js';
 import { toast } from '../toast.js';
-import { confirm } from '../confirm.js';
 
 // 非好友追踪（VRCX-Luo 对齐）：历史非好友 + 手动添加追踪的用户，
 // 服务端每小时拉取资料/头像并记录 bio/status 变化（events 表 friend-update + source=poll）。
@@ -24,6 +24,7 @@ const addResults = ref(null);
 const addBusy = ref(false);
 let addSeq = 0;
 let addTimer = null;
+let refreshTimer = null;   // 触发刷新后的延迟重载句柄：卸载必须清
 async function searchUsers() {
   const query = addQuery.value.trim();
   const mySeq = ++addSeq;
@@ -47,10 +48,12 @@ function isTracked(userId) {
   return (items.value || []).some((x) => x.userId === userId);
 }
 async function addTracked(user) {
-  if (addBusy.value || !user.userId) return;
+  // 搜索接口统一返回 id 字段（dashboard/search 各类型同形），兼容旧 userId 字段
+  const uid = user.id || user.userId;
+  if (addBusy.value || !uid) return;
   addBusy.value = true;
   try {
-    const r = await post('/api/dashboard/tracked', { userId: user.userId, displayName: user.name });
+    const r = await post('/api/dashboard/tracked', { userId: uid, displayName: user.name });
     if (r && r.error) throw new Error(r.error);
     toast(r.added ? `已添加追踪「${user.name}」，正在拉取资料…` : `「${user.name}」已在追踪列表中`, r.added ? 'success' : 'info');
     addOpen.value = false;
@@ -86,18 +89,8 @@ async function addDirectId() {
   }
 }
 
-// ── 移除追踪 ──
-async function removeTracked(x) {
-    if (!await confirm({ message: `确认移除对「${x.displayName || x.userId}」的追踪？其变化历史保留，但不再自动刷新。`, header: '移除追踪', acceptLabel: '移除' })) return;
-  try {
-    const r = await post('/api/dashboard/tracked/remove', { userId: x.userId });
-    if (r && r.error) throw new Error(r.error);
-    toast('已移除追踪', 'success');
-    await load();
-  } catch (e) {
-    toast('移除失败：' + (e.message || e), 'error');
-  }
-}
+
+onUnmounted(() => { clearTimeout(addTimer); clearTimeout(refreshTimer); });
 
 // ── 刷新 ──
 async function refreshNow() {
@@ -107,7 +100,7 @@ async function refreshNow() {
     const r = await post('/api/dashboard/tracked/refresh');
     if (r && r.ok) {
       toast('已触发资料刷新（限流队列中，稍后自动更新列表）', 'info');
-      setTimeout(async () => { await load(); refreshing.value = false; }, 6000);
+      refreshTimer = setTimeout(async () => { await load(); refreshing.value = false; }, 6000);
     } else {
       toast((r && r.error) || '刷新失败', 'error');
       refreshing.value = false;
@@ -132,11 +125,10 @@ async function load() {
   }
 }
 
-// 排序：在线优先（active/joinme/askme/busy），其次有变化的，最后按最近刷新倒序
+// 排序：在线优先（按 location 判定在游戏中），其次有变化的，最后按最近刷新倒序
 function sortTracked(list) {
   const rank = (x) => {
-    const s = String(x.status || '').toLowerCase();
-    const online = ['active', 'join me', 'ask me', 'busy'].some((k) => s.includes(k.split(' ')[0]));
+    const online = isOnline(x.location);
     return (online ? 0 : 1) * 100 + (x.lastRefreshAt ? 0 : 1) * 10;
   };
   return [...list].sort((a, b) => rank(a) - rank(b) || String(b.lastRefreshAt || '').localeCompare(String(a.lastRefreshAt || '')));
@@ -153,6 +145,8 @@ const filtered = computed(() => {
 
 const trackedCount = computed(() => (items.value || []).length);
 
+const memoOf = (x) => String(x && x.memo || '').trim();
+
 // 变化时间线类型筛选（全部/头像/简介/状态）
 const changeFilter = ref('all');
 const CHANGE_TYPES = [
@@ -160,6 +154,7 @@ const CHANGE_TYPES = [
   { v: 'avatar', l: '头像' },
   { v: 'bio', l: '简介' },
   { v: 'status', l: '状态' },
+  { v: 'location', l: '位置' },
 ];
 const filteredChanges = (userId) => {
   const cs = changesMap.value[userId] || [];
@@ -181,15 +176,21 @@ const lastChangeAt = (x) => {
   return x.lastChangeAt || '';
 };
 
-const CHANGE_LABEL = { bio: '简介变更', status: '状态变更', avatar: '头像更新', user_icon: '头像图标更新', pronouns: '代词更新', displayName: '改名' };
-const statusText = (s) => ({ active: '在线', 'join me': '加入我', 'ask me': '问我', busy: '忙碌', offline: '离线' }[s] || s || '—');
+const CHANGE_LABEL = { bio: '简介变更', status: '状态变更', avatar: '头像更新', user_icon: '头像图标更新', pronouns: '代词更新', trust_level: '等级变更', displayName: '改名', location: '位置/上下线' };
+// 位置可读化：offline=离线 / offline:offline=网页在线 / traveling=传送中 / wrld_xxx=世界（世界名在 c.worldName 里附加）
+const locLabel = (l) => { const v = String(l || ''); if (!v || v === 'offline') return '离线'; if (v === 'offline:offline') return '网页在线'; if (v === 'traveling') return '传送中'; return v; };
+const statusText = (s) => statusLabels[s] || s || '—';
 // 状态圆点颜色（对齐好友页视觉）：在线系绿色，离线灰色
-function statusDotStyle(s) {
-  const v = String(s || '').toLowerCase();
-  const online = ['active', 'join me', 'ask me', 'busy'].some((k) => v.includes(k.split(' ')[0]));
-  return { background: online ? '#52c41a' : v.includes('offline') ? 'var(--border-strong)' : 'var(--text-dim)' };
+function statusDotStyle(loc) {
+  // 2026-09-22 用户报「状态那行被缩进、圆点看不见」✗：原来用的 var(--border-strong) **项目里没有这个令牌** ✗
+  // ⇒ 背景无效 ⇒ 圆点透明但照样占 8px+间隙 ⇒ 文字看着被缩进 ✓。改用项目真实令牌（与好友页同色系 ✓）。
+  return { background: isOnline(loc) ? 'var(--ok)' : 'var(--text-dim)' };
 }
-const isOnline = (s) => !['offline', ''].includes(String(s || ''));
+// 真实在线判定：只看 location（status 是用户偏好，离线保留）。offline=真离线、offline:offline=网页在线不在世界、traveling=转场，均不算在游戏中。
+const isOnline = (loc) => {
+  const v = String(loc || '').trim().toLowerCase();
+  return v !== '' && !['offline', 'offline:offline', 'traveling'].includes(v);
+};
 
 function toggle(userId) {
   if (expanded.value === userId) {
@@ -228,7 +229,7 @@ onMounted(load);
         <InputText v-model="q" placeholder="搜索昵称 / ID…" class="tk-search" aria-label="搜索追踪用户" />
         <Button size="small" :icon="addOpen ? 'pi pi-times' : 'pi pi-user-plus'" :label="addOpen ? '收起' : '添加追踪'" :severity="addOpen ? 'secondary' : undefined" @click="addOpen = !addOpen" />
         <Button size="small" icon="pi pi-sync" :loading="refreshing" label="立即刷新" title="手动触发全部追踪用户资料刷新（限流队列执行）" @click="refreshNow" />
-        <Button size="small" text icon="pi pi-refresh" title="刷新列表" @click="load" />
+        <Button size="small" text icon="pi pi-refresh" title="刷新列表" @click="load" aria-label="刷新列表" />
       </div>
     </div>
 
@@ -269,33 +270,33 @@ onMounted(load);
     </div>
     <div v-else class="tk-list">
       <div v-for="x in filtered" :key="x.userId" class="tk-item">
-        <button type="button" class="tk-row" :class="{ open: expanded === x.userId }" @click="toggle(x.userId)">
-          <Avatar :image="x.avatarUrl || ''" :label="avatarLabel(x.avatarUrl, x.displayName)" shape="circle" size="large" />
-          <div class="tk-info">
-            <b class="tk-name">
-              <span v-if="x.status" class="tk-dot" :style="statusDotStyle(x.status)" :title="'当前状态：' + statusText(x.status)"></span>
-              {{ x.displayName || x.userId }}
-            </b>
-            <small class="tk-sub">
-              <span class="tk-statusline">
-                <span class="mono tk-uid">{{ x.userId }}</span>
-                <span v-if="x.status" class="tk-status" :class="{ on: isOnline(x.status) }">{{ statusText(x.status) }}</span>
-              </span>
-              <span v-if="lastChangeAt(x)" class="tk-stat">最近变化 {{ reltime(lastChangeAt(x)) }}</span>
-              <span v-if="x.lastRefreshAt" class="tk-stat tk-stat-dim">上次检测 {{ fmtRefresh(x.lastRefreshAt) }}</span>
-              <span v-else class="tk-stat tk-stat-dim">尚未检测</span>
-            </small>
+        <!-- 2026-09-22：由 button 改为 div[role=button] —— 用户要求「资料/移除」放到本行末尾，而 button 内不能嵌套 button ✗（动态流页同做法）-->
+        <!-- 2026-09-22 用户：「先把这一页按好友页的样式统一」✓ —— 行结构与样式对齐 FriendsView 的 .friend-card：
+             Avatar + .fc-text（名字 → 备注 → uid/状态 → 最近变化·上次检测），动作区右推在本行末尾 ✓ -->
+        <!-- 2026-09-22 用户：把好友页的整个样式抄过来 ✓；多出来的信息与按钮**先不加** ✓（由用户决定怎么加）
+             因此本卡＝好友页 .friend-card 的等价物：头像 + 名字 + 备注 + 状态；**展开入口保留**（2026-10-16 审查 🔴1 恢复），
+             资料/移除入口迁到 UserDialog（卡片内不再放这两个按钮）✓ -->
+        <div class="friend-card" v-clickable="(e) => (openUser(x.userId))" >
+          <Avatar :image="x.avatarUrl || ''" :label="avatarLabel(x.avatarUrl, x.displayName)" shape="circle" />
+          <div class="fc-text">
+            <b :style="{ color: trustColor(x.trustLevel) }" :title="x.trustLevel ? ('信任等级：' + x.trustLevel) : ''">{{ x.displayName || x.userId }}</b><!-- 2026-09-22：非好友现在也有信任等级了（来自 tags ✓）⇒ 名字配色自动生效 ✓ + 悬停可看等级名 ✓（与好友页口径一致 ✓）-->
+            <small><span class="fc-dot" :style="statusDotStyle(x.location)"></span>{{ x.statusDescription || statusText(x.status) }}<i v-if="platformIcon(x.platform)" class="pi fc-plat" :class="platformIcon(x.platform)" :title="platformLabel(x.platform)"></i><!-- 2026-09-22 用户报「平台图标是乱码」✗：漏了 pi（图标字体基础类）与 fc-plat（尺寸样式）⇒ 渲染成豆腐块 ✓；现与好友页写法完全一致 ✓ --></small>
+            <small v-if="memoOf(x)" class="fc-memo" :title="memoOf(x)">{{ memoOf(x) }}</small>   <!-- 2026-09-22 用户：备注行放到在线行下面 ✓ -->
+<small>
+                          <span v-if="lastChangeAt(x)">变化 {{ reltime(lastChangeAt(x)) }}</span><!-- 2026-09-22 用户：卡片一行放不下「上次资料变化」⇒ 用短的「变化」✓（弹窗空间够，那边保留全称 ✓） -->
+                          <span v-if="lastChangeAt(x) && x.lastRefreshAt">·</span>
+                          <span v-if="x.lastRefreshAt">上次检测 {{ fmtRefresh(x.lastRefreshAt) }}</span>
+                          <span v-if="!lastChangeAt(x) && !x.lastRefreshAt">暂无记录</span>
+                        </small>
+            
           </div>
-          <span v-if="lastChangeAt(x)" class="tk-dot" title="有资料变化"></span>
-          <Button size="small" text rounded :icon="expanded === x.userId ? 'pi pi-chevron-up' : 'pi pi-chevron-down'"
-            :aria-label="expanded === x.userId ? '收起变化历史' : '展开变化历史'" @click.stop="toggle(x.userId)" />
-        </button>
-
-        <div class="tk-actions" @click.stop>
-          <Button size="small" text icon="pi pi-user" label="资料" title="打开资料" :aria-label="'打开 ' + (x.displayName || x.userId) + ' 的资料'" @click="openUser(x.userId)" />
-          <Button size="small" text severity="danger" icon="pi pi-user-minus" label="移除" title="移除追踪" :aria-label="'移除追踪 ' + (x.displayName || x.userId)" @click="removeTracked(x)" />
-        </div>
-
+                  <!-- 2026-10-16（审查 🔴1）：恢复展开入口 —— 卡片点击已改为「打开资料」，若不给展开留入口，`expanded` 永不置位 ⇒ 变化时间线与类型筛选（以及 /api/dashboard/tracked-changes）整体不可达 ✗ -->
+          <Button class="tk-expand" size="small" text rounded
+            :icon="expanded === x.userId ? 'pi pi-chevron-up' : 'pi pi-chevron-down'"
+            :title="expanded === x.userId ? '收起变化历史' : '展开变化历史'"
+            :aria-label="expanded === x.userId ? '收起变化历史' : '展开变化历史'"
+            @click.stop="toggle(x.userId)" />
+</div>
         <!-- 展开：变化时间线 -->
         <div v-if="expanded === x.userId" class="tk-detail">
           <div v-if="loadingChanges === x.userId" class="loading-mini"><ProgressSpinner style="width:22px;height:22px" strokeWidth="4" /></div>
@@ -334,8 +335,20 @@ onMounted(load);
                     <span class="tc-new" :title="c.bio">新：{{ c.bio || '（已清空）' }}</span>
                   </template>
                   <template v-else-if="c.type === 'status'">
-                    <span class="tc-old">旧：{{ statusText(c.previousStatus) }}{{ c.previousStatusDescription ? ' · ' + c.previousStatusDescription : '' }}</span>
-                    <span class="tc-new">新：{{ statusText(c.status) }}{{ c.statusDescription ? ' · ' + c.statusDescription : '' }}</span>
+                    <!-- 对齐动态页状态灯样式：[旧灯]→[新灯] 新签名（种类未变时只显新灯；旧种类/旧签名在灯 title） -->
+                    <span class="tc-statusrow">
+                      <template v-if="c.previousStatus && c.previousStatus !== c.status">
+                        <span class="tc-slamp" :style="{ background: statusColor(c.previousStatus) }" :title="'旧：' + statusText(c.previousStatus) + (c.previousStatusDescription ? ' · ' + c.previousStatusDescription : '')"></span>
+                        <span class="tc-sarr">→</span>
+                      </template>
+                      <span class="tc-slamp" :style="{ background: statusColor(c.status) }" :title="'新：' + statusText(c.status)"></span>
+                      <span v-if="c.statusDescription" class="tc-sdesc" :title="c.statusDescription">{{ c.statusDescription }}</span>
+                      <span v-else-if="c.status" class="tc-sdesc dim">{{ statusText(c.status) }}</span>
+                    </span>
+                  </template>
+                  <template v-else-if="c.type === 'location'">
+                    <span class="tc-old">旧：{{ locLabel(c.previousLocation) }}</span>
+                    <span class="tc-new">新：{{ locLabel(c.location) }}{{ c.worldName ? '（' + c.worldName + '）' : '' }}</span>
                   </template>
                   <span v-else class="tc-new">{{ JSON.stringify(c).slice(0, 120) }}</span>
                 </div>
@@ -347,6 +360,8 @@ onMounted(load);
         </div>
       </div>
     </div>
+
+
 </template>
 
 <style scoped>
@@ -372,25 +387,7 @@ onMounted(load);
 .ta-name { font-size: 13px; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ta-sub { font-size: 11px; color: var(--text-dim); display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-.tk-list { display: flex; flex-direction: column; gap: 6px; }
 .tk-item { display: flex; flex-direction: column; gap: 3px; }
-.tk-row { display: flex; align-items: center; gap: 10px; padding: 8px; border-radius: 10px; background: var(--surface); border: 1px solid var(--border-soft); cursor: pointer; text-align: left; width: 100%; color: inherit; font-family: inherit; transition: border-color 0.12s; }
-.tk-row:hover, .tk-row.open { border-color: var(--accent); }
-.tk-row:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.tk-info { min-width: 0; flex: 1; }
-.tk-name { font-size: 13px; display: flex; align-items: center; gap: 6px; overflow: hidden; }
-.tk-name { white-space: nowrap; text-overflow: ellipsis; }
-.tk-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; display: inline-block; }
-.tk-statusline { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.tk-status { font-size: 10px; color: var(--text-dim); border: 1px solid var(--border); border-radius: 999px; padding: 0 7px; line-height: 16px; flex: none; }
-.tk-status.on { color: #52c41a; border-color: rgba(82, 196, 26, 0.4); }
-.tk-sub { font-size: 11px; color: var(--text-dim); display: flex; flex-direction: column; gap: 1px; overflow: hidden; }
-.tk-uid { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
-.tk-stat { color: var(--accent); display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tk-stat { color: var(--accent); flex: none; }
-.tk-stat-dim { color: var(--text-dim); }
-.tk-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; }
-.tk-actions { display: flex; gap: 2px; margin-left: 42px; margin-top: 1px; }
 
 .tk-detail { background: var(--surface-2); border: 1px solid var(--border-soft); border-radius: 10px; padding: 10px 12px; margin-left: 34px; }
 .tk-empty { font-size: 12px; color: var(--text-dim); padding: 6px 2px; }
@@ -403,20 +400,102 @@ onMounted(load);
 .tc-date { font-size: 9px; color: var(--text-dim); }
 .tc-card { min-width: 0; flex: 1; background: var(--surface); border: 1px solid var(--border-soft); border-radius: 8px; padding: 7px 9px; }
 .tc-body { margin-top: 5px; display: flex; flex-direction: column; gap: 3px; }
+/* 状态变更行：对齐动态页（FeedView）状态灯视觉，横排 [旧灯]→[新灯] 签名 */
 .tc-avatars { display: flex; align-items: center; gap: 8px; }
 .tc-avpair { display: flex; flex-direction: column; align-items: center; gap: 2px; }
 .tc-av { width: 42px; height: 42px; border-radius: 8px; object-fit: cover; }
 .tc-avnone { display: flex; align-items: center; justify-content: center; background: var(--surface-2); font-size: 10px; color: var(--text-dim); }
 .tc-avlabel { font-size: 10px; color: var(--text-dim); }
 .tc-avarrow { color: var(--text-dim); font-size: 11px; }
-.tc-old { color: var(--text-dim); text-decoration: line-through; opacity: 0.75; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tc-new { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .loading-mini { display: flex; justify-content: center; padding: 12px; }
 @media (max-width: 899px) {
   .tk-search { width: 100%; order: 2; }
   .tk-tools { order: 3; }
   .tk-detail { margin-left: 0; }
+  /* 2026-10-16 审查 ⚠️1：这条来自 main（原第 495 行），本轮重构时漏还原 ⇒ 窄屏下长 bio/状态旧值
+     从「换行」退化成「单行省略号截断」= 信息可见性下降，已还原 ✓ */
   .tc-old, .tc-new { white-space: normal; }
 }
+
+/* ── tk-polish-2026-09-22（用户："非好友追踪这个界面是不是太丑了"）────────────────
+   只加样式、不动结构：修「筛选 chip 被挤成孤字」「详情内容贴左留白」「时间列不对齐」「头像对尺寸不一」。
+   全部使用项目令牌（--surface/--border-soft/--text/--text-dim）✓ 不引入新颜色 ✓ */
+/* 1) 筛选 chip 行：允许换行、均匀间距，避免「头像」被拆成孤字 */
+.tc-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.tc-chip { white-space: nowrap; }
+.tk-expand { flex: none; margin-left: auto; }
+/* 2026-10-16（审查 3）：.tk-expand 就在 Button 根元素上 ⇒ 后代选择器匹配不到自身 ✓ */
+.tk-expand.p-button { padding: 2px 6px; }
+/* 2) 时间列：等宽数字 + 稍宽，时间与内容对齐 */
+.tc-rail { width: 86px; font-variant-numeric: tabular-nums; }
+.tc-rail b, .tc-rail strong { font-size: 12.5px; color: var(--text); }
+.tc-date { font-size: 10px; color: var(--text-dim); }
+/* 3) 内容列：占满剩余宽度、正文用主文本色（旧值仍为 dim + 删除线）*/
+.tc-body { flex: 1; min-width: 0; color: var(--text); }
+.tc-body > * { min-width: 0; }
+/* 4) 头像对：统一 24px 圆角，与全站 .av-thumb 一致 */
+.tc-av { width: 24px; height: 24px; border-radius: 6px; object-fit: cover; border: 1px solid var(--border-soft); }
+.tc-avnone { display: inline-flex; align-items: center; justify-content: center; font-size: 10px; color: var(--text-dim); }
+.tc-avlabel { font-size: 9px; color: var(--text-dim); }
+/* 5) 卡片：与其它列表一致的分隔与悬停反馈 */
+.tc-card { border: 1px solid var(--border-soft); border-radius: var(--radius); }
+.tc-card:hover { border-color: var(--border); }
+
+/* ── tk-grid-2026-09-22（用户：「PC 端你不觉得一条太长了吗？」）────────────────
+   宽屏改为多列卡片网格：一屏 2 列（≥1200px）/ 3 列（≥1700px），窄屏保持 1 列。
+   展开的详情用 :has() 自动占满整行（Chromium 支持 ✓），避免详情被挤在 570px 里。*/
+/* 2026-09-22 用户：与好友页**同一套网格**（.fg-body 同款 auto-fill minmax(240px,1fr) ⇒ 宽屏约 5 个/行 ✓）*/
+/* 2026-09-22 用户：有备注和没备注的块高度不一样 ✗ => 去掉我自加的 align-items:start，
+   与好友页 .fg-body 完全一致（默认 stretch = 同一行卡片自动等高 ✓）*/
+.tk-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 6px; }
+/* 2026-10-16（审查 2）：原写法引用已消失的 .tk-row.open ⇒ 永不命中、展开详情被挤在单列；改为按 .tk-detail 命中 ✓ */
+.tk-item:has(.tk-detail) { grid-column: 1 / -1; }
+
+/* ── tk-sub-oneline-2026-09-22（用户：「最近变化和上次检测可以放到一行吧？」）───────────
+   元信息强制单行、超出省略；动作按钮随行尾对齐 ✓ */
+
+/* ── friend-page-2026-09-22（用户：「先按好友页的样式统一」）──────────────────
+   以下 6 条与 FriendsView.vue:242-258 **完全一致**（同变量同数值 ✓），仅作用域在本组件 ✓ */
+.friend-card { display: flex; align-items: center; gap: 10px; padding: 8px 10px; background: var(--surface); border: 1px solid var(--border-soft); border-radius: var(--radius); cursor: pointer; transition: background 0.12s, border-color 0.12s; }
+.friend-card:hover { background: var(--surface-2); border-color: var(--border); }
+.fc-text { min-width: 0; flex: 1; }
+.fc-text b { display: block; font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fc-text small { color: var(--text-dim); font-size: 11px; display: flex; align-items: center; gap: 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fc-memo { display: block; font-size: 10px; color: var(--accent); opacity: 0.85; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; cursor: pointer; }
+/* 增量：动作区右推（好友页卡内没有动作按钮 ✓）*/
+/* ==== 以下样式整块抄自 FriendsView（用户 2026-09-22 要求「整个样式都抄过来」） ==== */
+
+/* 搜索框与右侧好友栏搜索统一 32px；几何全写死不随字体加载伸缩 */
+.fc-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; transform: translateY(1px); }
+.fc-plat {
+  flex: none;
+  font-size: 10px;
+  color: var(--text-dim);
+  line-height: 1;
+  cursor: help;
+}
+.fc-plat:hover { color: var(--text); }
+@media (max-width: 899px) {
+  .friend-card { padding: 10px 11px; }
+  .fc-text b { font-size: 13px; }
+  .fc-text small { font-size: 11.5px; }
+}
+
+
+/* 2026-09-22 用户：有备注和没备注的块高度不一样 ✗
+   网格项 .tk-item 会被 stretch 拉齐 ✓，但项内的卡片不跟着撑满 ✗ ⇒ 补这几条：
+   让 .tk-item 变成等高列、卡片 height:100% 填满 ✓（等价于"同排卡片一样高"✓） */
+.tk-list > .tk-item { display: flex; flex-direction: column; }
+.tk-list > .tk-item > .friend-card { height: 100%; }
+
+
+/* 2026-10-16（审查 1 修正）：机械清理时误删了这些**仍被模板引用**的定义（.tc-slamp / .tc-sdesc / .tc-old / .tc-new / .tc-statusrow / .tc-sarr）⇒ 从 main 原样还原。教训：「已用类」的提取必须覆盖动态来源 ✓ */
+.tc-slamp { width: 12px; height: 12px; border-radius: 50%; display: inline-block; flex: none; box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 12%, transparent); border: 1.5px solid rgba(0,0,0,0.35); }
+.tc-sdesc { color: var(--text); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tc-sdesc.dim { color: var(--text-dim); font-weight: 400; }
+.tc-old { color: var(--text-dim); text-decoration: line-through; opacity: 0.75; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tc-new { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tc-statusrow { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.tc-sarr { color: var(--text-dim); font-size: 11px; flex: none; }
 </style>

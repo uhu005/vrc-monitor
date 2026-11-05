@@ -1,9 +1,11 @@
 <script setup>
 import { ref, computed, watch } from 'vue';
-import { store, closeWorld, openUser, copyText, openPreview, openInstance, openGroup } from '../store.js';
+import { store, closeWorld, openUser, copyText, openPreview, openInstance, openGroup, openWorld } from '../store.js';
 import { get, post, imgUrl } from '../api.js';
-import { date, dateTime, trustColor, parseLoc, instanceLabel } from '../utils.js';
+import { date, dateTime, time, trustColor, parseLoc, instanceLabel } from '../utils.js';
+import { createSeqGuard } from '../utils/seq-guard.js';
 import { toast } from '../toast.js';
+import { confirm } from '../confirm.js';
 
 const visible = computed({
   get: () => !!store.worldModal,
@@ -37,17 +39,24 @@ async function load() {
   history.value = null;
   liveInst.value = null;
   activeTab.value = 'info';
+  // 复审 💡3：切换世界时旧响应可能晚到并覆盖新世界的数据（UserDialog 已修，这里同步）。
+  // rec 同时校验序号与业务键 worldId：过期响应直接丢弃，loading 只由最新一次收尾。
+  const rec = worldGuard.begin(modal.worldId);
   try {
     const d = await get(`/api/dashboard/world?worldId=${encodeURIComponent(modal.worldId)}`);
+    if (!worldGuard.isCurrent(rec)) return;
     if (!d.error) world.value = d;
     const h = await get(`/api/dashboard/world-history?worldId=${encodeURIComponent(modal.worldId)}`);
+    if (!worldGuard.isCurrent(rec)) return;
     if (!h.error) history.value = h;
     // 实时实例（在线实例变化频繁，走独立实时端点）
     const li = await get(`/api/dashboard/world-instances?worldId=${encodeURIComponent(modal.worldId)}`);
+    if (!worldGuard.isCurrent(rec)) return;
     if (!li.error) liveInst.value = li;
   } catch { /* 保持空 */ }
-  loading.value = false;
+  if (worldGuard.isCurrent(rec)) loading.value = false;
 }
+const worldGuard = createSeqGuard();
 watch(() => store.worldModal, (v) => { if (v) load(); });
 
 const infoFacts = computed(() => {
@@ -174,6 +183,8 @@ async function toggleFav() {
   favBusy.value = true;
   try {
     if (faved.value) {
+      // #162: 取消收藏=云端不可逆, UI 二次确认
+      if (!await confirm({ message: '确认取消收藏该世界？不可恢复。', header: '取消收藏', acceptLabel: '取消收藏' })) { favBusy.value = false; return; }
       await post('/api/dashboard/favorite-remove', { type: 'world', id: world.value.worldId });
       faved.value = false;
       toast('已取消收藏', 'success');
@@ -286,7 +297,7 @@ const worldJson = computed(() => (world.value ? JSON.stringify(world.value, null
             </button>
           </div>
         </div>
-        <Button :icon="faved ? 'pi pi-star-fill' : 'pi pi-star'" :severity="faved ? 'warning' : 'secondary'" size="small" text rounded :loading="favBusy" :title="faved ? '取消收藏' : '收藏'"
+        <Button :icon="faved ? 'pi pi-star-fill' : 'pi pi-star'" :severity="faved ? 'warn' : 'secondary'" size="small" text rounded :loading="favBusy" :title="faved ? '取消收藏' : '收藏'"
           @click="toggleFav" />
         <Button icon="pi pi-thumbs-up" size="small" text rounded :loading="rateBusy === 1" :title="'喜欢（影响推荐）'" :aria-label="'喜欢'"
           @click="rateWorld(1)" />
@@ -370,7 +381,7 @@ const worldJson = computed(() => (world.value ? JSON.stringify(world.value, null
               <span><i class="pi pi-lock"></i> 私密 {{ privOcc }} 人</span>
             </div>
             <div v-if="sortedInstances.length" class="inst-list">
-              <div v-for="inst in sortedInstances" :key="inst.location" class="inst-row" role="button" tabindex="0" :title="'打开房间详情：' + inst.location" @click="openInstance(inst.location)" @keydown.enter="openInstance(inst.location)">
+              <div v-for="inst in sortedInstances" :key="inst.location" class="inst-row" :title="'打开房间详情：' + inst.location" v-clickable="(e) => (openInstance(inst.location))" >
                 <div class="inst-line1">
                   <i :class="['pi', instIcon(inst)]" class="inst-icon" :style="{ color: inst.type === 'group' ? 'var(--accent-2)' : 'var(--text-dim)' }"></i>
                   <span class="inst-type">{{ instTypeLabel(inst) }}</span>
@@ -392,7 +403,7 @@ const worldJson = computed(() => (world.value ? JSON.stringify(world.value, null
             <div v-if="onlineHere.length" class="wd-online-here">
               <div class="wd-local-head"><i class="pi pi-users"></i> 该世界的好友</div>
               <div class="mini-list">
-                <div v-for="f in onlineHere" :key="f.userId" class="mini-row" role="button" tabindex="0" @click="openUser({ userId: f.userId, displayName: f.displayName, avatarUrl: f.avatarUrl || '' })" @keydown.enter="openUser({ userId: f.userId, displayName: f.displayName, avatarUrl: f.avatarUrl || '' })">
+                <div v-for="f in onlineHere" :key="f.userId" class="mini-row" v-clickable="(e) => (openUser({ userId: f.userId, displayName: f.displayName, avatarUrl: f.avatarUrl || '' }))" >
                   <img v-if="f.avatarUrl" :src="f.avatarUrl" class="mini-thumb" alt="" loading="lazy" />
                   <span class="mini-name">{{ f.displayName }}</span>
                   <span class="mini-loc text-dim">{{ f.instanceName || '' }}</span>

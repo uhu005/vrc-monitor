@@ -4,13 +4,17 @@
 
 import { ctx, log, parseLocation } from '../server-context.js';
 import { resolveWorldNames } from '../world-names.js';
+import { isOnlineForCount, readOnlineCountIncludeWeb } from '../online-count-policy.js';
+import { fetchProfileBio } from '../profile-bio.js';   // 简介(bio)已移出 user 对象（2026-10-07）
 
 export async function handleGetOnlineFriends() {
   const { storage, api } = ctx;
   const r = await api._request('GET', '/auth/user/friends?offline=false');
   if (r.status !== 200) throw new Error(`API error: ${r.status}`);
   const friends = Array.isArray(r.data) ? r.data : [];
-  const online = friends.filter(f => f.location && f.location !== 'offline');
+  // 在线口径与 friendState 统一走 core/online-count-policy.js（含「网页在线」开关，调用时读取）
+  const includeWeb = readOnlineCountIncludeWeb();
+  const online = friends.filter((f) => isOnlineForCount(f, includeWeb));
 
   const nicknames = storage.getNicknames({});
   const nicknameMap = new Map();
@@ -103,10 +107,13 @@ export async function handleGetFriendInfo({ userId, displayName }) {
   const r = await api._request('GET', `/users/${targetId}`);
   if (r.status !== 200) throw new Error(`API error: ${r.status}`);
   const u = r.data;
+  // 简介真值单独取：新版资料系统已把 bio 移出 user 对象 ⇒ 直接读 u.bio 会让该键整条消失 ✗（2026-10-07）
+  const bioText = await fetchProfileBio(api, u.id);
   return {
     userId: u.id,
     displayName: u.displayName,
-    bio: u.bio,
+    // null = 未知（取不到），'' = 确实没写简介 —— 保留这个区分（评审 💡）
+    bio: bioText === undefined ? null : bioText,
     status: u.status,
     statusDescription: u.statusDescription,
     state: u.state,
@@ -142,7 +149,9 @@ export async function handleSearchUsers({ query, limit = 10 }) {
     .map(u => ({
       userId: u.id,
       displayName: u.displayName,
-      bio: (u.bio || '').slice(0, 100),
+      // 搜索结果不逐条取 /profile（N 次请求不划算）：简介未知 ⇒ 显式 null。
+      // 不用 '' 伪装成「确认没写简介」——与 get_friend_info 的 null（未知）/ ''（确认无）口径一致。
+      bio: null,
       status: u.status,
       isFriend: u.isFriend,
       userIcon: u.userIcon || '',
@@ -215,6 +224,46 @@ export async function handleGetMutualFriends({ userId, displayName, limit = 100 
     displayName: targetDisplayName,
     total: mutualFriends.length,
     mutualFriends,
+  };
+}
+
+export async function handleGetMutualGroups({ userId, displayName, limit = 100 }) {
+  const { api } = ctx;
+  if (!userId && !displayName) throw new Error('userId or displayName is required');
+
+  let targetId = userId;
+  let targetDisplayName = null;
+
+  if (!targetId) {
+    const search = await api._request('GET', `/users?search=${encodeURIComponent(displayName)}&n=20`);
+    if (search.status !== 200) throw new Error(`API error: ${search.status}`);
+    const users = Array.isArray(search.data) ? search.data : [];
+    const matches = users.filter(u => u.displayName && u.displayName.toLowerCase() === displayName.toLowerCase());
+
+    if (matches.length === 0) throw new Error(`未找到显示名为 "${displayName}" 的用户`);
+    if (matches.length > 1) throw new Error(`显示名 "${displayName}" 匹配到多个用户，请用 userId 指定`);
+
+    targetId = matches[0].id;
+    targetDisplayName = matches[0].displayName;
+  }
+
+  const n = Math.max(1, Math.min(100, Number(limit) || 100));
+  const r = await api._request('GET', `/users/${targetId}/mutuals/groups?n=${n}&offset=0`);
+  if (r.status !== 200) throw new Error(`API error: ${r.status}`);
+
+  const mutuals = Array.isArray(r.data) ? r.data : [];
+  const mutualGroups = mutuals.map(g => ({
+    groupId: g.id,
+    name: g.name,
+    memberCount: g.memberCount ?? null,
+    description: g.description ? String(g.description).slice(0, 120) : null,
+  }));
+
+  return {
+    userId: targetId,
+    displayName: targetDisplayName,
+    total: mutualGroups.length,
+    mutualGroups,
   };
 }
 
@@ -322,6 +371,29 @@ export const tools = [
       }
     },
     handler: async (args) => ctx.rateLimiter.execute(() => handleGetMutualFriends(args))
+  },
+  {
+    "name": "get_mutual_groups",
+    "description": "[query] List mutual groups between you and a user (userId or exact displayName). Groups both accounts belong to.",
+    inputSchema: {
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "VRChat user id (usr_...)"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Exact display name to search"
+        },
+        "limit": {
+          "type": "number",
+          "default": 100,
+          "description": "Max results (1-100, default 100)"
+        }
+      }
+    },
+    handler: async (args) => ctx.rateLimiter.execute(() => handleGetMutualGroups(args))
   },
   {
     "name": "search_users",

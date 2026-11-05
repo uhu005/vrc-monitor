@@ -1,6 +1,8 @@
 // event-types 纯函数单测（重构行为等价锚点）
 import { describe, it, expect } from 'vitest';
-import { typeOf, isNotiUpdate, TYPE_LABELS, TYPE_ICONS, TYPE_SEVERITIES, eventTypeLabel } from './event-types.js';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { typeOf, isNotiUpdate, TYPE_LABELS, TYPE_ICONS, TYPE_SEVERITIES, eventTypeLabel, serverUpdateTypes, SERVER_FILTERABLE_TYPES } from './event-types.js';
 
 describe('typeOf 归一化', () => {
   it('位置/上下线/状态', () => {
@@ -64,5 +66,36 @@ describe('isNotiUpdate', () => {
     expect(isNotiUpdate({ type: 'notification-v2-update' })).toBe(true);
     expect(isNotiUpdate({ type: 'notification-update' })).toBe(true);
     expect(isNotiUpdate({ type: 'notification' })).toBe(false);
+  });
+});
+
+// 2026-10-07：类型筛选服务端化的白名单与参数（后端映射见 core/dashboard-services.js 的 UI_UPDATE_TYPE_SQL，
+// 等价性由 test/dashboard-events-type-filter.test.mjs 用同一批样本断言）
+describe('serverUpdateTypes（类型筛选服务端参数）', () => {
+  it('全部为可服务端过滤的值 ⇒ 返回逗号串（去重）', () => {
+    expect(serverUpdateTypes(['bio'])).toBe('bio');
+    expect(serverUpdateTypes(['bio', 'avatar'])).toBe('bio,avatar');
+    expect(serverUpdateTypes(['bio', 'bio'])).toBe('bio');
+  });
+  it('含不可服务端过滤的值（位置/上下线）或混选 ⇒ 返回空串（退回客户端过滤，行为不变）', () => {
+    expect(serverUpdateTypes(['location'])).toBe('');
+    expect(serverUpdateTypes(['bio', 'location'])).toBe('');
+    expect(serverUpdateTypes([])).toBe('');
+    expect(serverUpdateTypes(null)).toBe('');
+  });
+  it('白名单与后端 UI_UPDATE_TYPE_SQL 的键一致（读后端源码，真护栏）', () => {
+    // ⚠️ 2026-10-07 评审 💡2：原断言只是与一份硬编码字面量比较（自证）——后端增删键它不会红。
+    // 现改为**读后端源码**逐个断言键存在：后端改了键、前端没跟 ⇒ 这条变红。
+    const src = readFileSync(fileURLToPath(new URL('../../../../../../core/dashboard-services.js', import.meta.url)), 'utf8');
+    // ⚠️ 评审三轮：`src.includes(k + ':')` 是弱判据 —— 同文件里 DTO 映射/label 表的无关出现会命中，
+    // 变异实验（键 bio: → bioMUT:）下它仍全绿 ⇒ 咬不动。改为**从对象字面量里解析出键集合**做全等断言。
+    const start = src.indexOf('export const UI_UPDATE_TYPE_SQL = {');
+    expect(start, '后端应有 UI_UPDATE_TYPE_SQL 定义').toBeGreaterThan(-1);
+    const end = src.indexOf('\n};', start);
+    expect(end, '应能定位对象字面量结尾').toBeGreaterThan(start);
+    // 顶层键＝行首恰好两个空格 + 标识符 + 冒号（注释行以 // 开头、值里的续行缩进更深，都不会命中）
+    const keys = [...src.slice(start, end).matchAll(/^ {2}([A-Za-z_$][\w$]*):/gm)].map((m) => m[1]);
+    expect(keys.slice().sort()).toEqual([...SERVER_FILTERABLE_TYPES].slice().sort());
+    expect([...SERVER_FILTERABLE_TYPES].sort()).toEqual(['avatar', 'bio', 'status', 'trustLevel']);
   });
 });

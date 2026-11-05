@@ -3,6 +3,7 @@ import { ref, computed, onMounted } from 'vue';
 import { store, openWorld, openUser, openPreview } from '../store.js';
 import { get, post } from '../api.js';
 import { toast } from '../toast.js';
+import { confirm } from '../confirm.js';
 
 const tab = ref('worlds');
 const worlds = ref(null);
@@ -44,7 +45,10 @@ async function load() {
     try {
       const g = await get('/api/dashboard/favorites?type=groups');
       groupsList = (g && Array.isArray(g.groups)) ? g.groups : [];
-    } catch { groupsList = []; }
+    } catch (err) {
+      // 2026-09-22 彻查：失败不写正常态（[]=「确实没有」✗）⇒ 保持旧值 + 如实报错 ✓
+      toast('收藏分组加载失败：' + ((err && err.message) || err), 'error');
+    }
     if (!worlds.value) {
       const w = await get('/api/dashboard/favorites?type=worlds&limit=200');
       worlds.value = (w && w.worlds) || [];
@@ -126,6 +130,8 @@ const visibleFriendGroups = computed(() => pickGroups(friendGroups.value, friend
 async function removeFav(type, id, displayName) {
   const key = type + ':' + id;
   if (removing.value.has(key)) return;
+  // #162：取消收藏=云端不可逆，UI 二次确认
+  if (!await confirm({ message: '确认取消收藏' + (displayName ? '「' + displayName + '」' : '该项') + '？不可恢复。', header: '取消收藏', acceptLabel: '取消收藏' })) return;
   removing.value.add(key);
   // 乐观更新：先移除，失败回滚
   const prev = type === 'world' ? worlds.value : type === 'avatar' ? avatars.value : friends.value;
@@ -209,7 +215,7 @@ const statusText = (f) => {
     <div class="fv-head">
       <h2><i class="pi pi-star"></i> 收藏</h2>
       <span class="fv-count">{{ loading ? '加载中…' : ((worlds ? worlds.length : 0) + (avatars ? avatars.length : 0) + (friends ? friends.length : 0)) + ' 项' }}</span>
-      <Button size="small" text icon="pi pi-refresh" title="刷新" @click="reload" />
+      <Button size="small" text icon="pi pi-refresh" title="刷新" @click="reload" aria-label="刷新" />
     </div>
 
     <Tabs v-model:value="tab" :scrollable="true">
@@ -244,7 +250,7 @@ const statusText = (f) => {
                 <div class="fgm-note">设为公开后收藏夹对他人可见（敏感操作）</div>
               </div>
               <div class="world-grid">
-                <div v-for="w in list" :key="w.worldId" class="world-card" role="button" tabindex="0" @click="openWorld(w.worldId)" @keydown.enter="openWorld(w.worldId)">
+                <div v-for="w in list" :key="w.worldId" class="world-card" v-clickable="(e) => (openWorld(w.worldId))" >
                   <img v-if="w.imageUrl" :src="w.imageUrl" class="world-img" alt="" loading="lazy" />
                   <div v-else class="world-img world-img-empty"><i class="pi pi-globe"></i></div>
                   <div class="world-info">
@@ -257,7 +263,7 @@ const statusText = (f) => {
                   </div>
                   <div class="wc-actions">
                     <Button icon="pi pi-arrow-right" text size="small" class="rm-btn" title="移动分组" :aria-label="'移动分组 ' + w.worldName" @click.stop="toggleMove(w)" />
-                    <Button icon="pi pi-star-fill" severity="warning" text size="small" class="rm-btn" title="取消收藏" :loading="removing.has('world:' + w.worldId)" @click.stop="removeFav('world', w.worldId, w.worldName)" />
+                    <Button icon="pi pi-star-fill" severity="warn" text size="small" class="rm-btn" title="取消收藏" :loading="removing.has('world:' + w.worldId)" @click.stop="removeFav('world', w.worldId, w.worldName)" aria-label="取消收藏" />
                   </div>
                   <div v-if="moveMenuFor === w.worldId" class="move-menu" @click.stop>
                     <div class="mm-title">移动到收藏夹</div>
@@ -282,14 +288,14 @@ const statusText = (f) => {
             <div v-for="[g, list] in visibleAvatarGroups" :key="g" class="fv-group">
               <div class="fv-group-head"><i class="pi pi-bookmark"></i>{{ favName(g) }} <span class="fv-group-count">{{ list.length }}</span></div>
               <div class="avatar-grid">
-                <div v-for="a in list" :key="a.avatarId" class="avatar-card" role="button" tabindex="0" @click="openPreview(a.imageUrl || '')" @keydown.enter="openPreview(a.imageUrl || '')">
+                <div v-for="a in list" :key="a.avatarId" class="avatar-card" v-clickable="(e) => (openPreview(a.imageUrl || ''))" >
                   <img v-if="a.imageUrl" :src="a.imageUrl" class="avatar-img" alt="" loading="lazy" />
                   <div v-else class="avatar-img avatar-img-empty"><i class="pi pi-user"></i></div>
                   <div class="avatar-info">
                     <b class="ellipsis" :title="a.name">{{ a.name }}</b>
                     <div class="text-dim">{{ a.authorName || '' }}</div>
                   </div>
-                  <Button icon="pi pi-star-fill" severity="warning" text size="small" class="rm-btn" title="取消收藏" :loading="removing.has('avatar:' + a.avatarId)" @click.stop="removeFav('avatar', a.avatarId, a.name)" />
+                  <Button icon="pi pi-star-fill" severity="warn" text size="small" class="rm-btn" title="取消收藏" :loading="removing.has('avatar:' + a.avatarId)" @click.stop="removeFav('avatar', a.avatarId, a.name)" aria-label="取消收藏" />
                 </div>
               </div>
             </div>
@@ -307,14 +313,14 @@ const statusText = (f) => {
             <div v-for="[g, list] in visibleFriendGroups" :key="g" class="fv-group">
               <div class="fv-group-head"><i class="pi pi-bookmark"></i>{{ favName(g) }} <span class="fv-group-count">{{ list.length }}</span></div>
               <div class="fav-friend-list">
-                <div v-for="f in list" :key="f.userId" class="fav-friend" role="button" tabindex="0" @click="openUser({ userId: f.userId, displayName: f.name, avatarUrl: f.avatarUrl || '' })" @keydown.enter="openUser({ userId: f.userId, displayName: f.name, avatarUrl: f.avatarUrl || '' })">
+                <div v-for="f in list" :key="f.userId" class="fav-friend" v-clickable="(e) => (openUser({ userId: f.userId, displayName: f.name, avatarUrl: f.avatarUrl || '' }))" >
                   <img v-if="f.avatarUrl" :src="f.avatarUrl" class="fav-friend-av" alt="" loading="lazy" />
                   <div v-else class="fav-friend-av fav-friend-av-empty">{{ (f.name || '?')[0] }}</div>
                   <div class="fav-friend-info">
                     <b>{{ f.name }}</b>
                     <div class="text-dim">{{ statusText(f) }}</div>
                   </div>
-                  <Button icon="pi pi-star-fill" severity="warning" text size="small" class="rm-btn" title="取消收藏" :loading="removing.has('friend:' + f.userId)" @click.stop="removeFav('friend', f.userId, f.name)" />
+                  <Button icon="pi pi-star-fill" severity="warn" text size="small" class="rm-btn" title="取消收藏" :loading="removing.has('friend:' + f.userId)" @click.stop="removeFav('friend', f.userId, f.name)" aria-label="取消收藏" />
                 </div>
               </div>
             </div>

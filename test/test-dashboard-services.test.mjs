@@ -5,7 +5,7 @@
  *   trackedNonFriends / trackedChanges（bio/status 前后值）/ stats / owner 归属
  * 自包含：临时 SQLite + 造数据，不依赖真实 VRChat 凭据。
  */
-import { rmSync } from 'node:fs';
+import { rmSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
@@ -70,6 +70,34 @@ test('dashboard.trackedNonFriends 返回 tracked 列表形状', () => {
   assert.ok(r.tracked.some((x) => x.userId === UID && x.displayName === '测试用户'));
 });
 
+test('tracked 列表权威源兜底：已是好友必不显示，解除好友自动回列（#164 补漏）', () => {
+  const UID2 = 'usr_test-0000-0000-0000-000000000002';
+  ctx.storage.run(
+    `INSERT OR REPLACE INTO tracked_non_friends (user_id, display_name, avatar_image_url, added_at, last_refresh_at)
+     VALUES ($u, $d, '', datetime('now'), datetime('now'))`,
+    { $u: UID2, $d: '曾追踪现好友' });
+  // 模拟 friend-add 事件丢失（联动未写 removed_at）：直接进 friends 权威表
+  ctx.storage.run(`INSERT OR REPLACE INTO friends (user_id, display_name) VALUES ($u, $d)`, { $u: UID2, $d: '曾追踪现好友' });
+  let r = services.get('dashboard.trackedNonFriends')({ limit: 50 });
+  assert.ok(!r.tracked.some((x) => x.userId === UID2), '已是好友的条目不得出现在追踪列表');
+  // 解除好友（friend-delete 联动删 friends 行）→ 自动回列，无需 removed_at
+  ctx.storage.run(`DELETE FROM friends WHERE user_id = $u`, { $u: UID2 });
+  r = services.get('dashboard.trackedNonFriends')({ limit: 50 });
+  assert.ok(r.tracked.some((x) => x.userId === UID2), '解除好友后应自动回到追踪列表');
+});
+
+test('trackedMemo 设置/清除备注，列表携带 memo 字段', () => {
+  const set = services.get('dashboard.trackedMemo')({ userId: UID, memo: '  群里认识的， Worlds 测试爱好者  ' });
+  assert.equal(set.ok, true);
+  assert.equal(set.memo, '群里认识的， Worlds 测试爱好者', '应 trim 且截断后保存');
+  let x = services.get('dashboard.trackedNonFriends')({ limit: 10 }).tracked.find((i) => i.userId === UID);
+  assert.equal(x.memo, '群里认识的， Worlds 测试爱好者', '列表应携带 memo');
+  assert.throws(() => services.get('dashboard.trackedMemo')({ userId: 'bad-id', memo: 'x' }), /usr_/, '非 usr_ 前缀应拒绝');
+  services.get('dashboard.trackedMemo')({ userId: UID, memo: '' });
+  x = services.get('dashboard.trackedNonFriends')({ limit: 10 }).tracked.find((i) => i.userId === UID);
+  assert.equal(x.memo, '', '空串应清除备注');
+});
+
 test('trackedNonFriends.lastChangeAt 与 trackedChanges 最新变化一致（真实变更时间，非检测时间）', () => {
   const list = services.get('dashboard.trackedNonFriends')({ limit: 10 }).tracked;
   const x = list.find((i) => i.userId === UID);
@@ -111,6 +139,24 @@ test('dashboard.trackedChanges 返回 avatar 变化形状（前后缩略图字�
   assert.ok(av.avatarImageUrl.startsWith('/api/dashboard/image-proxy?url='), '头像应走本地图片代理');
   assert.ok(decodeURIComponent(av.avatarImageUrl).includes('/image/'), '头像应缩略图化');
   assert.ok(av.previousAvatarImageUrl);
+});
+
+test('dashboard.trackedChanges 返回 location 变化（上下线/换世界透传，PR #149）', () => {
+  ctx.storage.insertEvent({
+    type: 'friend-update', userId: UID, displayName: '测试用户',
+    contentJson: { userId: UID, displayName: '测试用户', type: 'location',
+      location: 'wrld_44a2b6c8-83c5-4a5e-a5cf-99a5dbf8b8c3:12345', previousLocation: 'offline',
+      worldId: 'wrld_44a2b6c8-83c5-4a5e-a5cf-99a5dbf8b8c3', worldName: '测试世界' },
+    worldId: 'wrld_44a2b6c8-83c5-4a5e-a5cf-99a5dbf8b8c3', worldName: '测试世界',
+    createdAt: new Date().toISOString(), source: 'poll',
+  });
+  const r = services.get('dashboard.trackedChanges')({ userId: UID, limit: 20 });
+  const loc = r.changes.find((c) => c.type === 'location');
+  assert.ok(loc, 'location 变化在时间线中');
+  assert.equal(loc.previousLocation, 'offline', '旧位置（离线）透传');
+  assert.ok(loc.location.startsWith('wrld_'), '新位置透传');
+  assert.equal(loc.worldId, 'wrld_44a2b6c8-83c5-4a5e-a5cf-99a5dbf8b8c3', 'worldId 透传');
+  assert.equal(loc.worldName, '测试世界', 'worldName 透传（前端 locLabel 附加显示用）');
 });
 
 test('dashboard.trackedChanges 对非法 userId 返回空', () => {
@@ -232,13 +278,14 @@ test('dashboard.trackedAdd 幂等 + 拒绝自己 + trackedRemove 标记', () => 
 });
 
 test('dashboard.groupAnnouncementsAll 汇总跨群组公告', () => {
-  const ev = (gid, gname, title, msg, dt) => ctx.storage.insertEvent({
+  const ev = (gid, gname, title, msg, dt, imageUrl) => ctx.storage.insertEvent({
     type: 'notification-v2', userId: 'usr_ann', displayName: '公告',
     contentJson: { id: 'not_' + gid, type: 'group.announcement', title: gname + ': ' + title, message: msg,
+      ...(imageUrl ? { imageUrl } : {}),
       data: { groupId: gid, groupName: gname, announcementTitle: title } },
     worldId: '', worldName: '', createdAt: new Date(Date.now() - dt).toISOString(), source: 'ws',
   });
-  ev('grp_ann1', '群组A', '公告一', '内容一', 300000);
+  ev('grp_ann1', '群组A', '公告一', '内容一', 300000, 'https://api.vrchat.cloud/api/1/file/file_ann1cover/1/file');
   ev('grp_ann2', '群组B', '公告二', '内容二', 600000);
   const r = services.get('dashboard.groupAnnouncementsAll')({ limit: 50 });
   assert.ok(r.total >= 2, '至少汇总 2 条公告');
@@ -247,6 +294,11 @@ test('dashboard.groupAnnouncementsAll 汇总跨群组公告', () => {
   assert.equal(a1.title, '公告一');
   assert.equal(a1.groupName, '群组A');
   assert.equal(a1.text, '内容一');
+  // PR #149：公告封面图解析（content 顶层 imageUrl 经本地代理）；无图公告为空串
+  assert.ok(a1.imageUrl && a1.imageUrl.startsWith('/api/dashboard/image-proxy?url='), '封面图经本地代理');
+  assert.ok(decodeURIComponent(a1.imageUrl).includes('file_ann1cover'), '代理 URL 还原后含原始 file id');
+  const a2 = r.announcements.find((a) => a.groupId === 'grp_ann2');
+  assert.equal(a2.imageUrl, '', '无图公告 imageUrl 为空串（不产生空代理 URL）');
   // 降序（最新在前）
   const ts = r.announcements.map((a) => a.createdAt);
   const sorted = [...ts].sort().reverse();
@@ -429,7 +481,281 @@ test('dashboard.notificationEvents 群组通知提取 groupName（ownerName/owne
   assert.equal(boop.groupName, '', '非群组通知 groupName 应为空（title 兜底限定 group.*），实际: ' + JSON.stringify(boop.groupName));
 });
 
+// ── recentWorlds 世界补名负缓存 TTL（审者建议后续优化：占位无 TTL 导致瞬时失败永不自愈）──
+// 语义：无 world_cache 记录 → 触发补名；空名占位在 24h TTL 内 → 抑制（零新增 API 尝试）；
+// 占位超 TTL → 放行一次重试；失败写占位刷新 updated_at（续期冷却）；成功落真名自愈。
+const ttlWorld = (id) => `wrld_ttl-${id}-0000-0000-0000-000000000000`;
+const insertNamelessLocation = (worldId) => ctx.storage.insertEvent({
+  type: 'user-location', userId: 'usr_ttl', displayName: '我',
+  contentJson: { location: worldId + ':1' }, worldId, worldName: '',
+  createdAt: new Date().toISOString(), source: 'ws',
+});
+const upsertPlaceholder = (worldId, ageExpr) => ctx.storage.run(
+  `INSERT OR REPLACE INTO world_cache (world_id, name, updated_at) VALUES ('${worldId}', '', ${ageExpr})`
+);
+const placeholderUpdatedAt = (worldId) => {
+  const r = ctx.storage.query(`SELECT updated_at AS u FROM world_cache WHERE world_id=$w`, { $w: worldId });
+  return r[0] ? r[0].u : null;
+};
+const flushMicrotasks = () => new Promise((r) => setTimeout(r, 0));
+
+test('recentWorlds 补名：无占位触发 / TTL 内抑制 / 超 TTL 重试 / 失败续期 / 成功自愈', async () => {
+  // ① 无记录 → 触发补名 1 次，成功落真名后不再触发
+  const wA = ttlWorld('a');
+  insertNamelessLocation(wA);
+  let callsA = 0;
+  loader.services.set('dashboard.world', (args) => {
+    callsA++;
+    ctx.storage.upsertWorld({ worldId: args.worldId, name: '真名世界A' });
+    return { name: '真名世界A' };
+  });
+  services.get('dashboard.recentWorlds')({ limit: 60 });
+  assert.equal(callsA, 1, '无占位世界应触发补名 1 次');
+  await flushMicrotasks();
+  assert.equal(ctx.storage.getWorldName(wA)?.name, '真名世界A', '补名成功应落真名');
+  services.get('dashboard.recentWorlds')({ limit: 60 });
+  assert.equal(callsA, 1, '落真名后不应再次触发');
+
+  // ② 空名占位在 TTL 内（5 分钟前）→ 抑制，零新增 API 调用
+  const wB = ttlWorld('b');
+  insertNamelessLocation(wB);
+  upsertPlaceholder(wB, `datetime('now','-5 minutes')`);
+  let callsB = 0;
+  loader.services.set('dashboard.world', (args) => { callsB++; return null; });
+  services.get('dashboard.recentWorlds')({ limit: 60 });
+  assert.equal(callsB, 0, 'TTL 内空名占位应抑制补名（负缓存生效）');
+
+  // ③ 占位超 TTL（25 小时前）→ 放行重试 1 次；失败写占位刷新 updated_at（续期冷却）
+  const wC = ttlWorld('c');
+  insertNamelessLocation(wC);
+  upsertPlaceholder(wC, `datetime('now','-25 hours')`);
+  let callsC = 0;
+  loader.services.set('dashboard.world', (args) => { callsC++; return null; }); // 补名失败（API 不可见）
+  services.get('dashboard.recentWorlds')({ limit: 60 });
+  assert.equal(callsC, 1, '超 TTL 占位应放行一次重试');
+  await flushMicrotasks();
+  const refreshed = placeholderUpdatedAt(wC);
+  const oneMinuteAgoUtc = new Date(Date.now() - 60000).toISOString().replace('T', ' ').slice(0, 19);
+  assert.ok(refreshed && refreshed >= oneMinuteAgoUtc,
+    `失败后占位 updated_at 应刷新（续期），实际 ${refreshed}`);
+  services.get('dashboard.recentWorlds')({ limit: 60 });
+  assert.equal(callsC, 1, '刷新后的占位在 TTL 内不应再次触发');
+});
+
 // ── 清理 ──
 after(() => {
   for (const f of [tmpDb, tmpDb + '-wal', tmpDb + '-shm']) { try { rmSync(f, { force: true }); } catch {} }
+});
+
+test('dashboard.events：location=traveling:traveling 在 DTO 层归一为 traveling（实例字段清空）', async () => {
+  // 2026-09-25 #261 回归用例：VRChat 的「传送中」实际推的是 `traveling:traveling`（不是纯 `traveling`）。
+  // 未归一会被 parseLocInfo 判成 public + instanceId='traveling' ⇒ 前端渲染出「公开 · traveling」。
+  const uid = 'usr_test-0000-0000-0000-0000000000t1';
+  ctx.storage.insertEvent({
+    type: 'friend-location', userId: uid, displayName: '转场测试',
+    contentJson: { userId: uid, location: 'traveling:traveling', user: {} },
+    worldId: '', worldName: '', createdAt: new Date().toISOString(), source: 'websocket',
+  });
+  const r = await services.get('dashboard.events')({ limit: 50, offset: 0 });
+  const ev = r.events.find((e) => e.userId === uid);
+  assert.ok(ev, '应能查到该位置事件');
+  assert.equal(ev.location, 'traveling', '应归一为 traveling（前端据此走「传送中」分支）');
+  assert.equal(ev.instanceType, '', '归一后不得再是 public');
+  assert.equal(ev.instanceId, '', '归一后不得再是 traveling');
+});
+
+test('previousWorldName：左端世界名走 world_cache（私人房不载荷 world 也能显示）', async () => {
+  // 2026-09-25 审查 #262 的回归用例：两条事件的世界名列【故意留空】——
+  // 模拟 VRChat 对私人房 / hidden 房不下发 content.world 的推送；名字只能来自 world_cache。
+  const uid = 'usr_test-0000-0000-0000-0000000000b1';
+  const widPrev = 'wrld_test-1111-1111-1111-111111111111';
+  const widCur = 'wrld_test-2222-2222-2222-222222222222';
+  ctx.storage.run(
+    `INSERT OR REPLACE INTO world_cache (world_id, name, image_url) VALUES ($w, $n, '')`,
+    { $w: widPrev, $n: '缓存世界名' });
+  ctx.storage.insertEvent({
+    type: 'friend-location', userId: uid, displayName: '左端测试',
+    contentJson: { userId: uid, location: widPrev + ':12345~hidden(usr_aaaaaaaa-0000-0000-0000-000000000001)', user: {} },
+    worldId: widPrev, worldName: '', createdAt: new Date(Date.now() - 60000).toISOString(), source: 'websocket',
+  });
+  ctx.storage.insertEvent({
+    type: 'friend-location', userId: uid, displayName: '左端测试',
+    contentJson: { userId: uid, location: widCur + ':6789~hidden(usr_aaaaaaaa-0000-0000-0000-000000000001)', user: {} },
+    worldId: widCur, worldName: '', createdAt: new Date().toISOString(), source: 'websocket',
+  });
+  const r = await services.get('dashboard.events')({ limit: 50, offset: 0 });
+  const cur = r.events.find((e) => e.worldId === widCur);
+  assert.ok(cur, '应能查到当前世界那条事件');
+  assert.equal(cur.previousWorldName, '缓存世界名', '左端世界名应取自 world_cache（与右端同口径）');
+  assert.equal(cur.previousWorldId, widPrev, '左端世界 id 应指向上一位置');
+});
+
+test('previousWorldName：同一世界时左端名与右端名一致（消除「从 X → 到 Y」幻影行）', async () => {
+  // 2026-09-25 审查 nixi-agent 建议（#262）：
+  //   前端 views.js 以 `previousWorldName !== worldName` 判定是否渲染「从 X → 到 Y」；
+  //   修前左端只读载荷 ⇒ 同一世界若载荷无 world（私人房常见）而缓存有名字，就会显示成【幻影世界切换】。
+  //   他本机 30 天实测：修前 115 行、修后 0 行。本用例把该不变量钉死。
+  const uid = 'usr_test-0000-0000-0000-0000000000e1';
+  const wid = 'wrld_test-3333-3333-3333-333333333333';
+  ctx.storage.run(
+    `INSERT OR REPLACE INTO world_cache (world_id, name, image_url) VALUES ($w, $n, '')`,
+    { $w: wid, $n: '缓存世界名' });
+  ctx.storage.insertEvent({
+    type: 'friend-location', userId: uid, displayName: '幻影测试',
+    contentJson: { userId: uid, location: wid + ':11111~hidden(usr_bbbbbbbb-0000-0000-0000-000000000002)', user: {} },
+    worldId: wid, worldName: '', createdAt: new Date(Date.now() - 60000).toISOString(), source: 'websocket',
+  });
+  ctx.storage.insertEvent({
+    type: 'friend-location', userId: uid, displayName: '幻影测试',
+    contentJson: { userId: uid, location: wid + ':11111~hidden(usr_bbbbbbbb-0000-0000-0000-000000000002)', user: {} },
+    worldId: wid, worldName: '', createdAt: new Date().toISOString(), source: 'websocket',
+  });
+  const r = await services.get('dashboard.events')({ limit: 50, offset: 0 });
+  const cur = r.events.find((e) => e.userId === uid);
+  assert.ok(cur, '应能查到该事件');
+  assert.equal(cur.worldName, '缓存世界名', '右端名取自 world_cache');
+  assert.equal(cur.previousWorldName, cur.worldName, '同一世界时左端名必须与右端一致（否则前端渲染出幻影世界切换）');
+});
+
+test('dashboard.events：无模型图的 avatar 事件【不得】用跨事件的旧模型名回填', async () => {
+  // 2026-09-25 审查 #264 的回归用例（阻断项）：
+  //   旧实现回落到 lastKnownAvatarUrl（该好友全局最近一条带图事件）⇒ 对「本事件」而言是更早/更晚的模型，
+  //   会把「未知模型」写成「确定但错误」的名；本用例钉住：只允许用【同事件】的 thumbnail 回落。
+  const uid = 'usr_test-0000-0000-0000-0000000000d1';
+  const fidOld = 'file_dddd1111-0000-0000-0000-000000000001';
+  const fidThumb = 'file_dddd2222-0000-0000-0000-000000000002';
+  ctx.storage.setPlanetCache('avatar_name:' + fidOld, { name: '旧事件模型名', at: Date.now() });
+  ctx.storage.setPlanetCache('avatar_name:' + fidThumb, { name: '同事件模型名', at: Date.now() });
+  loader._avatarNameCache = new Map();
+  loader._avatarNameCacheLoaded = false;
+  ctx.storage.insertEvent({
+    type: 'friend-update', userId: uid, displayName: '回落测试',
+    contentJson: {
+      userId: uid, displayName: '回落测试', type: 'avatar', avatarName: '旧事件模型名',
+      avatarImageUrl: 'https://api.vrchat.cloud/api/1/file/' + fidOld + '/1/file',
+    },
+    worldId: '', worldName: '', createdAt: new Date(Date.now() - 120000).toISOString(), source: 'ws',
+  });
+  ctx.storage.insertEvent({
+    type: 'friend-update', userId: uid, displayName: '回落测试',
+    contentJson: {
+      userId: uid, displayName: '回落测试', type: 'avatar',
+      avatarImageUrl: '',
+      avatarThumbnailUrl: 'https://api.vrchat.cloud/api/1/image/' + fidThumb + '/1/256',
+    },
+    worldId: '', worldName: '', createdAt: new Date().toISOString(), source: 'ws',
+  });
+  await services.get('dashboard.events')({ limit: 50, offset: 0 });
+  const r = await services.get('dashboard.events')({ limit: 50, offset: 0 });
+  const evs = r.events.filter((e) => e.userId === uid && e.updateType === 'avatar');
+  assert.ok(evs.length >= 2, '应能查到两条 avatar 事件，实际 ' + evs.length);
+  const newest = evs[0];
+  assert.notEqual(newest.avatarName, '旧事件模型名', '【阻断项】不得用跨事件的旧模型名回填');
+  assert.equal(newest.avatarName, '同事件模型名', '应使用【同事件】thumbnail 回落到本次新模型名');
+});
+
+// ── #264（审查 nixi-agent 建议②）：用【真实载荷形态】把限度钉死 ──
+test('dashboard.events：载荷无新模型图时保持「未知模型」（不得跨事件猜测当前模型名）', async () => {
+  // 上游这批推送 avatarImageUrl / avatarThumbnailUrl 同为空串、且无 user.currentAvatar*（生产实测形态）。
+  // 本用例钉住：这种情况下【保持未知】，绝不用「好友当前模型名」猜测（那会把更早的行写成当前模型名，张冠李戴）。
+  const uid = 'usr_test-0000-0000-0000-0000000000f3';
+  const fidCur = 'file_ffff5555-0000-0000-0000-000000000005';
+  const curImg = 'https://api.vrchat.cloud/api/1/file/' + fidCur + '/1/file';
+  ctx.storage.upsertFriend({ userId: uid, displayName: '限度测试', avatarImageUrl: curImg, bio: '', status: 'active' });
+  ctx.storage.setPlanetCache('avatar_name:' + fidCur, { name: '当前模型名', at: Date.now() });
+  loader._avatarNameCache = new Map();
+  loader._avatarNameCacheLoaded = false;
+  ctx.storage.insertEvent({
+    type: 'friend-update', userId: uid, displayName: '限度测试',
+    contentJson: { userId: uid, displayName: '限度测试', type: 'avatar', avatarImageUrl: '', avatarThumbnailUrl: '',
+      previousAvatarImageUrl: 'https://api.vrchat.cloud/api/1/image/file_ffff6666-0000-0000-0000-000000000006/1/256' },
+    worldId: '', worldName: '', createdAt: new Date(Date.now() + 10800000).toISOString(), source: 'ws',
+  });
+  await services.get('dashboard.events')({ limit: 50, offset: 0 });
+  const r = await services.get('dashboard.events')({ limit: 50, offset: 0 });
+  const ev = r.events.find((e) => e.userId === uid);
+  assert.ok(ev, '应能查到该事件');
+  assert.notEqual(ev.avatarName, '当前模型名', '不得跨事件用「好友当前模型」回填（会张冠李戴）');
+  assert.equal(ev.avatarName, '', '载荷没有新模型图时保持未知（本 PR 的已知限度）');
+});
+
+
+// ── 2026-09-27（用户定案 B）：左侧圆头像按「该行当时」的图标回填 ──
+// 背景：原先无载荷图标的行会回落到「好友当前图标」（friends 表实时值），于是同一列里
+//   「当时快照」与「当前值」混排 —— 用户截图：同一位好友几行头像不一样 ✗。
+// 定案：一律显示「那一行当时的图」（老行没有任何历史图标时才回落当前值）。
+test('events：无载荷图标的行必须回填「该行时刻之前最近的已知图标」，不得回落好友当前图标', async () => {
+  const U2 = 'usr_test-icon-0000-0000-0000-000000000002';
+  const LIVE = 'https://api.vrchat.cloud/api/1/image/file_aaaa1111-0000-0000-0000-00000000000a/2/256';
+  const HIST = 'https://api.vrchat.cloud/api/1/image/file_bbbb2222-0000-0000-0000-00000000000b/1/256';
+  const MODEL = 'https://api.vrchat.cloud/api/1/image/file_cccc3333-0000-0000-0000-00000000000c/1/256';
+  ctx.storage.upsertFriend({ userId: U2, displayName: '图标测试', userIcon: LIVE, avatarImageUrl: '', bio: '', status: 'active' });
+  // t1：上线行（载荷里带当时的图标）
+  ctx.storage.insertEvent({
+    type: 'friend-online', userId: U2, displayName: '图标测试',
+    contentJson: { userId: U2, platform: 'standalonewindows', location: 'private', user: { id: U2, iconUrl: HIST } },
+    worldId: '', worldName: '', createdAt: '2026-09-27T01:00:00.000Z', source: 'websocket',
+  });
+  // t2：换模型行（载荷不带图标）—— 它的左侧头像应取 t1 那个"当时的图标"
+  ctx.storage.insertEvent({
+    type: 'friend-update', userId: U2, displayName: '图标测试',
+    contentJson: { userId: U2, displayName: '图标测试', type: 'avatar', avatarName: '某模型', avatarImageUrl: MODEL },
+    worldId: '', worldName: '', createdAt: '2026-09-27T02:00:00.000Z', source: 'websocket',
+  });
+  const svc = loader.services.get('dashboard.events');
+  const res = await svc({ limit: 100 });
+  const evs = res.events || res || [];
+  const fidOf = (u) => avatarFileId(decodeURIComponent(String(u || '')));
+  const online = evs.find((e) => e.type === 'friend-online' && e.userId === U2);
+  const avatar = evs.find((e) => e.type === 'friend-update' && e.userId === U2 && e.updateType === 'avatar');
+  assert.ok(online && avatar, '两条事件都应在响应里（online + avatar）');
+  assert.equal(fidOf(online.userIcon), avatarFileId(HIST), '带载荷图标的行用载荷里那一刻的图标');
+  assert.equal(fidOf(avatar.userIcon), avatarFileId(HIST), '无载荷图标的行必须回填"当时最近的已知图标"');
+  assert.notEqual(fidOf(avatar.userIcon), avatarFileId(LIVE), '不得回落到好友当前图标（定案 B 要修的正是这个混排）');
+});
+
+
+// ── 2026-09-27：模型名可信性（parseAvatarName 对「非 Avatar 命名」原样返回 ⇒ blob/文件名会被当模型名） ──
+test('模型名可信性判据 + DTO 过滤：blob/文件名类脏值不得作为模型名展示', async () => {
+  const { isPlausibleAvatarName } = await import(pathToFileURL(path.join(REPO, 'core', 'img-util.js')).href);
+  assert.equal(isPlausibleAvatarName('タフィー バニー'), true, '正常模型名要通过');
+  assert.equal(isPlausibleAvatarName('file_c3f51535-f3bb-4d6a-90f6-0a67ab53b422_blob'), false, 'blob 文件名要挡掉');
+  assert.equal(isPlausibleAvatarName('file_11111111-0000-0000-0000-000000000001'), false, '裸 file id 要挡掉');
+  assert.equal(isPlausibleAvatarName('c3f51535-f3bb-4d6a-90f6-0a67ab53b422'), false, '裸 UUID 要挡掉');
+  assert.equal(isPlausibleAvatarName('image.png'), false, '图片文件名要挡掉');
+  assert.equal(isPlausibleAvatarName(''), false);
+
+  // DTO 层：载荷里存了 blob 名也不得原样透出
+  const U3 = 'usr_test-name-0000-0000-0000-000000000003';
+  ctx.storage.upsertFriend({ userId: U3, displayName: '名字测试', userIcon: '', avatarImageUrl: '', bio: '', status: 'active' });
+  ctx.storage.insertEvent({
+    type: 'friend-update', userId: U3, displayName: '名字测试',
+    contentJson: { userId: U3, displayName: '名字测试', type: 'avatar', avatarName: 'file_c3f51535-f3bb-4d6a-90f6-0a67ab53b422_blob', avatarImageUrl: 'https://api.vrchat.cloud/api/1/image/file_dddd4444-0000-0000-0000-00000000000d/1/256' },
+    worldId: '', worldName: '', createdAt: '2026-09-27T02:30:00.000Z', source: 'websocket',
+  });
+  const svc2 = loader.services.get('dashboard.events');
+  const res2 = await svc2({ limit: 100 });
+  const row = (res2.events || []).find((e) => e.userId === U3 && e.updateType === 'avatar');
+  assert.ok(row, '该行应在响应里');
+  assert.equal(row.avatarName, '', 'DTO 不得把 blob 名当模型名透出（应为空 ⇒ 前端显示未知模型）');
+});
+
+
+// ── 2026-09-27 审查（nixi-agent）复核后补的护栏：这两处修复很"隐形"，加源码级断言防回归 ──
+test('审查修复护栏：历史窗口按 created_at 排序 + 截断/失败必须留痕（不得静默降级）', () => {
+  const src = readFileSync(path.join(REPO, 'core', 'dashboard-services.js'), 'utf8');
+  assert.match(src, /ORDER BY created_at DESC LIMIT 400/,
+    '回填窗口必须按 created_at 排序（与索引同序；id 序 ≠ 时间序的老数据上按 id 会静默失效）');
+  assert.ok(!/ORDER BY id DESC LIMIT 400/.test(src), '不应再有按 id 排序的窗口');
+  assert.match(src, /头像历史回填按上限/, '回填截断必须留痕（审查 ⚠️1：此前静默）');
+  assert.match(src, /头像历史回填失败/, '取历史失败必须留痕（审查 ⚠️2：此前静默）');
+});
+
+// 2026-09-27 追加：审查指出「说明与代码不符（称按需、实为全量）」⇒ 用护栏钉住"真按需"
+test('审查修复护栏②：回填对象必须【按需】选取（friend-* 且载荷缺图标），不得再用全量 user_id', () => {
+  const src = readFileSync(path.join(REPO, 'core', 'dashboard-services.js'), 'utf8');
+  assert.match(src, /const needUids = /, '必须按需选取回填对象（needUids）');
+  assert.ok(!/const allUids = \[\.\.\.new Set\(rows\.map\(\(r\) => r\.user_id\)/.test(src),
+    '不应再以"本页全部 user_id"作为回填对象（通知类 id 会挤占名额）');
+  assert.match(src, /rt\.startsWith\('friend-'\) \|\| rt\.startsWith\('user-'\)/, '回填应覆盖 friend-* 与本人 user-* 行');
 });

@@ -50,7 +50,7 @@ onUnmounted(() => { if (timer) clearInterval(timer); });
     <div class="pl-head">
       <h2><i class="pi pi-id-card"></i> 房间玩家</h2>
       <span class="pl-count">当前实例同房好友 · 30 秒自动刷新</span>
-      <Button size="small" text icon="pi pi-refresh" title="刷新" @click="load" />
+      <Button size="small" text icon="pi pi-refresh" title="刷新" @click="load" aria-label="刷新" />
     </div>
 
     <div v-if="data === null" class="loading-mini"><ProgressSpinner style="width:28px;height:28px" strokeWidth="4" /></div>
@@ -66,14 +66,14 @@ onUnmounted(() => { if (timer) clearInterval(timer); });
           </small>
           <small class="pl-wsub">同房好友 {{ players.length }} 人</small>
         </div>
-        <Button v-if="data.world && data.world.worldId" text size="small" icon="pi pi-external-link" title="查看世界资料" @click.stop="openWorld(data.world.worldId)" />
+        <Button v-if="data.world && data.world.worldId" text size="small" icon="pi pi-external-link" title="查看世界资料" @click.stop="openWorld(data.world.worldId)" aria-label="查看世界资料" />
       </button>
 
       <div class="pl-list">
         <button v-for="p in players" :key="p.userId" class="pl-row" @click="openUser(p.userId)">
           <Button v-if="String(p.userId || '').startsWith('usr_')" class="pl-copy" icon="pi pi-link" text size="small" rounded :aria-label="'复制玩家链接 ' + (p.displayName || '')" title="复制玩家链接" @click.stop="copyPlayerLink(p)" />
           <span class="pl-dot" v-bind="trustDot(p.trustLevel)" :title="p.trustLevel || ''"></span>
-          <Avatar :image="p.avatarUrl || p.userIcon || ''" :label="(p.displayName || '?').charAt(0).toUpperCase()" shape="circle" size="normal" />
+          <Avatar :image="p.userIcon || p.avatarUrl || ''" :label="(p.displayName || '?').charAt(0).toUpperCase()" shape="circle" size="normal" />
           <div class="pl-info">
             <b class="pl-name">{{ p.displayName }}</b>
             <small class="pl-sub">{{ p.statusDescription || statusText(p.status) || p.userId }}</small>

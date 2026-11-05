@@ -1,9 +1,11 @@
 <script setup>
 import { ref, computed, watch } from 'vue';
+import { createSeqGuard } from '../utils/seq-guard.js';
 import { store, closeUser, openWorld, openGroup, copyText, openPreview, toggleWatch } from '../store.js';
 import { get, post } from '../api.js';
 import { trustColor, trustName, locLabelFull, statusLabels, fmtMin, time, date, avatarLabel } from '../utils.js';
 import { toast } from '../toast.js';
+import { confirm } from '../confirm.js';
 import TrustBadge from './TrustBadge.vue';
 import { STATUS_COLORS } from '../composables/useFriendGroups.js';
 
@@ -52,6 +54,8 @@ async function onToggleFavFriend() {
   favBusy = true;
   try {
     if (isFavFriend.value) {
+      // #162: 取消收藏=云端不可逆, UI 二次确认
+      if (!await confirm({ message: '确认取消收藏该好友？不可恢复。', header: '取消收藏', acceptLabel: '取消收藏' })) { favBusy = false; return; }
       const r = await post('/api/dashboard/favorite-remove', { type: 'friend', id: user.value.userId });
       if (r && r.ok) {
         store.favFriendIds = new Set([...store.favFriendIds].filter((x) => x !== user.value.userId));
@@ -109,17 +113,42 @@ async function onToggleWatch() {
     watchBusy = false;
   }
 }
-const avatarUrl = computed(() => user.value.avatarUrl || user.value.userIcon || pUser.value.currentAvatarThumbnailImageUrl || pUser.value.currentAvatarImageUrl || '');
+const avatarUrl = computed(() => user.value.userIcon || user.value.avatarUrl || pUser.value.currentAvatarThumbnailImageUrl || pUser.value.currentAvatarImageUrl || '');
 const trustLevel = computed(() => {
   // 原始等级（本地记录优先，其次从 API tags 推断——对齐 VRCX computeTrustLevel 的 tag→名映射）
   const lt = pLocal.value.trustLevel;
   if (lt) return lt;
-  const t = (pUser.value.tags || []).find((x) => String(x).startsWith('system_trust_'));
+  // 2026-09-22 修：tags 是【累积】的（basic→known→trusted→veteran 一路的痕迹）✗
+  // 原来用 .find() 取【第一个】⇒ 永远显示他最早那一档（显示成 New User，与卡片/接口不一致 ✓）
+  // 现在取【最高档】✓（顺序与本仓既有实现一致：后端 start-monitor.js 的 inferTrustFromTags / 前端 ui/src/utils.js 的 TRUST_TAG_NAMES）
+  const RANK = { basic: 1, known: 2, trusted: 3, veteran: 4, legend: 5 };
+  const hits = (pUser.value.tags || []).map((x) => String(x)).filter((x) => x.startsWith('system_trust_'));
+  const best = hits.sort((a, b) => (RANK[b.replace('system_trust_', '')] || 0) - (RANK[a.replace('system_trust_', '')] || 0))[0];
+  const t = best;
   if (!t) return '';
   return String(t);
 });
 // VRCX 风格英文名（Trusted User / Known User / User / New User / Visitor）
 const trustNameText = computed(() => trustName(trustLevel.value));
+// 2026-09-22：备注就在弹窗里改（免得多挂一个常驻 Dialog —— 那正是「全站空白」的元凶）
+// 只用已确认存在的导入：ref/watch 来自 vue ✓、post 来自 api.js ✓、toast 来自 toast.js ✓
+const memoDraft = ref('');
+const memoSaving = ref(false);
+watch(() => profile.value && profile.value.trackedMemo, (v) => { memoDraft.value = v || ''; }, { immediate: true });
+async function saveMemo() {
+  if (memoSaving.value) return;
+  memoSaving.value = true;
+  try {
+    const r = await post('/api/dashboard/tracked/memo', { userId: user.value.userId, memo: memoDraft.value });
+    if (r && r.ok === false) throw new Error(r.error || '保存失败');
+        // 2026-10-16（审查 3）：服务端在「行已被并发移除」时返回 { ok:true, updated:false } ⇒ 必须按 updated 判，
+    // 否则会提示「备注已保存」而实际什么都没写（静默假成功）✗
+    if (r.updated === false) { toast('该用户已不在追踪列表，备注未生效', 'info'); return; }
+    if (profile.value) profile.value.trackedMemo = memoDraft.value;
+toast('备注已保存', 'success');
+  } catch (e) { toast('备注保存失败：' + (e.message || e), 'error'); }   // 失败必须可见，不伪装成功
+  finally { memoSaving.value = false; }
+}
 const statusValue = computed(() => pUser.value.status || pLocal.value.status || '');
 const statusText = computed(() => {
   if (pUser.value.statusDescription) return pUser.value.statusDescription;
@@ -149,31 +178,49 @@ function ago(iso) {
   return `${Math.floor(diff / 86400000)} 天`;
 }
 function openAvatarImage(a) {
-  if (a && (a.imageUrl || a.thumbnailImageUrl)) store.previewUrl = a.imageUrl || a.thumbnailImageUrl;
+  // 必须走 openPreview（复审 nixi-agent ⚠️1）：直接给 store.previewUrl 赋值会绕过
+  // 内部的焦点压栈 ⇒ 预览关闭时弹掉的是**父弹窗那一档**焦点栈，
+  // 焦点跑到仍打开的 UserDialog 背后，随后 closeUser 时又无处可还。
+  // 空值分支由 openPreview 内的 if (!url) return 兜住。
+  if (a) openPreview(a.imageUrl || a.thumbnailImageUrl || '');
 }
 
 // ── 数据加载 ──
+// 竞态保护（2026-11-02）：快速切换弹窗对象时，先发出的请求可能后返回，
+// 若不校验身份就会把 A 的资料写进 B 的弹窗（A 的响应覆盖 B）。
+// 用 utils/seq-guard：序号挡同对象乱序、业务键(userId)挡对象已切换。逻辑有独立单测。
+const profileGuard = createSeqGuard();
 async function loadProfile() {
   if (!user.value.userId) return;
+  const rec = profileGuard.begin(user.value.userId);
   loading.value = true;
   error.value = '';
   profile.value = null;
   try {
-    const d = await get(`/api/dashboard/user-profile?userId=${encodeURIComponent(user.value.userId)}`, 60000);
+    const d = await get(`/api/dashboard/user-profile?userId=${encodeURIComponent(rec.key)}`, 60000);
+    if (!profileGuard.isCurrent(rec) || user.value.userId !== rec.key) return;   // 过期 ⇒ 丢弃
     if (d && d.error) { error.value = String(d.error); }
     else profile.value = d || {};
   } catch (e) {
+    if (!profileGuard.isCurrent(rec) || user.value.userId !== rec.key) return;
     error.value = '加载失败：' + (e.message || e);
   } finally {
-    loading.value = false;
+    if (profileGuard.isCurrent(rec)) loading.value = false;   // 只有最新一次能收尾
   }
 }
+const eventsGuard = createSeqGuard();
 async function loadEvents() {
   if (events.value || !user.value.userId) return;
+  const rec = eventsGuard.begin(user.value.userId);
   try {
-    const d = await get(`/api/dashboard/friend-events?userId=${encodeURIComponent(user.value.userId)}&limit=20`);
+    const d = await get(`/api/dashboard/friend-events?userId=${encodeURIComponent(rec.key)}&limit=20`);
+    if (!eventsGuard.isCurrent(rec) || user.value.userId !== rec.key) return;   // 过期 ⇒ 丢弃
     events.value = d.events || [];
-  } catch { events.value = []; }
+  } catch (err) {
+    if (!eventsGuard.isCurrent(rec) || user.value.userId !== rec.key) return;
+    // 2026-09-22 彻查：失败不写正常态（[]=「没有事件」✗）⇒ 保持旧值 + 如实报错 ✓
+    toast('好友事件加载失败：' + ((err && err.message) || err), 'error');
+  }
 }
 async function openJoin() {
   try {
@@ -237,8 +284,11 @@ const rawJson = computed(() => {
     <Tabs v-else-if="profile" v-model:value="activeTab" :scrollable="true">
       <TabList>
         <Tab value="info">信息</Tab>
-        <Tab v-if="isFriend" value="mutual">共同好友<span v-if="profile.mutualFriendCount"> ({{ profile.mutualFriendCount }})</span></Tab>
-        <Tab v-if="isFriend" value="groups">群组<span v-if="profile.groups.length"> ({{ profile.groups.length }})</span></Tab>
+        <!-- 2026-09-22 实测：/users/{id}/mutuals/friends 对非好友可用 ✓（服务器直接算，无需对方开启共享 ✓）-->
+        <Tab value="mutual">共同好友<span v-if="profile.mutualFriendCount"> ({{ profile.mutualFriendCount }})</span></Tab>
+        <Tab value="mutualgrp">共同群组<span v-if="profile.mutualGroupCount"> ({{ profile.mutualGroupCount }})</span></Tab>
+        <!-- 2026-09-22 实测：/users/{id}/groups 对非好友**可用**（拿到 18 个群组 ✓）⇒ 不再隐藏 ✓ -->
+        <Tab value="groups">群组<span v-if="profile.groups.length"> ({{ profile.groups.length }})</span></Tab>
         <Tab v-if="isFriend" value="worlds">创建的世界<span v-if="profile.worlds.length"> ({{ profile.worlds.length }})</span></Tab>
         <Tab value="favworlds">收藏的世界<span v-if="favTotal"> ({{ favTotal }})</span></Tab>
         <Tab v-if="isFriend" value="avatars">创建的模型<span v-if="profile.avatars.length"> ({{ profile.avatars.length }})</span></Tab>
@@ -248,7 +298,7 @@ const rawJson = computed(() => {
       <TabPanels>
         <!-- 信息 -->
         <TabPanel value="info">
-          <div v-if="!isFriend" class="ud-note"><i class="pi pi-info-circle"></i> 非好友 · 共同好友 / 群组 / 世界 / 模型信息不可见</div>
+          <div v-if="!isFriend" class="ud-note"><i class="pi pi-info-circle"></i> 非好友 · 创建的世界 / 模型列表不可见（群组、共同好友已可查看）</div>
           <div v-if="isOnline && instanceName" class="ud-loc">
             <i class="pi pi-map-marker"></i>
             <span class="link" @click="openWorld(user.worldId || '')">{{ instanceName }}</span>
@@ -257,20 +307,34 @@ const rawJson = computed(() => {
           <div v-if="bio" class="bio">{{ bio }}</div>
           <div class="facts">
             <div class="fact"><span>正在使用的模型</span><span v-if="profile.avatarName" class="link" :title="'点击放大查看：' + profile.avatarName" @click="openPreview(pUser.currentAvatarImageUrl || pUser.currentAvatarThumbnailImageUrl || '')">{{ profile.avatarName }}</span><span v-else>—</span></div>
-            <div class="fact"><span>最后见面时间</span><span>{{ pStats.lastMeet ? date(pStats.lastMeet) + ' ' + time(pStats.lastMeet) : '-' }}</span></div>
-            <div class="fact"><span>见面的次数</span><span>{{ pStats.meetCount }}</span></div>
-            <div class="fact"><span>一起游玩的时长</span><span>{{ fmtDur(pStats.timeSpentMs) }}</span></div>
-            <div class="fact"><span>本次在线时长</span><span>{{ fmtDur(pStats.currentOnlineMs) }}</span></div>
-            <div class="fact"><span>最后活动时间</span><span>{{ ago(pStats.lastActivity) }}</span></div>
-            <div class="fact"><span>上线次数</span><span>{{ pStats.joinCount }}</span></div>
+            <div v-if="isFriend" class="fact"><span>最后见面时间</span><span>{{ pStats.lastMeet ? date(pStats.lastMeet) + ' ' + time(pStats.lastMeet) : '-' }}</span></div>
+            <div v-if="isFriend" class="fact"><span>见面的次数</span><span>{{ pStats.meetCount }}</span></div>
+            <div v-if="isFriend" class="fact"><span>一起游玩的时长</span><span>{{ fmtDur(pStats.timeSpentMs) }}</span></div>
+            <div v-if="isFriend" class="fact"><span>本次在线时长</span><span>{{ fmtDur(pStats.currentOnlineMs) }}</span></div>
+            <div class="fact"><span>上次资料变化</span><!-- 2026-09-22 改名：该值来自我们本地记录的"上次资料变化"（stats.lastActivity），不是 VRChat 的 last_activity --><span>{{ ago(pStats.lastActivity) }}</span></div>
+            <div v-if="isFriend" class="fact"><span>上线次数</span><span>{{ pStats.joinCount }}</span></div>
             <div class="fact"><span>账号创建日期</span><span>{{ pStats.dateJoined || '-' }}</span></div>
-            <div class="fact"><span>添加为好友的时间</span><span>{{ pStats.dateFriended ? date(pStats.dateFriended) : '-' }}</span></div>
+            <div v-if="isFriend" class="fact"><span>添加为好友的时间</span><span>{{ pStats.dateFriended ? date(pStats.dateFriended) : '-' }}</span></div>
             <div class="fact"><span>是否允许克隆模型</span><span>{{ pStats.allowAvatarCopying ? '允许' : '不允许' }}</span></div>
-            <div class="fact"><span>玩家 ID</span><span class="mono">{{ user.userId }}</span></div>
+            <!-- 2026-09-22 用户：备注在弹窗里改（替代卡片上那个会引发白屏的常驻 Dialog） -->
+            <div v-if="!isFriend" class="fact fact-wide">
+              <span>本地备注</span>
+              <span class="memo-cell">
+                <input v-model="memoDraft" class="memo-input" placeholder="给这个人加个备注…" aria-label="给这位玩家加备注" @keydown.enter="saveMemo" />
+                <Button label="保存" size="small" :loading="memoSaving" @click="saveMemo" />
+              </span>
+            </div>
+            <!-- 2026-09-22 用户：玩家 ID 单独占两列（不然会被换行）；复制按钮挪到这一行右边 -->
+            <div class="fact fact-wide">
+              <span>玩家 ID</span>
+              <span class="mono id-cell">
+                <span class="id-text">{{ user.userId }}</span>
+                <Button label="复制 ID" icon="pi pi-copy" size="small" text @click="copyText(user.userId)" />
+              </span>
+            </div>
           </div>
           <div class="ud-actions">
             <Button v-if="isOnline" label="请求加入" icon="pi pi-send" size="small" @click="openJoin" />
-            <Button label="复制 ID" icon="pi pi-copy" size="small" text @click="copyText(user.userId)" />
             <Button :label="isWatched ? '取消关注' : '关注'" :icon="isWatched ? 'pi pi-eye-slash' : 'pi pi-eye'"
               size="small" :text="!isWatched" :severity="isWatched ? 'danger' : undefined" @click="onToggleWatch" />
             <Button v-if="!isFriend" :label="isTrackedUser ? '取消追踪' : '追踪'" :icon="isTrackedUser ? 'pi pi-user-minus' : 'pi pi-user-plus'"
@@ -281,21 +345,32 @@ const rawJson = computed(() => {
         </TabPanel>
 
         <!-- 共同好友 -->
-        <TabPanel value="mutual" v-if="isFriend">
+        <TabPanel value="mutual">
           <div v-if="!profile.mutualFriends.length" class="empty" style="padding:16px">暂无共同好友</div>
           <div v-else class="mini-list">
-            <div v-for="f in profile.mutualFriends" :key="f.id" class="mini-row" role="button" tabindex="0" @click="store.userModal = { userId: f.id, displayName: f.displayName, avatarUrl: f.avatarUrl }" @keydown.enter="store.userModal = { userId: f.id, displayName: f.displayName, avatarUrl: f.avatarUrl }">
+            <div v-for="f in profile.mutualFriends" :key="f.id" class="mini-row" v-clickable="(e) => (store.userModal = { userId: f.id, displayName: f.displayName, avatarUrl: f.avatarUrl })" >
               <Avatar :image="f.avatarUrl" shape="circle" size="small" :label="avatarLabel(f.avatarUrl, f.displayName)" />
               <span>{{ nameOf(f) }}</span>
             </div>
           </div>
         </TabPanel>
 
+        <!-- 共同群组：端点按账号对计算，好友/非好友均可用（tracked 非好友亦可看共同群组） -->
+        <TabPanel value="mutualgrp">
+          <div v-if="!profile.mutualGroups || !profile.mutualGroups.length" class="empty" style="padding:16px">暂无共同群组</div>
+          <div v-else class="mini-list">
+            <div v-for="g in profile.mutualGroups" :key="g.id" class="mini-row" v-clickable="(e) => (openGroup(g.id))" >
+              <span>{{ g.name }}</span>
+              <small v-if="g.memberCount" class="mini-dim">{{ g.memberCount }} 成员</small>
+            </div>
+          </div>
+        </TabPanel>
+
         <!-- 群组 -->
-        <TabPanel value="groups" v-if="isFriend">
+        <TabPanel value="groups">
           <div v-if="!profile.groups.length" class="empty" style="padding:16px">暂未加入群组</div>
           <div v-else class="mini-list">
-            <div v-for="g in profile.groups" :key="g.id" class="mini-row" role="button" tabindex="0" @click="openGroup(g.id)" @keydown.enter="openGroup(g.id)">
+            <div v-for="g in profile.groups" :key="g.id" class="mini-row" v-clickable="(e) => (openGroup(g.id))" >
               <img v-if="g.iconUrl" :src="g.iconUrl" class="mini-thumb" alt="" loading="lazy" />
               <i v-else class="pi pi-users"></i>
               <span>{{ g.name }} <small class="text-dim">({{ g.memberCount }}人)</small></span>
@@ -308,7 +383,7 @@ const rawJson = computed(() => {
         <TabPanel value="worlds" v-if="isFriend">
           <div v-if="!profile.worlds.length" class="empty" style="padding:16px">暂无创建的世界</div>
           <div v-else class="world-grid">
-            <div v-for="w in profile.worlds" :key="w.id" class="world-card" role="button" tabindex="0" @click="openWorld(w.id)" @keydown.enter="openWorld(w.id)">
+            <div v-for="w in profile.worlds" :key="w.id" class="world-card" v-clickable="(e) => (openWorld(w.id))" >
               <img v-if="w.imageUrl" :src="w.imageUrl" class="world-img" alt="" loading="lazy" />
               <div v-else class="world-img world-img-empty"><i class="pi pi-globe"></i></div>
               <div class="world-info">
@@ -337,7 +412,7 @@ const rawJson = computed(() => {
                 <span class="fav-group-count">{{ g.worlds ? g.worlds.length : 0 }}</span>
               </div>
               <div class="world-grid">
-                <div v-for="w in g.worlds" :key="w.worldId || w.name" class="world-card" role="button" tabindex="0" @click="openWorld(w.worldId)" @keydown.enter="openWorld(w.worldId)">
+                <div v-for="w in g.worlds" :key="w.worldId || w.name" class="world-card" v-clickable="(e) => (openWorld(w.worldId))" >
                   <img v-if="w.imageUrl" :src="w.imageUrl" class="world-img" alt="" loading="lazy" />
                   <div v-else class="world-img world-img-empty"><i class="pi pi-globe"></i></div>
                   <div class="world-info">
@@ -354,7 +429,7 @@ const rawJson = computed(() => {
         <TabPanel value="avatars" v-if="isFriend">
           <div v-if="!profile.avatars.length" class="empty" style="padding:16px">暂无创建的模型（VRChat 对他人的模型列表有限制）</div>
           <div v-else class="world-grid">
-            <div v-for="a in profile.avatars" :key="a.id" class="world-card" role="button" tabindex="0" @click="openAvatarImage(a)" @keydown.enter="openAvatarImage(a)">
+            <div v-for="a in profile.avatars" :key="a.id" class="world-card" v-clickable="(e) => (openAvatarImage(a))" >
               <img v-if="a.thumbnailImageUrl" :src="a.thumbnailImageUrl" class="world-img" alt="" loading="lazy" />
               <div v-else class="world-img world-img-empty"><i class="pi pi-user-edit"></i></div>
               <div class="world-info">
@@ -410,10 +485,16 @@ const rawJson = computed(() => {
 .fact { display: flex; justify-content: space-between; gap: 12px; font-size: 12.5px; padding: 4px 0; border-bottom: 1px dashed var(--border-soft); }
 .fact span:first-child { color: var(--text-dim); flex: none; }
 .fact span:last-child { text-align: right; word-break: break-all; }
-.ud-actions { display: flex; gap: 8px; margin-top: 12px; }
+.ud-actions { display: flex; gap: 8px; margin-top: 12px; justify-content: flex-end; }
+.memo-cell { display: flex; align-items: center; gap: 8px; justify-content: flex-end; flex: 1; }
+.memo-input { flex: 1; max-width: 360px; background: var(--surface-2); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 5px 9px; font-size: 12.5px; }
 
+/* 2026-09-22：玩家 ID 单占一行（两列宽），右侧带复制按钮 */
+.facts > .fact-wide { grid-column: 1 / -1; }
+.id-cell { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
 .mini-list { display: flex; flex-direction: column; gap: 4px; }
 .mini-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px; cursor: pointer; font-size: 12.5px; }
+.mini-dim { color: var(--text-dim); font-size: 11px; margin-left: auto; }
 .mini-row:hover { background: var(--surface-2); }
 .mini-thumb { width: 26px; height: 26px; object-fit: cover; border-radius: 6px; flex: none; }
 .world-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }

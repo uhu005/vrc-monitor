@@ -7,7 +7,8 @@
  */
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { rmSync, readdirSync, readFileSync } from 'node:fs';
+import { rmSync, readdirSync, readFileSync, rmdirSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -23,10 +24,23 @@ before(() => {
   dir = path.join(__dirname, 'logger-test-rundir');
   rmSync(dir, { recursive: true, force: true });
 });
+// <仓库>/logs 的清理必须**非递归**（issue #280）：未设 VRC_MONITOR_LOGGER_DIR 时它就是
+// 默认配置下**正在写日志的生产目录**，递归删除会在跑着服务的机器上删掉线上 monitor.log
+// （曾实测触发「文件日志永久停写 + 每行刷一条 ENOENT」）。本测试对该目录的唯一副作用是
+// initLogger({}) 建出的**空目录**，所以用 rmdirSync：目录非空（= 服务在写）时抛
+// ENOTEMPTY，静默跳过——结构性保证不可能误删非空目录。
+const cleanupDefaultLogDir = () => {
+  try {
+    rmdirSync(path.join(REPO, 'logs'));
+  } catch {
+    // 非空或不存在：绝不动它
+  }
+};
+
 after(() => {
   rmSync(dir, { recursive: true, force: true });
-  // 兜底清理：默认目录用例可能向 <仓库>/logs 写入，测试进程离开时一并清除
-  rmSync(path.join(REPO, 'logs'), { recursive: true, force: true });
+  // 兜底清理：默认目录用例可能创建 <仓库>/logs（空目录）
+  cleanupDefaultLogDir();
 });
 
 test('脱敏：authToken/cookie/邮箱/password/授权码 全部替换且零泄漏', () => {
@@ -39,6 +53,43 @@ test('脱敏：authToken/cookie/邮箱/password/授权码 全部替换且零泄�
   assert.ok(!out.includes('hunter2'), '密码不得泄漏');
   assert.ok(!out.includes('mysecret'), '授权码不得泄漏');
   assert.equal(out.match(/\[REDACTED\]/g)?.length, 5, '应有 5 处 [REDACTED]');
+});
+
+test('脱敏：中文校验码（验证码/校验码/动态码）覆盖，且不吞正文', () => {
+  // 2026-09-21 补：授权码已覆盖，但「验证码」族此前从未命中（真实缺口）
+  const out = redactSecrets('验证码：778899 校验码=ABC123 动态码 123456');
+  assert.ok(!out.includes('778899'), '中文验证码值不得泄漏');
+  assert.ok(!out.includes('ABC123'), '校验码值不得泄漏');
+  assert.ok(out.includes('验证码：[REDACTED]'), '应保留「验证码：」前缀 + 脱敏值');
+  // 无分隔符的正文不得被误吞（要求显式 : = ：）
+  // 2026-10-16 审查 ⚠️1/⚠️2：补自然语序（必须命中）与「分隔符后是中文正文」（不得吞）两组边界
+  const natural = redactSecrets('您的验证码是 123456，请勿泄露');
+  assert.ok(natural.includes('[REDACTED]'), '自然语序（是 + 码）必须打码');
+  const natural2 = redactSecrets('校验码 ABC123 已生成 动态码 654321');
+  assert.ok(!natural2.includes('ABC123') && !natural2.includes('654321'), '纯空格分隔的码也必须打码');
+  const noSwallow = redactSecrets('验证码：短信已发送到邮箱');
+  assert.ok(noSwallow.includes('短信已发送到邮箱'), '分隔符后面是中文正文时**不得**吞掉（旧写法会整句遮掉）');
+  // 2026-10-16 审查 🔴1：**真实生产句子**（logging 现场形态）—— 验证码被双引号包裹，必须先遮住
+  const prod = redactSecrets('无效的验证码: "123456"，应为6位数字');
+  assert.ok(!prod.includes('123456'), '真实句子里的引号包裹验证码必须打码（上一版会漏 ✗）');
+  const prod2 = redactSecrets('无效的 TOTP 验证码: "ABC123"');
+  // 2026-10-16 审查 💡1/💡2：组合分隔符与紧贴数字形态
+  const combo1 = redactSecrets('验证码为：123456');
+  assert.ok(!combo1.includes('123456'), '组合分隔符必须打码');
+  const combo2 = redactSecrets('校验码是：ABC123');
+  assert.ok(!combo2.includes('ABC123'), '是+冒号同样必须打码');
+  const tight = redactSecrets('验证码123456已发送');
+  assert.ok(!tight.includes('123456') && tight.includes('已发送'), '紧贴数字要遮且不得吞正文');
+  assert.ok(!prod2.includes('ABC123'), 'TOTP 形态同样必须打码');
+  // 2026-10-16 审查（另一条 💡）：真实调用点还会**拼接**上一层 message（`start-monitor.js:902`）—— 一起钉住
+  const composed = redactSecrets('启动登录失败：无效的验证码: "123456"，应为6位数字');
+  assert.ok(!composed.includes('123456'), '拼接句里的验证码也必须打码（真实落盘形态）');
+  const longTok = redactSecrets('验证码: "abcdefghijklmnop1234"');
+  assert.ok(!longTok.includes('abcdefghijklmnop1234'), '长码必须整段遮住（不得只遮前 10 位留下残片）');
+  const paren = redactSecrets('验证码：123456（5分钟内有效）');
+  assert.ok(paren.includes('[REDACTED]') && paren.includes('（5分钟内有效）'), '括号说明不得被吞');
+  const prose = redactSecrets('请输入验证码 已发送到邮箱');
+  assert.ok(prose.includes('已发送'), '无分隔符时不得吞掉后续正文');
 });
 
 test('级别过滤：info 级别隐藏 debug，setLevel(debug) 后可见', () => {
@@ -224,8 +275,12 @@ test('脱敏：中文键「授权码」宽松值也替换', () => {
 test('默认目录：无任何 env 时落到仓库根/logs（非 cwd 父目录）', () => {
   const savedD = process.env.VRC_MONITOR_LOGGER_DIR;
   const savedM = process.env.VRC_MONITOR_DIR;
+  const savedCtx = process.env.NODE_TEST_CONTEXT;
   delete process.env.VRC_MONITOR_LOGGER_DIR;
   delete process.env.VRC_MONITOR_DIR;
+  // 本测试进程自带 NODE_TEST_CONTEXT=child-v8（node --test 子进程）——删除它模拟生产进程，
+  // 否则 resolveDir 会按「测试上下文兜底」落到系统临时目录（B1 防御，见下方用例）。
+  delete process.env.NODE_TEST_CONTEXT;
   try {
     const s = initLogger({});
     const expected = path.join(REPO, 'logs');
@@ -234,8 +289,55 @@ test('默认目录：无任何 env 时落到仓库根/logs（非 cwd 父目录�
     // 复位后用隔离目录重建，避免向 <仓库>/logs 写日志
     if (savedD !== undefined) process.env.VRC_MONITOR_LOGGER_DIR = savedD;
     if (savedM !== undefined) process.env.VRC_MONITOR_DIR = savedM;
+    if (savedCtx !== undefined) process.env.NODE_TEST_CONTEXT = savedCtx;
     initLogger({ dir: path.join(dir, 'reset') });
-    rmSync(path.join(REPO, 'logs'), { recursive: true, force: true }); // 清掉断言时创建的目录
+    cleanupDefaultLogDir(); // 清掉断言时创建的空目录（非空则不动，见 #280）
+  }
+});
+
+// ===== 交付 B1 回归：node --test 上下文未显式设 LOGGER_DIR 时，日志必须落到系统临时目录 =====
+test('B1：NODE_TEST_CONTEXT 下 initLogger({}) 落到系统临时目录（不写继承的 VRC_MONITOR_DIR/logs）', () => {
+  const savedD = process.env.VRC_MONITOR_LOGGER_DIR;
+  const savedM = process.env.VRC_MONITOR_DIR;
+  const savedCtx = process.env.NODE_TEST_CONTEXT;
+  const noticeLines = [];
+  const origInfo = console.info;
+  delete process.env.VRC_MONITOR_LOGGER_DIR;
+  // 模拟继承的生产 VRC_MONITOR_DIR（虚构路径，勿写真实环境路径）与 NODE_TEST_CONTEXT：
+  // 正是「测试子进程继承生产 env」的真实条件
+  process.env.VRC_MONITOR_DIR = 'D:\\somewhere\\production-checkout';
+  process.env.NODE_TEST_CONTEXT = 'child-v8';
+  console.info = (m) => { noticeLines.push(String(m)); };
+  try {
+    const s = initLogger({});
+    const expected = path.join(os.tmpdir(), 'vrc-monitor-test-logs');
+    assert.equal(s.dir, expected, `测试上下文应落到系统临时目录 ${expected}`);
+    assert.ok(!s.dir.includes('production-checkout'), '不得落到继承的 VRC_MONITOR_DIR/logs');
+    assert.ok(noticeLines.some((l) => l.includes('检测到 node --test 上下文')), '必须打一行非静默提示（禁静默降级）');
+    // 隔离目录真实可写（与生产日志目录物理隔离）
+    assert.ok(readdirSync(expected).length >= 0, '临时日志目录应可创建');
+  } finally {
+    console.info = origInfo;
+    if (savedD !== undefined) process.env.VRC_MONITOR_LOGGER_DIR = savedD;
+    if (savedM !== undefined) process.env.VRC_MONITOR_DIR = savedM;
+    if (savedCtx !== undefined) process.env.NODE_TEST_CONTEXT = savedCtx;
+    initLogger({ dir: path.join(dir, 'reset-b1') });
+  }
+});
+
+test('B1：显式 VRC_MONITOR_LOGGER_DIR 永远优先（压过 NODE_TEST_CONTEXT）', () => {
+  const savedD = process.env.VRC_MONITOR_LOGGER_DIR;
+  const savedCtx = process.env.NODE_TEST_CONTEXT;
+  const d = path.join(dir, 'b1-explicit');
+  process.env.VRC_MONITOR_LOGGER_DIR = d;
+  process.env.NODE_TEST_CONTEXT = 'child-v8';
+  try {
+    const s = initLogger({});
+    assert.equal(s.dir, path.resolve(d), '显式 LOGGER_DIR 必须压过测试上下文兜底');
+  } finally {
+    if (savedD !== undefined) process.env.VRC_MONITOR_LOGGER_DIR = savedD;
+    if (savedCtx !== undefined) process.env.NODE_TEST_CONTEXT = savedCtx;
+    initLogger({ dir: path.join(dir, 'reset-b1b') });
   }
 });
 

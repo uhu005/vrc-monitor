@@ -39,6 +39,9 @@ if _reconf:
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 仓库根（本脚本在 scripts/ 下）
 
+# dump-tools stdout 的合法工具名形态（snake_case）；其余行视为日志/噪音丢弃并上报
+SNAKE_TOOL_RE = re.compile(r"^[a-z0-9_]+$")
+
 # 需要扫数字残留的路径（相对仓库根；目录递归，文件单查）
 NUMERIC_RESIDUE_TARGETS = [
     "README.md", "README.en.md", "README.ja.md", "AGENTS.md", "ARCHITECTURE.md",
@@ -63,7 +66,19 @@ def read_text(rel):
         return f.read()
 
 def extract_code_tools():
-    """从 scripts/dump-tools.mjs（加载插件后）提取权威工具清单。"""
+    """从 scripts/dump-tools.mjs（加载插件后）提取权威工具清单。
+
+    返回 (tools: set, dropped: list)；dropped = stdout 中非合法工具名的行。
+
+    2026-09-22 加固：stdout 是**数据通道**（每行一个 snake_case 工具名）。此前无条件
+    把每个非空行当工具名，插件加载期经 core/logger.js 写到 stdout 的 INFO 行会被
+    **当成工具名**——实测案例：events 插件加载失败时 3 行
+    `2026-09-21T21:02:44.413Z INFO  [app] [registry] tool "..." in manifest but not registered`
+    被解析成 3 个"工具"，同时误报「代码新增工具未登记」与「skill 引用了不存在的工具」
+    （真正的故障是插件没加载，不是文档漂移）。故只接受 ^[a-z0-9_]+$ 的行，
+    其余丢弃**并计数上报**（不静默：调用方会打印 [INFO]）。
+    dump-tools 侧已同时把日志压到 silent（根因修复），这里是防御层。
+    """
     try:
         r = subprocess.run(
             ["node", "scripts/dump-tools.mjs"],
@@ -71,11 +86,14 @@ def extract_code_tools():
         )
         if r.returncode != 0:
             print(f"ERROR: dump-tools failed: {r.stderr.strip()}", file=sys.stderr)
-            return None
-        return set(line.strip() for line in r.stdout.splitlines() if line.strip())
+            return None, None
+        lines = [line.strip() for line in r.stdout.splitlines() if line.strip()]
+        tools = set(l for l in lines if SNAKE_TOOL_RE.match(l))
+        dropped = [l for l in lines if not SNAKE_TOOL_RE.match(l)]
+        return tools, dropped
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         print(f"ERROR: unable to run dump-tools: {e}", file=sys.stderr)
-        return None
+        return None, None
 
 def extract_doc_tools():
     """从权威工具登记文档提取已登记工具（反引号包裹的 snake_case 标识符）。
@@ -202,9 +220,14 @@ def gh_all_pr_states():
 
 # 历史记录中的 PR 状态标注模式
 # 1) 显式括号标注：`#30` (OPEN, 2026-08-14) 或 #30 (OPEN, 2026-08-14)（兼容反引号包裹）
+#    2026-10-12 补：兼容全角括号与「PR，」前缀写法 —— `#279`（PR，OPEN，2026-10-11 00:08 UTC+8，分支 …）
+#    （该写法 2026-10-11 起被扫描任务实际使用，旧正则只认半角括号 + 紧随状态词 ⇒ 漏检 #279/#281/#283 三处）
 # 2) 行内状态词：PR #30 ... 待评审 / 待审核 / 已合并 / 已合入 / 已关闭
+# ⚠️ 已知副作用（2026-10-12 实测）：本正则会连**正文里的字面引用**一起匹配，而同一 PR 多条标注
+#    时 OPEN 优先级最高 ⇒ 在 docs/history 正文里复述「#279（PR，OPEN，…）」这种标注字面量会
+#    自我触发 pr_status_drift。**写记录时引用旧写法请用 `#NNN` 占位**（不写真实合并号）。
 PR_STATUS_RE = re.compile(
-    r"#(\d+)[`\s]*\((OPEN|CLOSED|MERGED)[^)]*\)|"      # (OPEN/CLOSED/MERGED, date)
+    r"#(\d+)[`\s]*[（(](?:PR[，,]\s*)?(OPEN|CLOSED|MERGED)[^)）]*[)）]|"      # (OPEN/CLOSED/MERGED, date)
     r"PR\s*#(\d+)[^\n。]*?(待评审|待审核|待合并|已合并|已合入|已关闭)",  # 行内状态词
 )
 
@@ -351,7 +374,7 @@ def main():
     ap.add_argument("--json", action="store_true", help="输出 JSON 摘要")
     args = ap.parse_args()
 
-    code_tools = extract_code_tools()
+    code_tools, dropped_lines = extract_code_tools()
     if code_tools is None:
         print("ERROR: 无法从 scripts/dump-tools.mjs 导出工具清单，无法检测", file=sys.stderr)
         return 2
@@ -402,6 +425,7 @@ def main():
     report = {
         "code_tools_count": len(code_tools),
         "doc_tools_count": len(doc_tools & code_tools),
+        "dump_tools_dropped_lines": dropped_lines,
         "missing_in_readme": missing_readme,
         "missing_in_agents": missing_agents,
         "numeric_residue": [{"file": r, "line": l, "text": t} for r, l, t in numeric_hits],
@@ -428,6 +452,11 @@ def main():
     print("=" * 60)
     print(f"权威工具数（core/registry.js）: {len(code_tools)}")
     print(f"skill 工具清单已登记: {len(doc_tools & code_tools)}")
+    if dropped_lines:
+        print(f"\n[INFO] dump-tools stdout 含 {len(dropped_lines)} 行非工具名内容（已忽略；stdout 应只含工具名）:")
+        for l in dropped_lines[:5]:
+            print(f"  - {l[:140]}")
+        print("       （多为日志/噪音泄漏：确认 dump-tools 已把日志通道与 stdout 数据通道隔离）")
     if missing_readme:
         print(f"\n[FAIL] README 缺失 {len(missing_readme)} 个工具（需补进「🔌 MCP 工具」对应分组）:")
         for t in missing_readme:

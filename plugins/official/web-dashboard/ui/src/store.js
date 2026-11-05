@@ -1,6 +1,15 @@
 // 响应式数据层（移植旧 core.js 模式：快/慢路径拆分 + 30s 轮询 + SSE + hash 视图同步）
 import { reactive } from 'vue';
-import { get, post, openSse } from './api.js';
+import { get, post, openSse, getToken } from './api.js';   // 2026-09-22：补 getToken 导入 —— 启动守卫里用了它却没导入 ⇒ ReferenceError 被 catch 吞掉 ⇒ authed 恒 false ⇒ 一个请求都不发（表现与后端挂了完全一样）✗
+import { serverUpdateTypes } from './constants/event-types.js';
+
+// 类型筛选的服务端参数（2026-10-07）：选中的全是「资料变更子类型」时才下发 updateTypes。
+// 否则（如"位置变动"或混选）保持原行为——服务端表达不了，继续客户端过滤。
+// ⚠️ 不加这个参数时，稀有类型的筛选会为凑够 50 条一路翻到库底（数百请求 ⇒ 很慢/超时）。
+function feedUpdateTypesParam() {
+  const t = serverUpdateTypes(store.feedFilter);
+  return t ? `&updateTypes=${encodeURIComponent(t)}` : '';
+}
 
 // 兼容 events 接口的几种历史形状，避免包一层对象后前端当数组用 → 动态整页空
 function parseEvents(d) {
@@ -17,6 +26,10 @@ function parseEvents(d) {
 }
 
 export const store = reactive({
+  authRequired: null,   // null=未知（探针未跑）/ false=不需要鉴权 / true=需要 ✓
+  // 2026-10-16（审查 💡1）：**显式声明**——它是数据面的核心门禁（startDashboard 的 authed 读它），
+  // 只在 App.vue 的 verifyToken 成功后置 true；不声明的话单看本文件发现不了这个契约 ✓
+  authVerified: false,
   view: 'feed',
   isMobile: false,
   navOpen: false,
@@ -37,6 +50,12 @@ export const store = reactive({
   feedTotal: 0,  // 数据库事件总数（右上角"已加载/总数"）
   eventsRange: { min: null, max: null },  // 动态数据时间范围（日历筛选可选范围）
   feedLoading: false,
+  // 加载失败横幅文案（空串=无错误）。Vue 3 下未声明属性赋值**也会**触发更新（实测 3.5.41），
+  // 声明在此属可维护性（字段全量集中、避免拼写错误静默建新字段），不是修 bug。
+  loadError: '',
+  // 日期分组标签的「现在」。Date.now() 不是响应式依赖 ⇒ 必须由本字段驱动重算，
+  // 否则 23:59 打开页面后过零点仍显示「今天」（复审 💡2 指出的用户可见缺陷）。
+  dayClock: Date.now(),
   feedLoadingMore: false,
 
   friends: [],
@@ -74,9 +93,9 @@ export const store = reactive({
 
   statusPresets: [
     { v: 'active', l: '在线' },
-    { v: 'join me', l: '加入我' },
-    { v: 'ask me', l: '问我' },
-    { v: 'busy', l: '忙碌' },
+    { v: 'join me', l: '欢迎加入' },
+    { v: 'ask me', l: '忙碌' },
+    { v: 'busy', l: '请勿打扰' },
   ],
   statusDesc: '',
 });
@@ -105,9 +124,35 @@ function closeMobileDrawers() {
   if (store.isMobile && store.friendsOpen) store.friendsOpen = false;
 }
 
+// ── 弹窗焦点归还（2026-11-02）──
+// 键盘用户从列表打开详情弹窗、按 Esc 关闭后，若不归还焦点，焦点会掉到 <body> ⇒
+// 只能从头 Tab 一遍才能回到刚才那一行。记录「打开前的 activeElement」，关闭时还原。
+// 只记元素引用、不持有 DOM，元素被移除时 focusOrRestore 会静默跳过（不影响关闭流程）。
+// 焦点来源用**栈**而不是单槽（复审 EMeowAGENT ⚠️4）：
+// 单槽在嵌套弹窗下会被覆盖 —— 开 UserDialog 记列表行 → 弹窗内开 WorldDialog 覆盖成弹窗内元素
+// → 关 WorldDialog 还原并清空 → 关 UserDialog 时槽已空 ⇒ 焦点掉到 body，正是本功能想修的现象。
+const __focusStack = [];
+export function activeFocusStackDepth() { return __focusStack.length; }
+function rememberFocusForModal() {
+  // catch 里不压栈：frontend-catch-guard 的规则是「失败不得被写成正常值」，
+  // 而「读不到 activeElement」本身就是拿不到来源 ⇒ 不压栈，让 restore 自然早退。
+  try { __focusStack.push(document.activeElement || null); } catch { /* 无来源可还原 */ }
+}
+export function restoreFocusAfterModal() {
+  // 栈式还原：每次关闭弹出最近一次打开时记下的来源，嵌套弹窗逐层归还。
+  while (__focusStack.length) {
+    const el = __focusStack.pop();
+    // 跳过已从 DOM 移除的来源（弹窗内部元素可能随弹窗一起销毁），继续往下一层还
+    if (el && typeof el.focus === 'function' && el.isConnected) {
+      try { el.focus({ preventScroll: true }); return; } catch { /* 不可聚焦：继续下一层 */ }
+    }
+  }
+}
+
 export function openUser(u) {
   if (!u) return;
   closeMobileDrawers();
+  rememberFocusForModal();
   if (typeof u === 'string') {
     const found = store.friends.find((f) => f.userId === u);
     // 自己不在 friends 表（不是自己的好友）→ 回退到 store.me，保留头像/状态等字段
@@ -119,37 +164,46 @@ export function openUser(u) {
     store.userModal = u;
   }
 }
-export const closeUser = () => { store.userModal = null; };
+export const closeUser = () => { store.userModal = null; restoreFocusAfterModal(); };
 
 export function openWorld(wid) {
   if (!wid) return;
   closeMobileDrawers();
+  rememberFocusForModal();
   store.worldModal = typeof wid === 'string' ? { worldId: wid } : wid;
 }
-export const closeWorld = () => { store.worldModal = null; };
+export const closeWorld = () => { store.worldModal = null; restoreFocusAfterModal(); };
 
 export function openAvatar(aid) {
   if (!aid) return;
   closeMobileDrawers();
+  rememberFocusForModal();
   store.avatarModal = typeof aid === 'string' ? { avatarId: aid } : aid;
 }
-export const closeAvatar = () => { store.avatarModal = null; };
+export const closeAvatar = () => { store.avatarModal = null; restoreFocusAfterModal(); };
 
 export function openGroup(g) {
   if (!g) return;
   closeMobileDrawers();
+  rememberFocusForModal();
   store.groupModal = typeof g === 'string' ? { groupId: g } : g;
 }
-export const closeGroup = () => { store.groupModal = null; };
+export const closeGroup = () => { store.groupModal = null; restoreFocusAfterModal(); };
 
 export function openInstance(loc) {
   if (!loc) return;
   closeMobileDrawers();
+  rememberFocusForModal();
   store.instanceModal = { location: loc };
 }
-export const closeInstance = () => { store.instanceModal = null; };
+export const closeInstance = () => { store.instanceModal = null; restoreFocusAfterModal(); };
 
-export const openPreview = (url) => { if (url) { closeMobileDrawers(); store.previewUrl = url; } };
+export const openPreview = (url) => {
+  if (!url) return;
+  closeMobileDrawers();
+  rememberFocusForModal();   // 复审 💡3：预览弹窗此前漏接，关掉后焦点同样会掉到 body
+  store.previewUrl = url;
+};
 
 export function copyText(t) {
   if (!t) return;
@@ -214,7 +268,8 @@ export async function loadAnnNewFlag() {
     const base = localStorage.getItem('ga_last_seen') || '';
     store.annHasNew = !!latest && !!base && latest > base;
   } catch {
-    store.annHasNew = false;
+    // 2026-09-22 彻查：取数失败 ⇒ 保持上次已知值，**不要写成 false** ✗
+    // （false 的含义是「确实没有新公告」，而此刻我们只是「没拿到」——弱源不写，见 lesson 0mucncnwh 同族原则）
   }
 }
 
@@ -269,17 +324,94 @@ export async function toggleWatch(userId, displayName = '') {
 }
 
 function syncRightGroups() {
-  store.onlineFriends = store.friends.filter((f) => f.isOnline);
-  store.offlineFriends = store.friends.filter((f) => !f.isOnline);
-  store.favFriends = store.friends.filter((f) => store.favFriendIds && store.favFriendIds.has(f.userId));
+  // 2026-09-22 用户报障「有时候请求正常但右边整块黑的」：这类症状通常是**渲染期抛错**导致整块子树不挂载 ✗。
+  // 这里把唯一会直接 .filter 的数据源做防空（本地缓存 hydrate / 接口返回异常形状时不再整块崩掉 ✓）。
+  const list = Array.isArray(store.friends) ? store.friends : [];
+  store.onlineFriends = list.filter((f) => f.isOnline);
+  store.offlineFriends = list.filter((f) => !f.isOnline);
+  store.favFriends = list.filter((f) => store.favFriendIds && store.favFriendIds.has(f.userId));
 }
 
 // 关键路径（本地 DB，秒回）+ 慢路径（VRChat API，后台填）
 // 已有数据时静默刷新：不再置 feedLoading（避免标题行"同步中…"Tag 闪烁），保持旧列表原地更新
+// ── 本地缓存（2026-09-22 用户要「无感」优化：首屏先用缓存渲染、再后台刷新）──
+// 约束：①只在首屏 hydrate，不改变任何接口语义 ②token 失效应清空 ③TTL 5 分钟，过期仍可用（stale-while-revalidate）
+const CACHE_KEY = 'vrc.dash.cache';
+const CACHE_TTL_MS = 5 * 60_000;
+function readCache() {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (!raw) return null;
+    const o = JSON.parse(raw);
+    if (!o || typeof o !== 'object') return null;
+    return o;
+  // 缓存不可用（非法 JSON / localStorage 被禁）⇒ 裸 return（= undefined）表示「没有缓存」，
+  // 由调用方按无缓存处理；不写 null/false 之类「正常值」，以免被 test/frontend-catch-guard 判为
+  // 「把失败写成业务结论」（缓存语义下等价，且满足该护栏的规则）✓
+  } catch { return; }
+}
+function writeCache(patch) {
+  try {
+    const cur = readCache() || {};
+    localStorage.setItem(CACHE_KEY, JSON.stringify({ ...cur, ...patch, at: Date.now() }));
+  } catch (e) { console.debug('[dashboard] 缓存写入跳过（隐私模式/配额满）:', e); }
+}
+export function clearDashCache() { try { localStorage.removeItem(CACHE_KEY); } catch {} }
+function cacheFresh(o) { return !!o && (Date.now() - (o.at || 0)) < CACHE_TTL_MS; }
+
+// 模块加载即 hydrate：早于 app mount ⇒ 首屏直接用上次数据填满（随后 load() 静默刷新）✓
+hydrateFromCache();
+// token 失效时清空缓存（避免把上个会话的数据显示给未登录/换号的用户）✓
+let __saw401At = 0;
+try { window.addEventListener('vrc-auth-401', () => { __saw401At = Date.now(); clearDashCache(); }); } catch { /* SSR/测试环境无 window */ }
+
+// 首屏 hydrate：用上次的数据先把界面填满（好友/动态/概览），随后 load() 会静默刷新 ✓
+export function hydrateFromCache() {
+  const c = readCache();
+  if (!c) return false;
+  let hit = false;
+  if (Array.isArray(c.friends) && c.friends.length && !store.friends.length) { store.friends = c.friends; syncRightGroups(); hit = true; }
+  if (Array.isArray(c.feedEvents) && c.feedEvents.length && !store.feedEvents.length) {
+    // 2026-09-22 用户报障「左侧整块黑」：此处此前**直接赋值缓存数组** ✗，未经过 parseEvents 归一化 ——
+    // 缓存形状与接口不一致（旧版本缓存 / 字段缺失）时，动态页渲染会抛错 ⇒ 整块不挂载（黑）✗✓。
+    // 现改为走与接口**完全相同**的归一化 + try/catch 兜底 ✓。
+    try {
+      const norm = parseEvents({ events: c.feedEvents, total: c.feedTotal || 0 });
+      if (Array.isArray(norm.events) && norm.events.length) {
+        store.feedEvents = norm.events;
+        store.feedTotal = norm.total || norm.events.length;
+        hit = true;
+      }
+    } catch { /* 缓存形状不可用 ⇒ 跳过 hydrate，等接口 ✓ */ }
+  }
+  if (c.overview && !store.overview) { store.overview = c.overview; hit = true; }
+  if (c.me && !store.me) { store.me = c.me; hit = true; }
+  if (c.nicknameMap && !Object.keys(store.nicknameMap || {}).length) { store.nicknameMap = c.nicknameMap; hit = true; }
+  if (Array.isArray(c.favFriendIds) && c.favFriendIds.length && !(store.favFriendIds && store.favFriendIds.size)) { store.favFriendIds = new Set(c.favFriendIds); hit = true; }
+  if (c.eventsRange && c.eventsRange.min) { store.eventsRange = c.eventsRange; hit = true; }
+  if (hit) console.info('[dashboard] 首屏使用本地缓存渲染（' + (cacheFresh(c) ? '新鲜' : '已过期') + '），随后静默刷新');
+  return hit;
+}
+
 export async function load(quiet = false) {
+  const __roundStart = Date.now();
   const silent = quiet || store.feedEvents.length > 0;
   if (!silent) store.feedLoading = true;
   try {
+    // 2026-09-22 首屏合并：公网反代下每个请求要付 1.4-3s 往返，第一波 4 个接口并为 1 次。
+    // bootstrap 不可用（旧后端 / 404 / 报错）时回退到逐个请求，行为与之前完全一致。
+    let o; let f; let parsed; let rng;
+    // 2026-09-22 #228 的失败判据在两条路径上都要成立 ⇒ 提到外层 let（bootstrap 成功即视为本轮成功）
+    let okAny = true; let feedOk = true;
+    const boot = await get('/api/dashboard/bootstrap?limit=50').catch(() => null);
+    if (boot && (boot.overview || boot.friends)) {
+      o = boot.overview;
+      f = boot.friends;
+      parsed = parseEvents({ events: boot.events || [], total: boot.total || 0 });
+      rng = boot.eventsRange;
+      // bootstrap 返回体缺 events = 关键请求等价失败（#228 语义：关键请求失败不得清横幅、不得用空值覆盖旧动态）
+      feedOk = Array.isArray(boot.events);
+    } else {
     const settled = await Promise.allSettled([
       get('/api/dashboard/overview'),
       get('/api/dashboard/friends?limit=1000'),  // issue #127：好友全量进 store，避免截断误判非好友
@@ -287,10 +419,22 @@ export async function load(quiet = false) {
       get('/api/dashboard/events-range'),
     ]);
     const val = (i) => (settled[i].status === 'fulfilled' ? settled[i].value : null);
-    const o = val(0);
-    const f = val(1);
-    const parsed = parseEvents(val(2));
-    const rng = val(3);
+    // 2026-09-22 评审 🔴：这里原为 const o/f/parsed/rng —— 块级 const 遮蔽了外层 let
+    // ⇒ 出块后 parsed 仍是 undefined ⇒ parsed.events 抛 TypeError 被外层 catch 吞掉
+    // ⇒ 回退模式下首屏全空（与正文声称的「行为与之前一致」不符）⇒ 改为只赋值、不声明
+    // 2026-09-22 评审残留（#228）：allSettled **永不 reject** ⇒ 不能把"本轮全部结束"当成"本轮成功"
+    // 判据改为"至少一个 fulfilled"；全部失败时反而写 loadError（此前 load() 自身无失败上报路径）
+    // 2026-09-22 评审（阻断 · #228）：只判「有任一成功」不够 —— events 单点失败而 overview 成功时，
+    // 横幅被清 + 动态被写成空 ⇒ 仍是「把失败伪装成正常结论」。关键请求＝动态流（settled[2]）
+    // ⚠️ 维护方合并说明：#237 引入 bootstrap 路径后，这两个判据必须在外层声明（否则 bootstrap 路径
+    //    走到下方公共代码时 feedOk 未定义 → 被外层 catch 吞掉 → 首屏静默空白）
+    okAny = settled.some((x) => x.status === 'fulfilled');
+    feedOk = settled[2].status === 'fulfilled';
+    o = val(0);
+    f = val(1);
+    parsed = parseEvents(val(2));
+    rng = val(3);
+    }
     if (rng && rng.min) store.eventsRange = { min: rng.min, max: rng.max || null };
     if (o) {
       store.overview = o;
@@ -302,13 +446,26 @@ export async function load(quiet = false) {
       if (o.vrcStatus) store.vrcStatus = o.vrcStatus;
       else if (o.status && o.status.indicator) store.vrcStatus = o.status.indicator;
     }
+    store.loadError = feedOk ? '' : (okAny ? '动态流加载失败（其余数据正常）' : '本轮请求全部失败（网络或服务不可达）');   // 关键请求成功才清；文案不带前缀（模板已拼「加载失败：」）
     store.friends = (f && f.friends) || (Array.isArray(f) ? f : store.friends);
-    if (!Array.isArray(store.feedEvents) || store.feedEvents.length <= 50) {
+    // 评审（阻断）其二：关键请求失败时不得用空值覆盖旧数据（否则「暂无动态」且无提示）
+    if (feedOk && (!Array.isArray(store.feedEvents) || store.feedEvents.length <= 50)) {
       store.feedEvents = parsed.events;
       store.feedTotal = parsed.total || store.feedTotal;
     }
-    store.feedHasMore = parsed.events.length >= 50;
+    if (feedOk) store.feedHasMore = parsed.events.length >= 50;
     syncRightGroups();
+    if (okAny && __saw401At <= __roundStart) writeCache({
+      friends: store.friends,
+      feedEvents: store.feedEvents.slice(0, 50),
+      feedTotal: store.feedTotal,
+      overview: store.overview,
+      me: store.me,
+      nicknameMap: store.nicknameMap,
+      // ⚠️1（审查）：Set 不能直接 JSON 化 ⇒ 存数组、hydrate 时重建 Set（首屏「仅星标」与昵称列不再短暂为空）
+      favFriendIds: Array.from(store.favFriendIds || []),
+      eventsRange: store.eventsRange,
+    });
 
     Promise.allSettled([
       get('/api/dashboard/favorites?type=friends'),
@@ -349,12 +506,14 @@ export async function resetFeed() {
   store.feedHasMore = true;
   store.feedLoading = true;  // 筛选切换期间显示加载态，不再闪"暂无动态"
   try {
-    const parsed = parseEvents(await get(`/api/dashboard/events?limit=50&dateFrom=${encodeURIComponent(store.feedDateFrom || '')}&dateTo=${encodeURIComponent(store.feedDateTo || '')}`));
+    const parsed = parseEvents(await get(`/api/dashboard/events?limit=50&dateFrom=${encodeURIComponent(store.feedDateFrom || '')}&dateTo=${encodeURIComponent(store.feedDateTo || '')}${feedUpdateTypesParam()}`));
     store.feedEvents = parsed.events;
     store.feedTotal = parsed.total || store.feedTotal;
     store.feedHasMore = parsed.events.length >= 50;
-  } catch {
-    store.feedHasMore = false;
+  } catch (err) {
+    // 2026-09-22 彻查（同类第 3 处）：筛选切换时请求失败也不能当成「没有更多」✗；
+    // 交给全局失败横幅显示原因，feedHasMore 保持原值（旧列表仍在，不谎报到底）。
+    store.loadError = (err && err.message) ? err.message : '网络或服务不可达';
   } finally {
     store.feedLoading = false;
   }
@@ -368,7 +527,7 @@ export async function loadMoreFeed({ target = 50, countMatch = null } = {}) {
   try {
     while (store.feedHasMore) {
       const offset = store.feedEvents.length;
-      const d = parseEvents(await get(`/api/dashboard/events?limit=50&offset=${offset}&dateFrom=${encodeURIComponent(store.feedDateFrom || '')}&dateTo=${encodeURIComponent(store.feedDateTo || '')}`));
+      const d = parseEvents(await get(`/api/dashboard/events?limit=50&offset=${offset}&dateFrom=${encodeURIComponent(store.feedDateFrom || '')}&dateTo=${encodeURIComponent(store.feedDateTo || '')}${feedUpdateTypesParam()}`));
       store.feedTotal = d.total || store.feedTotal;
       const more = d.events;
       if (!more.length) {
@@ -376,14 +535,16 @@ export async function loadMoreFeed({ target = 50, countMatch = null } = {}) {
         break;
       }
       store.feedEvents = [...store.feedEvents, ...more];
+      store.loadError = '';   // 同上：分页成功也清空 ✓
       store.feedHasMore = more.length >= 50;
       // 匹配数达标（或没有匹配判定=普通分页一次一批）→ 停；否则继续向前加载
       if (!countMatch) break;
       if (countMatch() >= target) break;
       if (!store.feedHasMore) break;
     }
-  } catch {
-    store.feedHasMore = false;
+  } catch (err) {
+    // 2026-09-22：失败不得伪装成「没有更多了」✗ —— 保持 feedHasMore 原值，把失败交给全局横幅 + 重试 ✓
+    store.loadError = (err && err.message) ? err.message : '加载更多失败（网络或服务不可达）';
   } finally {
     store.feedLoadingMore = false;
   }
@@ -445,12 +606,29 @@ function mergeFeedEvents(latest) {
 }
 
 let feedRefreshTimer = null;
+// 日期分组时钟：只在本地下一个零点前 1 秒跳一次，然后重排下一次。
+// 为什么不用 setInterval(60s)：跨午夜只需要「过零点时变一次」，高频 tick 会让
+// computed(feedRows) 每分钟重算整表（50 行 × 分支），纯属浪费。
+// 为什么需要它：Date.now() 不是响应式依赖 ⇒ 不定时推 store.dayClock，
+// computed 不会重算，23:59 打开后过零点仍显示「今天」（复审 💡2）。
+let dayClockTimer = null;
+export function scheduleDayClock() {
+  clearTimeout(dayClockTimer);
+  const now = new Date();
+  const nextMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 1, 0);
+  const delay = Math.max(1000, nextMidnight.getTime() - now.getTime());
+  dayClockTimer = setTimeout(() => {
+    store.dayClock = Date.now();
+    scheduleDayClock();
+  }, delay);
+}
+
 function refreshFeed() {
   clearTimeout(feedRefreshTimer);
   feedRefreshTimer = setTimeout(async () => {
     try {
       const want = Math.min(Math.max(store.feedEvents.length, 50), 200);
-      const e = parseEvents(await get(`/api/dashboard/events?limit=${want}`));
+      const e = parseEvents(await get(`/api/dashboard/events?limit=${want}${feedUpdateTypesParam()}`));
       if (e.events.length) {
         store.feedTotal = e.total || store.feedTotal;
         mergeFeedEvents(e.events);
@@ -471,7 +649,7 @@ function refreshFriends() {
       const f = await get('/api/dashboard/friends?limit=1000');  // issue #127
       if (f && Array.isArray(f.friends)) {
         // 按 userId 合并，保留现有顺序，更新已存在的、追加新的
-        const m = new Map(store.friends.map((x) => [x.userId, x]));
+        const m = new Map((Array.isArray(store.friends) ? store.friends : []).map((x) => [x.userId, x]));
         for (const nf of f.friends) m.set(nf.userId, nf);
         const merged = f.friends.map((x) => m.get(x.userId));
         for (const x of store.friends) {
@@ -590,9 +768,16 @@ function updateFriendFromEvent(ev) {
 }
 
 function trackViewport() {
-  const update = () => { store.isMobile = window.innerWidth < 900; };
+  // 移动布局判定：宽度 < 900，或触控设备（pointer: coarse）且宽度 < 1100。
+  // 后者覆盖 Android Chrome「桌面版网站」/高 DPR 大屏手机——innerWidth 可能 ≥900，
+  // 但触屏设备渲染桌面布局会导致底部导航栏缺失（用户实测：手机上 tabbar 消失）。
+  const update = () => {
+    const coarse = window.matchMedia('(pointer: coarse)').matches;
+    store.isMobile = window.innerWidth < 900 || (coarse && window.innerWidth < 1100);
+  };
   update();
   window.addEventListener('resize', update);
+  window.matchMedia('(pointer: coarse)')?.addEventListener?.('change', update);
 }
 
 // 视图快捷键映射：Alt+数字 或 Ctrl+数字 快速切换（数字 = 导航顺序，避开输入框聚焦态）
@@ -628,29 +813,50 @@ function initKeyboard() {
       return;
     }
     if (e.key === 'Escape') {
+      // 关闭后归还焦点（2026-11-02）：否则键盘用户只能从 <body> 重新 Tab 回来
       if (store.quickSearchOpen) { store.quickSearchOpen = false; return; }
-      if (store.userModal) { store.userModal = null; return; }
-      if (store.worldModal) { store.worldModal = null; return; }
-      if (store.avatarModal) { store.avatarModal = null; return; }
-      if (store.groupModal) { store.groupModal = null; return; }
-      if (store.instanceModal) { store.instanceModal = null; return; }
+      if (store.userModal) { store.userModal = null; restoreFocusAfterModal(); return; }
+      if (store.worldModal) { store.worldModal = null; restoreFocusAfterModal(); return; }
+      if (store.avatarModal) { store.avatarModal = null; restoreFocusAfterModal(); return; }
+      if (store.groupModal) { store.groupModal = null; restoreFocusAfterModal(); return; }
+      if (store.instanceModal) { store.instanceModal = null; restoreFocusAfterModal(); return; }
     }
   });
 }
 
+// 2026-09-22 评审三轮：拆成两个幂等门 —— 本地初始化（可早于 mount）与数据面启动（探针判定后才允许）
+// 原因：未启用令牌的部署里 main.js 会在 app.mount() 前先调一次（那时 authRequired 还没置位 ⇒ authed=false），
+// 若用单个门，首次调用就把门锁掉 ⇒ App 在探针判定后那次调用被吞 ⇒ 零请求 / 不连 SSE / 不起校准
+let __dashStarted = false;   // 本地初始化门（幂等：只做一次，重复调用无副作用）
+let __dataStarted = false;   // 数据面门（只有 authed 时才开，且只开一次）
 export function startDashboard() {
-  initFromHash();
-  load();
-  loadWatchlist();
-  loadTracked();
-  loadNotifCount();
-  loadAnnNewFlag();
-  try { store.notifyEnabled = localStorage.getItem('vrc_notify') === '1'; } catch { /* 隐私模式 */ }
-  startSse();
-  trackViewport();
-  initKeyboard();
-  bindHashChange();
-  setInterval(() => load(true), 120000);  // 全量校准：120s 一次（SSE 增量主导，全量只防丢帧/断线自愈）
-  // 右侧栏"我自己"状态/位置：由 SSE user-update/user-location 事件直接更新 me + refreshMeFresh() 节流拉取，
-  // 不再需要 10s 定时全量拉 /me（已移除，2026-09-01 SSE 增量改造）
+  // 2026-10-16 审查 🔴1：真实入口是 main.js 先 startDashboard() 再 mount ⇒ 有旧令牌时
+  // authed 若只看 getToken() 就会在校验前打开数据面（实测 13 个请求）
+  // ⇒ 数据面必须等「令牌已校验通过（store.authVerified）」；未启用令牌的部署走 authRequired === false ✓
+  const authed = (() => { try { return (!!getToken() && store.authVerified === true) || store.authRequired === false; } catch { return false; } })();
+  // 2026-10-16（合并上游与本仓实现）：**保留上游的双门 + authRequired 语义**（未启用令牌的部署靠它放行数据面），
+  // 同时套上本仓的「逐步独立兜底」——本函数此前是一条直线，任何一步抛错（实测首步 initFromHash 即抛）
+  // 都会让后面的数据加载全部不执行 ⇒ 页面能渲染但 **api:0**（「暂无动态」却没有任何请求）✗ ✓
+  const step = (name, fn) => { try { fn(); } catch (e) { console.warn('[dashboard] 启动步骤失败 ' + name + ':', e); } };   // 注意：某步失败**不会自动重试**（__dataStarted 在此之前已置位），需刷新页面 ✓
+  // —— 本地初始化：不依赖鉴权，幂等 ——
+  if (!__dashStarted) {
+    __dashStarted = true;
+    step('initFromHash', () => initFromHash());
+    step('notifyEnabled', () => { store.notifyEnabled = localStorage.getItem('vrc_notify') === '1'; });
+    step('trackViewport', () => trackViewport());
+    step('initKeyboard', () => initKeyboard());
+    step('bindHashChange', () => bindHashChange());
+  }
+  // —— 数据面：未登录不请求、不连 SSE、不轮询；探针判定后由 App 再调一次即可启动 ——
+  if (!__dataStarted && authed) {
+    __dataStarted = true;
+    step('load', () => load());
+    step('loadWatchlist', () => loadWatchlist());
+    step('loadTracked', () => loadTracked());
+    step('loadNotifCount', () => loadNotifCount());
+    step('loadAnnNewFlag', () => loadAnnNewFlag());
+    step('startSse', () => startSse());   // 与数据加载同处守卫（原 SSE 没进守卫 ⇒ 一连上就触发 load() ⇒ 登录页 overview 401）
+    step('poll', () => setInterval(() => load(true), 120000));   // 全量校准：120s 一次（未登录不轮询）
+    step('dayClock', () => scheduleDayClock());   // 跨午夜重算日期分组标签（复审 💡2）
+  }
 }

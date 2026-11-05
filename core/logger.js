@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
@@ -61,16 +62,39 @@ const state = {
   console: true,
   color: 'auto',
   suppress: [],
+  syslogPrefix: false,
   filePath: '',
   fileEnabled: false,
+  // 运行期文件写入「连续失败段」计数（成功落盘即清零）：用于错误去重与不可自愈时的降级判定
+  fileWriteFailures: 0,
   closed: false,
   pid: process.pid,
 };
+
+// 级别名 → syslog 优先级（RFC 5424）：debug=7 info=6 warn=4 error=3。
+// 仅在 VRC_MONITOR_LOGGER_SYSLOG_PREFIX 开启时给 stdout 行加 `<N>` 前缀，
+// 供 systemd（SyslogLevelPrefix= 默认 true）解析成 journald 的 PRIORITY 字段，
+// 使 `journalctl -p warning` 等按级别过滤生效。文件输出永不加此前缀。
+const SYSLOG_LEVELS = { debug: 7, info: 6, warn: 4, error: 3 };
+
+function syslogPrefixFor(levelName) {
+  const pri = SYSLOG_LEVELS[String(levelName).toLowerCase()];
+  return pri === undefined ? '' : `<${pri}>`;
+}
 
 function resolveDir() {
   // 日志模块专属变量名（VRC_MONITOR_LOGGER_DIR），不与 AGENTS.md 里 service-windows 用的 VRC_MONITOR_LOG_DIR 撞名
   if (process.env.VRC_MONITOR_LOGGER_DIR) {
     return path.resolve(process.env.VRC_MONITOR_LOGGER_DIR);
+  }
+  // node --test 上下文（node --test 子进程 NODE_TEST_CONTEXT=child-v8，已实测）：
+  // 任何继承 VRC_MONITOR_DIR 的测试进程都会把日志写进生产目录（实测 96 行 wrld_kbtest-*
+  // 测试夹具污染主仓库生产日志），单点防御落到系统临时目录与生产日志物理隔离。
+  // 显式 VRC_MONITOR_LOGGER_DIR 永远优先（上方分支），此处只在未显式指定时兜底。
+  if (process.env.NODE_TEST_CONTEXT) {
+    const dir = path.join(os.tmpdir(), 'vrc-monitor-test-logs');
+    console.info(`[logger] 检测到 node --test 上下文，日志落盘改用临时目录: ${dir}（如需显式指定请设 VRC_MONITOR_LOGGER_DIR）`);
+    return dir;
   }
   if (process.env.VRC_MONITOR_DIR) {
     return path.join(process.env.VRC_MONITOR_DIR, 'logs');
@@ -140,6 +164,11 @@ function buildConfig(options) {
     suppress: parseSuppress(
       envOrOpt('VRC_MONITOR_LOGGER_SUPPRESS', 'suppress')
     ),
+    file: parseBool(envOrOpt('VRC_MONITOR_LOGGER_FILE', 'file'), true),
+    syslogPrefix: parseBool(
+      envOrOpt('VRC_MONITOR_LOGGER_SYSLOG_PREFIX', 'syslogPrefix'),
+      false
+    ),
   };
 }
 
@@ -155,10 +184,19 @@ export function initLogger(options = {}) {
   state.console = cfg.console;
   state.color = cfg.color;
   state.suppress = cfg.suppress;
+  state.syslogPrefix = cfg.syslogPrefix;
   state.filePath = path.join(state.dir, 'monitor.log');
-  state.fileEnabled = true;
+  state.fileEnabled = cfg.file;
+  state.fileWriteFailures = 0;
   state.closed = false;
   state.pid = process.pid;
+
+  // 文件输出被显式关闭（VRC_MONITOR_LOGGER_FILE=0）时不建目录、不校验可写：
+  // 用于 systemd/journald 场景避免「文件 + journald」双份落盘（stdout 始终保留）。
+  if (!cfg.file) {
+    state.filePath = '';
+    return state;
+  }
 
   try {
     fs.mkdirSync(state.dir, { recursive: true });
@@ -222,6 +260,17 @@ export function redactSecrets(text) {
   // 中文键「授权码」：\b 对 CJK 无效，单独用宽松值兜底
   out = out.replace(/((?:授权码)\s*[:=:：]\s*)(\S+)/gi, '$1[REDACTED]');
 
+  // 中文校验码：验证码 / 校验码 / 动态码 + 分隔符（`: = ：` 或「是/为」，也接受纯空格）+ **码样值**
+  // 2026-10-16 审查 ⚠️1/⚠️2 修正：旧写法「显式分隔符 + `\S+`」有两个口径问题 ——
+  //   ① 只有紧跟 `: = ：` 才命中 ⇒ 「验证码 123456」「您的验证码是 123456」这类自然语序**明文落盘**；
+  //   ② `\S+` 会把紧随的中文正文一起吞掉（「验证码：短信已发送到邮箱」整句被遮）⇒ 与「不吞正文」自述不符。
+  // 现改为「值必须是码样（字母数字 4-10 位）」：两条都成立，且更保守（不会误遮正文）✓
+  // （\b 对 CJK 无效，与上方「授权码」同族单独兜底；要求显式分隔符，避免吞掉正文里的下一个词）
+  // 2026-10-16 审查 💡1/💡2：①分隔符允许「是/为 + 可选冒号」组合（验证码为：123456 此前明文）
+  //   ②无分隔符紧贴形态（验证码123456已发送）另加一条**只认紧贴纯数字 4-10 位**的窄分支（不放开通用值类）✓
+  out = out.replace(/((?:验证码|校验码|动态码)(?:(?:是|为)\s*(?:[:=：]\s*)?|[:=：]\s*|\s+(?:是|为)?\s*))([A-Za-z0-9"'「『（(][^\s　-〿＀-￯]*[」』）)"]?)/gi, '$1[REDACTED]');
+  out = out.replace(/((?:验证码|校验码|动态码))(\d{4,10})(?!\d)/g, '$1[REDACTED]');
+
   // 兜底：邮箱
   out = out.replace(/[\w.+-]+@[\w-]+\.[\w.]+/g, '[REDACTED]');
 
@@ -282,7 +331,11 @@ function writeToConsole(levelName, line) {
   const useColor =
     state.color === true ||
     (state.color === 'auto' && process.stdout.isTTY && state.format === 'text');
-  if (useColor) {
+  // syslog 前缀必须落在行首（systemd 逐行解析 `<N>`）；ANSI 色码会挡在它前面导致解析失败，
+  // 故开启前缀时强制不着色（systemd 下 stdout 非 TTY，auto 本就为假，这里是防御性保证）。
+  if (state.syslogPrefix) {
+    output = `${syslogPrefixFor(levelName)}${line}`;
+  } else if (useColor) {
     output = applyColor(line, levelName);
   }
 
@@ -368,6 +421,73 @@ function checkRotation(line) {
   }
 }
 
+// 运行期文件写入：自愈 + 错误去重 + 不可自愈降级（issue #278）。
+// 背景：日志目录此前只在 initLogger 里建一次，而 appendFileSync 是唯一落盘点——运行期
+// 目录被外部删除（清理脚本 / git clean / 挂载点重挂载）后，旧行为每写一行刷一条 ENOENT
+// 且永不恢复，直到重启；同时 getLoggerInfo() 仍报 file:true，与「一行都没落盘」自相矛盾
+// （违背 #200 审定的「报生效值」约定）。
+// 现行为：① ENOENT/ENOTDIR（目录缺失）→ 重建目录后重试一次（自愈，不属降级）；
+// ② 同一「连续失败段」内错误只输出一次，不逐行刷屏；
+// ③ 连续失败达 FILE_WRITE_DEGRADE_AFTER 次 → 按启动期同语义降级为仅 console
+//    （fileEnabled=false + filePath=''），使 /health.logging 继续报生效值。
+//    ⚠️ 显式取舍（降级是「本进程生命周期内单向」的，需重启恢复）：ENOENT/ENOTDIR 走 ①
+//    自愈、不进入降级；但 ENOSPC/EPERM/EBUSY/EMFILE/EACCES 这类「原因可能自行消失」的
+//    瞬时失败，连续 3 次同样会降级且此后本进程不再重试写文件——即把一次瞬时抖动放大为
+//    「重启才恢复」。此处优先保证「失败不逐行刷屏 + /health 不说谎」，与 doRotate() 对
+//    EPERM/EBUSY「跳过本次轮转」的既有取舍取向一致；不引入后台定时重试以保持 logger 无副作用。
+const FILE_WRITE_DEGRADE_AFTER = 3;
+
+function appendFileLine(fileLine) {
+  checkRotation(fileLine);
+  fs.appendFileSync(state.filePath, `${fileLine}\n`, 'utf8');
+}
+
+function markFileWriteFailure(err) {
+  state.fileWriteFailures += 1;
+  // console 通道可能被 VRC_MONITOR_LOGGER_CONSOLE=0 关闭：提示文案随之静默，但**状态迁移
+  // 不受影响**（降级必须照样发生，否则该配置下 /health.logging 会退回「零落盘却报 file:true」）。
+  if (state.fileWriteFailures === 1 && state.console) {
+    console.error(`[logger] 写入日志文件失败: ${err.message}`);
+  }
+  if (state.fileWriteFailures >= FILE_WRITE_DEGRADE_AFTER) {
+    state.fileEnabled = false;
+    state.filePath = '';
+    if (state.console) {
+      console.error(
+        `[logger] 日志文件连续 ${state.fileWriteFailures} 次写入失败，已降级为仅 console（不再落盘，重启后重新尝试）: ${err.message}`
+      );
+    }
+  }
+}
+
+function writeFileLines(fileLines) {
+  for (const fileLine of fileLines) {
+    try {
+      appendFileLine(fileLine);
+      state.fileWriteFailures = 0; // 成功落盘即结束失败段
+    } catch (err) {
+      // 目录被外部删除是可确定性自愈的：重建目录 + 重试同一行，不留降级痕迹。
+      // 提示走裸 console——此时才刚恢复文件通道，且不能在 write() 内递归调用 write()。
+      if (err && (err.code === 'ENOENT' || err.code === 'ENOTDIR')) {
+        try {
+          fs.mkdirSync(state.dir, { recursive: true });
+          appendFileLine(fileLine);
+          state.fileWriteFailures = 0;
+          if (state.console) {
+            console.info(`[logger] 日志目录已被外部删除，已重建: ${state.dir}`);
+          }
+          continue;
+        } catch (retryErr) {
+          markFileWriteFailure(retryErr);
+          return; // 本批剩余行不再逐个尝试：同一次失败不重复刷屏
+        }
+      }
+      markFileWriteFailure(err);
+      return;
+    }
+  }
+}
+
 function write(levelName, name, msg, meta) {
   if (state.closed) return;
 
@@ -395,14 +515,16 @@ function write(levelName, name, msg, meta) {
   writeToConsole(levelName, line);
 
   if (state.fileEnabled && state.filePath) {
-    try {
-      checkRotation(line);
-      fs.appendFileSync(state.filePath, `${line}\n`, 'utf8');
-    } catch (err) {
-      if (state.console) {
-        console.error(`[logger] 写入日志文件失败: ${err.message}`);
-      }
-    }
+    // 多行消息按行拆分落盘：每行都带完整前缀。否则「前缀+空正文」行会被解析成
+    // 空条目（日志页出现空行）、无前缀的续行（如 `\n[启动]...` 的正文、error.stack）
+    // 会被解析器整行丢弃（日志页数据丢失）。空段跳过——装饰性 '\n' 不再产生空行。
+    const fileLines = state.format === 'json'
+      ? [line]
+      : redactedMsg.split('\n')
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .map((seg) => formatText(ts, levelName, name, seg));
+    writeFileLines(fileLines);
   }
 }
 
@@ -435,6 +557,25 @@ export function getLevelName(level) {
     if (val === n) return name;
   }
   return 'info';
+}
+
+/**
+ * 运行期日志配置快照（供 /health 只读暴露）。
+ * 不触发初始化：未初始化时字段为默认值（filePath 为空 = 尚未落盘目录）。
+ * 不含任何凭据/内容，仅配置元数据（level/format/dir/filePath/file/console/syslogPrefix）。
+ */
+export function getLoggerInfo() {
+  return {
+    level: getLevelName(state.level),
+    format: state.format,
+    dir: state.dir,
+    filePath: state.filePath,
+    // 报**生效值**而非配置值：目录不可写时会降级（fileEnabled=false + filePath=''），
+    // 若仍报配置的 true 会与空 filePath 自相矛盾、误导「日志在哪」的自诊断。
+    file: state.fileEnabled,
+    console: state.console,
+    syslogPrefix: state.syslogPrefix,
+  };
 }
 
 export function rotate() {

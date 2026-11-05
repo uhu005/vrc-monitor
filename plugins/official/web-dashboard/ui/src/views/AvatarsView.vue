@@ -2,6 +2,7 @@
 import { ref, onMounted, computed } from 'vue';
 import { get, post } from '../api.js';
 import { toast } from '../toast.js';
+import { confirm } from '../confirm.js';
 import { openAvatar } from '../store.js';
 
 // 我的模型 + 收藏模型（对齐 VRCX Avatars）：/avatars?userId=me（更新排序）
@@ -46,6 +47,8 @@ async function toggleFav(a) {
   const id = a.avatarId || a.id;
   if (!id) return;
   const fav = isFav(a);
+  // #162：取消收藏=云端不可逆，UI 二次确认（收藏添加无需确认）
+  if (fav && !await confirm({ message: '确认取消收藏该模型？不可恢复。', header: '取消收藏', acceptLabel: '取消收藏' })) return;
   try {
     const r = await post('/api/dashboard/avatar/favorite', { avatarId: id, favorite: !fav });
     if (r && r.error) throw new Error(r.error);
@@ -83,7 +86,7 @@ onMounted(load);
       <h2><i class="pi pi-user-edit"></i> 我的模型</h2>
       <span class="av-count">上传与收藏 · 后端 30 分钟缓存</span>
       <InputText v-model="q" placeholder="搜索模型…" class="av-search" aria-label="搜索模型" />
-      <Button size="small" text icon="pi pi-refresh" title="刷新" @click="load" />
+      <Button size="small" text icon="pi pi-refresh" title="刷新" @click="load" aria-label="刷新" />
     </div>
 
     <div class="av-chips" role="group" aria-label="模型类别筛选">
@@ -132,8 +135,8 @@ onMounted(load);
 .av-nocover { display: flex; align-items: center; justify-content: center; color: var(--text-dim); font-size: 28px; }
 .ac-fav { position: absolute; top: 6px; right: 6px; background: rgba(0,0,0,0.45); border: none; border-radius: 50%; width: 26px; height: 26px; color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 12px; transition: transform 0.12s; }
 .ac-fav:hover { transform: scale(1.12); }
-.ac-fav.on { color: #ffca28; }
-.ac-select { color: #7bed9f; }
+.ac-fav.on { color: var(--star); }
+.ac-select { color: var(--ok); }
 .ac-fav:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .ac-body { padding: 7px 9px; }
 .ac-name { font-size: 12px; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

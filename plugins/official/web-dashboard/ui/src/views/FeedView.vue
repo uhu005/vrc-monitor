@@ -1,11 +1,12 @@
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
 import { store, setView, openUser, openWorld, openPreview, loadMoreFeed, copyText, openGroup, resetFeed } from '../store.js';
-import { time, date, locLabel, statusLabels, trustColor, instanceLabel, avatarLabel } from '../utils.js';
+import { time, date, locLabel, specialLocationLabel, prevLocationLabel, parseLoc, isPrivateInstance, statusLabels, trustColor, instanceLabel, avatarLabel } from '../utils.js';
 import { post } from '../api.js';
 import { toast } from '../toast.js';
 import { statusColor } from '../composables/useFriendGroups.js';
 import { typeOf, isNotiUpdate, TYPE_LABELS, TYPE_ICONS, TYPE_SEVERITIES } from '../constants/event-types.js';
+import { daySepLabel } from '../utils/feed-day-label.js';
 
 const datePop = ref(null);
 
@@ -25,6 +26,26 @@ function sourceLabel(s) {
   return s || '—';
 }
 
+// 左端「从哪来」：只认紧邻的上一个位置（判据见 utils.prevLocationLabel，有纯函数单测）
+function prevLabelOf(e) { return prevLocationLabel(e.previousLocation, e.previousWorldName); }
+function curIsWorld(e) { return String(e.worldId || '').startsWith('wrld_'); }
+// 位置行左右两端共用同一私人实例判据（utils.isPrivateInstance；别再各写一份，2026-10-18 复审 💡1）
+function destPrivate(e) { return isPrivateInstance(e.location); }
+function prevPrivate(e) { return isPrivateInstance(e.previousLocation); }
+// 左端（上一个位置）的实例信息：公开 · US · 36146（用户 2026-09-24 定「公开房间那侧要显示图像世界名和房间号」）。
+// 与目的地那侧的 inst 口径一致：都走 parseLoc + instanceLabel（不再用 locLabelFull 的整串文案）。
+// 与 locLabelFull 的**有意差异**（2026-10-16 审查 nixi-agent 2，已确认）：
+// 对「有 region、但没有实例类型 token、房间号为空」的畸形串（如 wrld_abc:~region(us) / local:~region(jp)），
+// locLabelFull 会渲染一个**只含国家**的 chip（US），实测 288 条语料里 14 条属这一类；本函数**不产出 chip**（返回空）——
+// 理由：只写国家没有信息量，且真实 VRChat 位置串形如 wrld_x:12345~region(us)、不会命中这一类。
+// 这是刻意的行为差异，不是「同口径替换」的遗漏。
+function prevInstLabel(e) {
+  const p = parseLoc(e.previousLocation || '');
+  if (!p || !p.type) return '';
+  return [instanceLabel(p.type), p.region ? p.region.toUpperCase() : '', p.instanceId || ''].filter(Boolean).join(' · ');
+}
+
+
 /* ── 类型定义（对齐 VRCX Feed filters：GPS/Online/Offline/Status/Avatar/Bio）── */
 const filterOptions = [
   { value: 'all', label: '所有' },
@@ -34,6 +55,7 @@ const filterOptions = [
   { value: 'status', label: '状态变动' },
   { value: 'avatar', label: '模型变动' },
   { value: 'bio', label: '简介变更' },
+  { value: 'trustLevel', label: '等级变动' },
 ];
 
 /* ── 日期范围筛选（VRCX 式日历范围选择：只选首尾，中间某天没数据也可选）── */
@@ -121,18 +143,6 @@ function toggleFav() {
 function toggleWatchFilter() {
   store.feedOnlyWatch = !store.feedOnlyWatch;
 }
-function exportRows() {
-  const list = rows.value || [];
-  if (!list.length) { toast('当前无事件可导出', 'warn'); return; }
-  const blob = new Blob([JSON.stringify(list, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = 'vrchat-events-' + new Date().toISOString().slice(0, 10) + '.json';
-  a.click();
-  URL.revokeObjectURL(url);
-  toast('已导出 ' + list.length + ' 条事件', 'success');
-}
 
 function toggleTrackedFilter() {
   store.feedOnlyTracked = !store.feedOnlyTracked;
@@ -208,13 +218,13 @@ function playerNameOf(x) {
   return x.notiGroupName || '通知';
 }
 function playerAvatarOf(x) {
-  if (!isNoti(x)) return x.avatarUrl || x.userIcon || '';
+  if (!isNoti(x)) return x.userIcon || x.avatarUrl || '';
   if (typeOf(x) === 'group') return x.notiImageUrl || '';
   if (x.senderUserId) {
     const f = store.friends.find((f) => f.userId === x.senderUserId);
-    if (f) return f.avatarUrl || f.userIcon || '';
+    if (f) return f.userIcon || f.avatarUrl || '';
   }
-  return x.avatarUrl || x.userIcon || '';
+  return x.userIcon || x.avatarUrl || '';
 }
 function playerOpen(x) {
   if (isNoti(x)) {
@@ -260,23 +270,16 @@ const rows = computed(() => {
   return list;
 });
 
-// 按天分组（今天/昨天/MM-DD）：feedRows 只给模板用，rows 保持纯列表供计数/加载逻辑
-function daySepLabel(iso) {
-  if (!iso) return '';
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return '';
-  const today = new Date();
-  const yest = new Date(today.getTime() - 86400000);
-  const same = (a, b) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
-  if (same(d, today)) return '今天';
-  if (same(d, yest)) return '昨天';
-  return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
+// 按天分组（今天/昨天/MM-DD）：纯函数在 utils/feed-day-label.js（可注入 nowMs ⇒ 跨午夜边界可测）
 const feedRows = computed(() => {
   const out = [];
   let lastDay = '';
+  // 「现在」取自 store.dayClock（响应式）：普通 Date.now() 不是响应式依赖，
+  // 跨午夜时 computed 不会重算 ⇒ 过零点仍显示「今天」（复审 💡2）。
+  // 代价是 tick 落在零点后 1s，可接受。
+  const nowMs = store.dayClock;
   for (const x of rows.value) {
-    const d = daySepLabel(x.createdAt);
+    const d = daySepLabel(x.createdAt, nowMs);
     if (d !== lastDay) { out.push({ __sep: d }); lastDay = d; }
     out.push(x);
   }
@@ -286,7 +289,7 @@ const feedRows = computed(() => {
 /* ── 自动加载 ── */
 const FEED_TARGET = 50;
 // 性能保护（无虚拟滚动）：移动端 DOM 行数上限收紧（中端机挂 400 个复杂行滚动掉帧），
-// 桌面 400。到上限后停补并隐藏"加载更多"，用户用筛选/日期缩小范围查看更早内容
+// 桌面 400。到上限后**只停止自动触底补拉**（静默保护 DOM）；手动"加载更多"按钮始终可用 ✓（2026-09-22 用户要求撤掉对用户可见的上限语义）
 const isMobileDev = () => (typeof window !== 'undefined' && window.innerWidth < 900);
 const feedHardCap = computed(() => (isMobileDev() ? 200 : 400));
 function hasFilter() {
@@ -362,7 +365,6 @@ onUnmounted(() => {
 
     <div class="feed-head">
       <h2><i class="pi pi-bolt"></i> 动态</h2>
-      <span class="feed-sub">{{ store.feedTotal ? '数据库共 ' + store.feedTotal + ' 条' : '好友活动实时记录' }}</span>
       <Tag v-if="store.feedLoading" value="同步中…" severity="secondary" rounded />
       <!-- 日期+星标在标题行（双端统一）；弹层锚定到点击的按钮 -->
       <span class="vt-actions">
@@ -371,15 +373,14 @@ onUnmounted(() => {
           {{ dateLabel }}
         </button>
         <button class="chip star-btn" :class="{ 'star-on': store.feedOnlyFav }" @click="toggleFav" :title="'仅显示星标好友'" aria-label="仅显示星标好友">
-          <i :class="store.feedOnlyFav ? 'pi pi-star-fill' : 'pi pi-star'"></i><span v-if="store.favFriendIds && store.favFriendIds.size"> ({{ store.favFriendIds.size }})</span>
+          <i :class="store.feedOnlyFav ? 'pi pi-star-fill' : 'pi pi-star'"></i>
         </button>
         <button class="chip star-btn" :class="{ 'star-on': store.feedOnlyWatch }" @click="toggleWatchFilter" :title="'仅显示关注名单'" aria-label="仅显示关注名单">
           <i :class="store.feedOnlyWatch ? 'pi pi-eye' : 'pi pi-eye-slash'"></i>
         </button>
         <button class="chip star-btn" :class="{ 'star-on': store.feedOnlyMe }" @click="toggleMeFilter" :title="'仅显示我的事件'" aria-label="仅显示我的事件">
-          <i :class="store.feedOnlyMe ? 'pi pi-user-check' : 'pi pi-user'"></i>
+          <i :class="store.feedOnlyMe ? 'pi pi-verified' : 'pi pi-user'"></i>
         </button>
-        <button class="chip star-btn" title="导出当前筛选结果（JSON）" aria-label="导出当前筛选结果" @click="exportRows"><i class="pi pi-download"></i></button>
         <button v-if="hasAnyFilter" class="chip star-btn" title="清除全部筛选" aria-label="清除全部筛选" @click="clearAllFilters"><i class="pi pi-filter-slash"></i> 清除全部</button>
         <button v-if="store.feedOnlyWorld" class="chip star-btn star-on" @click="clearWorldFilter" :title="'清除「只看此世界」筛选'" aria-label="清除只看此世界筛选">
           <i class="pi pi-globe"></i> 只看此世界{{ worldNameOf() ? '：' + worldNameOf().slice(0, 16) : '' }}
@@ -388,10 +389,10 @@ onUnmounted(() => {
           <i class="pi pi-filter"></i> 此人 {{ store.feedOnlyUser.slice(0, 8) }}…
         </button>
         <button class="chip star-btn" :class="{ 'star-on': store.feedOnlyTracked }" @click="toggleTrackedFilter" :title="'仅显示追踪非好友的事件'" aria-label="仅显示追踪非好友的事件">
-          <i class="pi pi-binoculars"></i><span v-if="store.trackedIds.size"> ({{ store.trackedIds.size }})</span>
+          <i class="pi pi-users"></i>
         </button>
       </span>
-      <span class="feed-count" :title="'当前筛选 ' + rows.length + ' / 已加载 ' + store.feedEvents.length + ' / 数据库共 ' + store.feedTotal + ' 条'">{{ rows.length }} / {{ store.feedEvents.length }} / {{ store.feedTotal }}</span>
+      <span class="feed-count" :title="'当前筛选 ' + rows.length + ' / 已加载 ' + store.feedEvents.length + ' / 当前条件下共 ' + store.feedTotal + ' 条'">{{ rows.length }} / {{ store.feedEvents.length }} / {{ store.feedTotal }}</span>
     </div>
 
     <!-- 类型筛选横条 + 搜索（所有元素弹性收缩换行） -->
@@ -430,11 +431,11 @@ onUnmounted(() => {
 
       <template v-for="x in feedRows" :key="x.__sep ? 'sep-' + x.__sep : rowId(x)">
       <div v-if="x.__sep" class="ev-daysep"><span>{{ x.__sep }}</span></div>
-      <div v-else class="ev-row" :class="{ open: expanded === rowId(x) }" role="button" tabindex="0" @click="toggleRow(x)" @keydown.enter="toggleRow(x)">
-        <div v-if="!store.isMobile" class="c-time mono">{{ time(x.createdAt) }}<small>{{ date(x.createdAt) }}</small></div>
-        <div v-else class="c-time mono">{{ date(x.createdAt) }}</div>
+      <div v-else class="ev-row" :class="{ open: expanded === rowId(x) }" v-clickable="(e) => (toggleRow(x))" >
+        <div v-if="!store.isMobile" class="c-time mono"><span class="ct-hm">{{ time(x.createdAt) }}</span><small>{{ date(x.createdAt) }}</small></div>
+        <div v-else class="c-time mono"><span class="ct-hm">{{ time(x.createdAt) }}</span><small>{{ date(x.createdAt) }}</small></div>
         <div class="c-type"><Tag :value="TYPE_LABELS[typeOf(x)]" :severity="TYPE_SEVERITIES[typeOf(x)]" rounded><i class="pi ctype-ico" :class="TYPE_ICONS[typeOf(x)] || 'pi-circle'"></i></Tag></div>
-        <div class="c-player" @click.stop="playerOpen(x)" role="button" tabindex="0" @keydown.enter="playerOpen(x)">
+        <div class="c-player" v-clickable.stop="(e) => (playerOpen(x))" >
           <Avatar :image="playerAvatarOf(x)" shape="circle" size="small" :label="avatarLabel(playerAvatarOf(x), playerNameOf(x))" />
           <span class="pl-name" :style="{ color: trustColor(x.trustLevel) }">{{ playerNameOf(x) }}</span>
           <i v-if="isFav(x)" class="pi pi-star-fill pl-star" title="收藏好友"></i>
@@ -451,18 +452,32 @@ onUnmounted(() => {
               <span class="dim">传送中</span>
             </template>
             <template v-else>
-            <template v-if="x.previousWorldName && x.previousWorldName !== x.worldName">
-              <img v-if="x.previousWorldImageUrl" class="wthumb" :src="x.previousWorldImageUrl" alt="" loading="lazy" />
-              <span v-if="x.previousWorldId" class="world-link" @click="openWorld(x.previousWorldId)" role="button" tabindex="0" @keydown.enter="openWorld(x.previousWorldId)">{{ x.previousWorldName }}</span>
-              <span v-else class="dim">{{ x.previousWorldName }}</span>
-              <span class="arr">→</span>
+            <template v-if="prevLabelOf(x) && (curIsWorld(x) ? prevLabelOf(x) !== x.worldName : true)">
+              <span class="src-group">
+                <img v-if="x.previousWorldImageUrl" class="wthumb" :src="x.previousWorldImageUrl" alt="" loading="lazy" />
+                <!-- 上一刻是仅邀请/私人房间 ⇒ 一律「私人房间」，**即便能拿到世界名**（用户 2026-10-17 定案；
+                     2026-10-18 复审 ⚠️1：此前这条定案只在纯函数里，模板被 x.previousWorldId 分支绕过 ⇒ 实际渲染成世界名） -->
+                <span v-if="prevPrivate(x)" class="dim">私人房间</span>
+                <span v-else-if="x.previousWorldId" class="world-link" v-clickable="(e) => (openWorld(x.previousWorldId))" >{{ x.previousWorldName }}</span>
+                <span v-else class="dim">{{ prevLabelOf(x) }}</span>
+                <span v-if="prevInstLabel(x)" class="inst mono">{{ prevInstLabel(x) }}</span>
+                <span class="arr">→</span>
+              </span>
             </template>
-            <img v-if="x.worldImageUrl" class="wthumb" :src="x.worldImageUrl" alt="" loading="lazy" />
-            <span v-if="x.worldName" class="world-link" @click="openWorld(x.worldId)" role="button" tabindex="0" @keydown.enter="openWorld(x.worldId)">{{ x.worldName }}</span>
-            <span v-else-if="x.location" class="dim">{{ locLabel(x.location) || x.location }}</span>
-            <span v-if="x.instanceType || x.region || x.instanceId" class="inst mono">{{ instanceLabel(x.instanceType) }}{{ x.region ? ' · ' + x.region.toUpperCase() : '' }}{{ x.instanceId ? ' · ' + x.instanceId : '' }}</span>
-            <span v-if="x.travelingToLocation" class="dim">传送中</span>
+            <span class="dest-group">
+              <img v-if="x.worldImageUrl" class="wthumb" :src="x.worldImageUrl" alt="" loading="lazy" />
+              <span v-if="x.worldName" class="world-link" v-clickable="(e) => (openWorld(x.worldId))" >{{ x.worldName }}</span>
+              <!-- 世界名不可得（VRChat 对无权查看/已下架世界返回 404）：显式标注 + 完整 worldId，房间号照旧跟在后面（2026-10-17 用户定） -->
+              <span v-else-if="x.worldId && x.worldNameUnavailable" class="dim mono" :title="'VRChat 返回 404/403：该世界对当前账号不可见或已下架（可能是暂时的，服务会自动重试）—— ' + x.worldId">404世界 {{ x.worldId }}</span>
+              <span v-else-if="x.location" class="dim">{{ specialLocationLabel(x.location) || locLabel(x.location) || x.location }}</span>
+              <span v-if="x.instanceType || x.region || x.instanceId" class="inst mono">{{ instanceLabel(x.instanceType) }}{{ x.region ? ' · ' + x.region.toUpperCase() : '' }}{{ x.instanceId ? ' · ' + x.instanceId : '' }}</span>
+            </span>
             </template>
+          </template>
+
+          <!-- 网页端/App 在线切换（friend-active）：显示转网页端在线/转App在线（#181 连带，summary 由后端语义化） -->
+          <template v-else-if="typeOf(x) === 'status' && x.type === 'friend-active'">
+            <span class="sdesc"><i class="pi pi-globe" style="font-size:11px;margin-right:4px"></i>{{ x.summary }}</span>
           </template>
 
           <!-- 状态变动：旧状态灯 → 新状态灯 / [灯] 当前签名 -->
@@ -504,7 +519,8 @@ onUnmounted(() => {
           <template v-else-if="typeOf(x) === 'online'">
             <span class="dim">进入</span>
             <img v-if="x.worldImageUrl" class="wthumb" :src="x.worldImageUrl" alt="" loading="lazy" />
-            <span v-if="x.worldName" class="world-link" @click="openWorld(x.worldId)" role="button" tabindex="0" @keydown.enter="openWorld(x.worldId)">{{ x.worldName }}</span>
+            <span v-if="x.worldName" class="world-link" v-clickable="(e) => (openWorld(x.worldId))" >{{ x.worldName }}</span>
+            <span v-else-if="destPrivate(x)" class="dim">私人房间</span>
             <span v-else class="dim">VRChat</span>
           </template>
 
@@ -521,12 +537,12 @@ onUnmounted(() => {
           <!-- 群组通知：显示群组名+内容；更新类显示"通知已读：内容"，点击打开群组 -->
           <template v-else-if="typeOf(x) === 'group'">
             <template v-if="isNotiUpdate(x)">
-              <span class="noti-read-wrap" :class="{ 'noti-msg-link': x.notiGroupId }" @click.stop="openGroup(x.notiGroupId)" role="button" tabindex="0" @keydown.enter="openGroup(x.notiGroupId)" :title="x.notiGroupId ? '点击打开群组' : ''">
+              <span class="noti-read-wrap" :class="{ 'noti-msg-link': x.notiGroupId }" v-clickable.stop="(e) => (openGroup(x.notiGroupId))" :title="x.notiGroupId ? '点击打开群组' : ''">
                 <span class="dim">通知已读：</span>
                 <span class="noti-msg-inline">{{ x.notiMessage || x.notiTitle || '群组通知' }}</span>
               </span>
             </template>
-            <span v-else class="noti-msg" :class="{ 'noti-msg-link': x.notiGroupId }" @click.stop="openGroup(x.notiGroupId)" role="button" tabindex="0" @keydown.enter="openGroup(x.notiGroupId)" :title="x.notiGroupId ? '点击打开群组' : ''">{{ x.notiMessage || x.notiTitle }}</span>
+            <span v-else class="noti-msg" :class="{ 'noti-msg-link': x.notiGroupId }" v-clickable.stop="(e) => (openGroup(x.notiGroupId))" :title="x.notiGroupId ? '点击打开群组' : ''">{{ x.notiMessage || x.notiTitle }}</span>
           </template>
 
           <!-- 其他通知 -->
@@ -544,13 +560,18 @@ onUnmounted(() => {
             <span class="dim">更新了头像图标</span>
             <img v-if="x.previousUserIcon" class="uicon" :src="x.previousUserIcon" alt="" loading="lazy" />
             <span v-if="x.previousUserIcon && x.userIcon" class="av-arrow" aria-hidden="true">→</span>
-            <img v-if="x.userIcon" class="uicon" :src="x.userIcon" alt="" loading="lazy" @click="openPreview(x.userIcon)" />
+            <img v-if="x.userIcon" class="uicon" :src="x.userIcon" alt="" loading="lazy" />
             <span v-if="!x.previousUserIcon && !x.userIcon" class="dim">（图片未取到）</span>
           </template>
 
           <!-- 代词变更 -->
           <template v-else-if="typeOf(x) === 'pronouns'">
             <span class="dim">代词：</span><span>{{ x.previousPronouns || '(空)' }} → {{ x.pronouns || '(空)' }}</span>
+          </template>
+
+          <!-- 信任等级变更 -->
+          <template v-else-if="typeOf(x) === 'trustLevel'">
+            <span class="dim">信任等级：</span><span>{{ x.previousTrustLevel || '(空)' }} → {{ x.trustLevel || '(空)' }}</span>
           </template>
 
           <!-- 改名 -->
@@ -580,7 +601,7 @@ onUnmounted(() => {
           <!-- 加入群组：groupId 可点击打开群组 -->
           <template v-else-if="typeOf(x) === 'groupJoined'">
             <span class="dim">加入了</span>
-            <span v-if="x.notiGroupName" class="world-link" @click="openGroup(x.groupId || x.notiGroupId)" role="button" tabindex="0" @keydown.enter="openGroup(x.groupId || x.notiGroupId)">{{ x.notiGroupName }}</span>
+            <span v-if="x.notiGroupName" class="world-link" v-clickable="(e) => (openGroup(x.groupId || x.notiGroupId))" >{{ x.notiGroupName }}</span>
             <span v-if="x.groupId && !x.notiGroupName" class="mono" :title="x.groupId">{{ x.groupId }}</span>
             <Button v-if="x.groupId" icon="pi pi-copy" text size="small" rounded :aria-label="'复制群组 ID'" :title="x.notiGroupName ? '复制群组 ID：' + x.groupId : '复制群组 ID'" @click="copyText(x.groupId)" />
           </template>
@@ -593,7 +614,7 @@ onUnmounted(() => {
           <!-- 群组角色更新：群名（可打开） + 角色名 -->
           <template v-else-if="typeOf(x) === 'groupRoleUpdated'">
             <span class="dim">群组角色更新</span>
-            <span v-if="x.notiGroupName" class="world-link" @click="openGroup(x.groupId || x.notiGroupId)" role="button" tabindex="0" @keydown.enter="openGroup(x.groupId || x.notiGroupId)">{{ x.notiGroupName }}</span>
+            <span v-if="x.notiGroupName" class="world-link" v-clickable="(e) => (openGroup(x.groupId || x.notiGroupId))" >{{ x.notiGroupName }}</span>
             <span v-if="x.roleName" class="dim">（角色：{{ x.roleName }}）</span>
           </template>
 
@@ -647,7 +668,7 @@ onUnmounted(() => {
             <b class="ed-ellip">{{ x.previousPronouns || '(空)' }} → {{ x.pronouns || '(空)' }}</b></div>
           <div v-if="x.updateType === 'user_icon'" class="ed-cell"><span>头像图标</span>
             <b class="ed-ellip">{{ x.previousUserIcon ? '已更换' : '已设置' }}</b>
-            <img v-if="x.userIcon" class="uicon" :src="x.userIcon" alt="" loading="lazy" @click="openPreview(x.userIcon)" /></div>
+            <img v-if="x.userIcon" class="uicon" :src="x.userIcon" alt="" loading="lazy" /></div>
           <div v-if="x.previousStatus && x.previousStatus !== x.status" class="ed-cell"><span>状态</span>
             <span class="slamp" :style="{ background: statusColor(x.previousStatus) }" :title="statusText(x.previousStatus)"></span>
             <span class="arr">→</span>
@@ -674,7 +695,13 @@ onUnmounted(() => {
       </template>
 
       <div class="feed-more">
-        <Button v-if="store.feedHasMore && store.feedEvents.length < feedHardCap" :label="store.feedLoadingMore ? '加载中…' : '加载更多'" text size="small" icon="pi pi-angle-down" @click="loadMoreFeed()" />
+        <!-- 用户 2026-09-22：「明明还可以加载，加载前他写的却是达展示上限，我觉得这个东西明明可以不设上限」⇒
+             撤掉对用户可见的"上限"语义：上限只作**自动触底**的静默保护，手动按钮永远可用。 -->
+        <div v-if="store.feedMoreError" class="feed-more-err">
+          <span>加载更多失败：{{ store.feedMoreError }}</span>
+          <Button label="重试" size="small" text icon="pi pi-refresh" @click="loadMoreFeed()" />
+        </div>
+        <Button v-else-if="store.feedHasMore" :label="store.feedLoadingMore ? '加载中…' : '加载更多'" text size="small" icon="pi pi-angle-down" @click="loadMoreFeed()" />
         <span v-else-if="store.feedEvents.length" class="feed-end">— 已加载全部动态 —</span>
         <!-- 哨兵始终渲染（条件渲染会导致 onMounted 拿不到元素、observer 失效） -->
         <div id="feed-sentinel" class="feed-sentinel"></div>
@@ -685,6 +712,9 @@ onUnmounted(() => {
 
 <style scoped>
 .feed-view { padding: 4px; }
+/* 标题行：让 .feed-count 的 margin-left:auto 生效（上游此前没有这条规则 ⇒ 计数贴不到右） */
+.feed-head { display: flex; align-items: center; gap: 6px; }
+
 .feed-toolbar {
   margin-bottom: 12px;
   /* 长列表滚动时筛选工具栏吸顶（相对 .main-viewport 滚动容器），随时切换筛选不用滚回顶部 */
@@ -718,7 +748,6 @@ onUnmounted(() => {
 .ft-search > .pi-search { font-size: 11px; color: var(--text-dim); flex: none; }
 .search-clear { font-size: 10px; color: var(--text-dim); cursor: pointer; padding: 2px; flex: none; }
 .search-clear:hover { color: var(--text); }
-.feed-sub { font-size: 11px; color: var(--text-dim); flex: 1; min-width: 80px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .feed-count { margin-left: auto; color: var(--text-dim); font-size: 11px; font-variant-numeric: tabular-nums; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* C4 窄窗口：计数保持行内、贴最右（不换行独占） */
 @media (min-width: 900px) and (max-width: 1280px) {
@@ -737,7 +766,13 @@ onUnmounted(() => {
 /* 筛选 chip：视觉语言统一走全局 .chip（style.css），此处仅保留本页私有覆盖 */
 .date-btn i { font-size: 11px; }
 .date-btn.active { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); }
-.star-btn { width: 30px; padding: 0; justify-content: center; }
+/* 仅图标按钮保持方形、带文字/计数的同类 chip（清除全部、只看此世界、此人、星标/追踪计数）按内容撑开。
+   注意：min-width 必须**替换** width —— 只追加 min-width 而不删 width 等于没修（宽度仍恒为 30px）。
+   本规则**不写 padding**：纯图标态宽度由 `.vt-actions .chip` 系列规则提供（同特异性、打包后更靠后 ⇒ 胜出），
+   此处写了也不生效、只会误导读者。实测（运行中真实构建产物的同一张样式表 + 含 scope 属性的真实 DOM，
+   宽度含 1px 边框）：纯图标 >1280px = 34px（padding 10px）/ 900–1280px = 30px（8px）/ ≤899px = 38px（12px）；
+   带文字/计数 chip 修前横向外溢 14–19px，修后三个断点均归零。 */
+.star-btn { min-width: 30px; justify-content: center; }
 .star-btn i { font-size: 12px; }
 .star-btn.star-on { color: var(--star); border-color: color-mix(in srgb, var(--star) 40%, var(--border)); }
 .date-cal { padding: 6px; }
@@ -784,6 +819,8 @@ onUnmounted(() => {
 
 .c-time { font-size: 12px; color: var(--text-dim); line-height: 1.25; }
 .c-time small { display: block; font-size: 10px; opacity: 0.7; }
+/* 时间主体加大加深（用户反馈：PC 时间看不清、手机缺时间） */
+.ct-hm { font-size: 13.5px; color: var(--text); font-weight: 600; }
 .c-type { display: flex; align-items: center; }
 .c-type :deep(.p-tag) { font-size: 10.5px; }
 .c-player {
@@ -811,7 +848,6 @@ onUnmounted(() => {
 .dim { color: var(--text-dim); white-space: nowrap; }
 .arr { color: var(--text-dim); opacity: 0.6; font-size: 11px; }
 .world-link {
-.uicon { width: 26px; height: 26px; border-radius: 50%; object-fit: cover; flex: none; cursor: pointer; }
   color: var(--accent-2);
   cursor: pointer;
   padding: 1px 5px;
@@ -819,7 +855,10 @@ onUnmounted(() => {
   background: color-mix(in srgb, var(--accent-2) 10%, transparent);
   white-space: nowrap;
 }
+.uicon { width: 26px; height: 26px; border-radius: 50%; object-fit: cover; flex: none; }
 .world-link:hover { background: color-mix(in srgb, var(--accent-2) 22%, transparent); }
+/* 2026-10-16 恢复（用户 2026-09-24 定案）：目的地/来源各绑成一组 ⇒ 房间信息不再被世界名挤到第二行 */
+.dest-group, .src-group { display: inline-flex; align-items: center; gap: 6px; min-width: 0; flex: 0 1 auto; }
 .inst { color: var(--text-dim); font-size: 10.5px; background: var(--surface-3); padding: 1px 6px; border-radius: 5px; flex: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
 
 /* 状态灯 */
@@ -894,8 +933,8 @@ onUnmounted(() => {
 /* 移动端：简介变更允许换行完整显示（父级 .c-detail 已 wrap），避免长文本横向溢出 */
 @media (max-width: 899px) {
   .bio-text { white-space: normal; overflow: visible; text-overflow: clip; word-break: break-word; }
-  /* C1 触控目标：世界链接行内元素加大点击区域（16px→inline-flex + padding） */
-  .world-link { display: inline-flex; align-items: center; padding: 4px 8px; }
+  /* C1 触控目标：世界链接行内元素加大点击区域（16px→inline-flex + padding，min-height 32 达标） */
+  .world-link { display: inline-flex; align-items: center; padding: 4px 8px; min-height: 32px; }
 }
 
 /* 通知：消息内容（可点击打开群组） */
@@ -1001,10 +1040,10 @@ onUnmounted(() => {
     margin-bottom: 7px;
     background: var(--surface);
   }
-  /* 第一行：玩家(左) ｜ 日期单行(中) ｜ 类型(右) */
-  .c-time { grid-area: time; align-self: center; white-space: nowrap; font-size: 12px; }
+  /* 第一行：玩家(左) ｜ 时间+日期竖排(中) ｜ 类型(右) */
+  .c-time { grid-area: time; align-self: center; white-space: nowrap; font-size: 12px; text-align: center; }
   .c-type { grid-area: type; justify-self: end; align-self: center; }
-  .c-player { grid-area: player; align-self: center; min-width: 0; }
+  .c-player { grid-area: player; align-self: center; min-width: 0; min-height: 32px; }
   /* 第二行：详情全宽 */
   .c-detail { grid-area: detail; padding-top: 3px; border-top: 1px dashed var(--border-soft); }
   /* 移动端禁用展开：隐藏 chevron、去掉手型与展开高亮 */
@@ -1012,4 +1051,7 @@ onUnmounted(() => {
   .ev-row { cursor: default; }
   .ev-row.open { background: var(--surface); box-shadow: none; }
 }
+
+/* 2026-09-22 评审 💡：模板引用了 .feed-more-err 但样式表没定义 ⇒ 补上 ✓ */
+.feed-more-err { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 10px 0; color: var(--text-dim); font-size: 12.5px; }
 </style>

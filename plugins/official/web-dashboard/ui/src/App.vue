@@ -1,7 +1,21 @@
 <script setup>
-import { computed, ref, onMounted, onUnmounted } from 'vue';
+import { computed, ref, watch, onMounted, onUnmounted, onErrorCaptured } from 'vue';
 import { useToast } from 'primevue/usetoast';
-import { store, setView, load, enableNotifications, disableNotifications } from './store.js';
+import { store, setView, load, startDashboard, enableNotifications, disableNotifications, restoreFocusAfterModal } from './store.js';
+
+// 2026-09-22 用户报障「请求正常但右边整块黑的」：全项目此前**没有任何渲染错误兜底** ✗ ⇒ 子组件报错会让那一块静默变黑 ✓。
+// 捕获后代组件的渲染/生命周期错误 → 写进全局失败横幅（store.loadError ✓）+ 控制台留痕，让症状可见而非黑屏 ✓。
+// 真正的「渲染错误边界」（2026-09-22 二次修正）：仅写横幅+return false 不够 ✗ ——
+// 当时 App 仍会继续渲染那棵坏掉的子树 ⇒ 用户看到的是**所有页面全黑** ✓（实测反馈）。
+// 正确做法：捕获后**用替代面板顶掉坏视图**，其余骨架（侧栏/右栏）继续可用，并给「重试/刷新」两条出路 ✓。
+const renderErr = ref('');
+const reloadPage = () => { try { location.reload(); } catch { /* 忽略 */ } };
+onErrorCaptured((err) => {
+  const msg = (err && err.message) ? err.message : String(err);
+  console.error('[dashboard] 渲染错误：', err);
+  renderErr.value = msg;
+  return false;   // 阻止冒泡（替代面板由本组件渲染 ✓）
+});
 import { bindToast, toast } from './toast.js';
 import FeedView from './views/FeedView.vue';
 import FriendsView from './views/FriendsView.vue';
@@ -19,6 +33,7 @@ import BoothView from './views/BoothView.vue';
 import AnnouncementsView from './views/AnnouncementsView.vue';
 import ModerationView from './views/ModerationView.vue';
 import ToolsView from './views/ToolsView.vue';
+import SettingsView from './views/SettingsView.vue';
 import OpenView from './views/OpenView.vue';
 import WeeklyReportView from './views/WeeklyReportView.vue';
 import XWorldsView from './views/XWorldsView.vue';
@@ -34,7 +49,7 @@ import GroupDialog from './components/GroupDialog.vue';
 import InstanceDialog from './components/InstanceDialog.vue';
 import AvatarDialog from './components/AvatarDialog.vue';
 import LoginView from './components/LoginView.vue';
-import { hasToken, clearToken } from './api.js';
+import { hasToken, clearToken, probeAuthRequired, verifyToken, getToken } from './api.js';
 import { useConfirm } from 'primevue/useconfirm';
 import { bindConfirm } from './confirm.js';
 
@@ -74,6 +89,7 @@ const NAV_GROUPS = [
   { g: '管理', items: [
     { view: 'moderation', ico: 'pi pi-ban', label: '屏蔽' },
     { view: 'tools', ico: 'pi pi-wrench', label: '工具' },
+    { view: 'settings', ico: 'pi pi-cog', label: '设置' },
     { view: 'open', ico: 'pi pi-external-link', label: '直接打开' },
   ]},
 ];
@@ -93,8 +109,94 @@ onMounted(() => document.addEventListener('scroll', onAnyScroll, true));
 
 // ── 登录页控制 ──
 const loginView = ref(!hasToken());
+// 两条路径都要处理，缺一不可（2026-10-16 合并上游与本仓实现）：
+//  ① 本地**无** token ⇒ 先裸探测服务端是否真的要令牌（api.js probeAuthRequired）：
+//     未启用鉴权（单机默认）⇒ 直接进面板，不再逼用户输入一个从未配置过的令牌（issue #213）；
+//     探测失败（服务未启动 / 网络异常）⇒ 保留登录门，并把原因透出到登录页（#297 / issue #213 的 UX 项）。
+//  ② 本地**有**旧 token ⇒ 必须先 verifyToken 验一次再挂主界面：
+//     否则主界面会立刻把全部数据请求并发打出去、全部 401 之后才跳回登录页（用户 2026-09-22 报障：
+//     「没登录为什么也发请求 + 首屏非常慢」）⇒ 失败就清 token 回登录页 ✓。
+// 因此进入本组件时**统一先显示检查中**（authChecking=true），两条路径都在 onMounted 里定论 ✓。
+// #297：探测失败的原因要透出到登录页 —— 此前只 console.warn，用户看到的是一个没有任何解释的登录页。
+const loginReason = ref('');
+const authChecking = ref(true);
+// 硬兜底（2026-11-02 用户报「卡在正在检查访问鉴权」）：下面两个探测各自带 AbortSignal.timeout，
+// 但部分环境会忽略该 signal（旧内核 / fetch 被 polyfill / service worker 拦截），
+// 一旦 await 永不返回，finally 就永远不执行 ⇒ 界面永久停在「正在检查访问鉴权」，用户无从判断。
+// 这里再加一层与 fetch 无关的计时器：超时后强制结束检查态、保留登录门并给出可读原因。
+// ⚠️ 必须 > verifyToken 自身的 20000ms 超时：否则 fetch 还在正常等待时就被这层判超时，
+// 把一个「慢但会成功」的冷启动误判成失败（实测首次 /api/dashboard/me 冷启动 8186ms，
+// 而 12s 的旧值在更慢的公网链路上会被击穿 ⇒ 用户看到「连接鉴权服务超时」并被弹回登录页）。
+const AUTH_HARD_TIMEOUT_MS = 25000;
+onMounted(async () => {
+  let authSettled = false;
+  // 先声明后赋值：finishChecking 在 setTimeout 回调与 finally 里都会引用它（复审 Lian-Hu 💡2 ——
+  // 当前调用时机都安全，但若有人把 finishChecking() 提前调用一次就是 ReferenceError）。
+  let hardTimeout = null;
+  const finishChecking = () => {
+    if (authSettled) return true;
+    authSettled = true;
+    clearTimeout(hardTimeout);
+    authChecking.value = false;
+    return false;
+  };
+  hardTimeout = setTimeout(() => {
+    // 硬超时只负责「别把用户永久卡在检查态」，**不武断判定鉴权失败**：
+    // 结束检查态、先把登录门亮出来（用户能操作），但请求本身仍可能随后成功 ——
+    // 那次成功由下面的 finally 正常收口（authSettled 已在 finishChecking 里置位，不会重复）。
+    if (finishChecking()) return;
+    console.warn('[auth] 鉴权探测超过 ' + AUTH_HARD_TIMEOUT_MS + 'ms 仍未返回，先结束检查态（请求仍在进行）');
+    if (!store.authVerified && store.authRequired !== false) {
+      loginReason.value = '鉴权服务响应较慢，已先显示登录界面；若你刚打开页面，稍等片刻会自动进入面板。';
+      loginView.value = true;
+    }
+  }, AUTH_HARD_TIMEOUT_MS);
+  try {
+    if (hasToken()) {
+      if (await verifyToken(getToken())) {
+        store.authVerified = true;   // 🔴1：校验通过才允许数据面打开（main.js 那次调用会因此空跑、零请求）
+        store.authRequired = true;
+        loginView.value = false;
+      } else {
+        clearToken();
+        loginView.value = true;
+      }
+    } else if (!(await probeAuthRequired())) {
+      store.authRequired = false;   // 服务端不需要鉴权 => 放行数据加载（否则未启用令牌的部署会零请求）
+      loginView.value = false;
+    } else {
+      store.authRequired = true;
+    }
+  } catch (e) {
+    // 2026-10-16 审查 ⚠️2：这里原来完全静默 ⇒ 使用者只会「无任何解释地被弹回登录页」，且旧令牌没被清。
+    // 登录页的 error 只在用户点「登录」后才赋值，所以必须在这里留痕 ✓
+    console.warn('[auth] 探测/校验失败（保留登录门）:', e);
+    // #297（issue #213）：失败原因还要**落到界面上**，不能只进控制台 —— 未配令牌 / 服务没起的部署，
+    // 用户不知道该填什么。页面上只说中文（原始技术串已进 console.warn，避免「无法连接服务：Failed to fetch」中英混排）
+    const msg = String((e && e.message) || e || '');
+    loginReason.value = /Failed to fetch|NetworkError|Load failed/i.test(msg)
+      ? '无法连接服务：网络不可达（请确认服务已启动，或检查网络/反代是否正常）。'
+      : /HTTP \d{3}/.test(msg)
+        ? '无法连接服务：服务返回了错误状态（请查看服务端日志；详见浏览器控制台）。'
+        : '无法连接服务（请确认服务已启动后再试）。';
+    // 保留登录门（frontend-catch-guard 已把这条登记为「回到登录页」的安全默认例外）
+    loginView.value = true;
+  } finally {
+    // 统一收口：硬超时可能已结束过检查态，但这不代表鉴权结论已定 ——
+    // 请求最终成功时仍要进面板（超时只是「先让界面可用」，不是判失败）。
+    const alreadyDone = finishChecking();
+    if (!loginView.value) startDashboard();
+    if (alreadyDone && !loginView.value) console.info('[auth] 鉴权在超时后成功返回，已自动进入面板');
+  }
+});
 function onAuth401() { loginView.value = true; }
 onMounted(() => window.addEventListener('vrc-auth-401', onAuth401));
+
+// 图片预览弹窗走 v-model:visible（PrimeVue 直接置 store.previewUrl = null），没有 close 函数，
+// 因此用 watch 在它关闭时归还焦点（复审 💡3：此前 6 个弹窗只接了 5 个 open*，预览漏了）。
+watch(() => store.previewUrl, (now, before) => {
+  if (before && !now) restoreFocusAfterModal();
+});
 onUnmounted(() => window.removeEventListener('vrc-auth-401', onAuth401));
 function doLogout() { clearToken(); location.reload(); }
 onUnmounted(() => document.removeEventListener('scroll', onAnyScroll, true));
@@ -143,7 +245,11 @@ async function refresh() {
 </script>
 
 <template>
-  <LoginView v-if="loginView" />
+  <div v-if="authChecking" class="auth-probe">
+    <i class="pi pi-spin pi-spinner"></i>
+    <span>正在检查访问鉴权…</span>
+  </div>
+  <LoginView v-else-if="loginView" :initial-error="loginReason" />
   <div v-else class="app-shell">
     <header class="app-header">
       <Button v-if="store.isMobile" icon="pi pi-bars" text rounded @click="store.navOpen = true" aria-label="打开菜单" />
@@ -176,6 +282,23 @@ async function refresh() {
       </nav>
 
       <main class="main-viewport">
+        <!-- 2026-09-22：渲染错误边界——坏视图被替代面板顶掉，其余部分仍可用 ✓ -->
+        <div v-if="renderErr" class="render-err">
+          <i class="pi pi-exclamation-triangle" aria-hidden="true"></i>
+          <b>这个页面渲染出错了</b>
+          <small>{{ renderErr }}</small>
+          <div class="render-err-actions">
+            <Button label="重试" size="small" icon="pi pi-refresh" @click="renderErr = ''" />
+            <Button label="刷新页面" size="small" severity="secondary" icon="pi pi-sync" @click="reloadPage()" />
+          </div>
+        </div>
+        <template v-else>
+        <!-- 2026-09-22 用户：任何页面加载失败都不能静默（此前失败被伪装成「暂无数据」）——全局横幅覆盖所有视图 -->
+        <div v-if="store.loadError" class="load-error-banner">
+          <i class="pi pi-exclamation-triangle" aria-hidden="true"></i>
+          <span>加载失败：{{ store.loadError }}</span>
+          <Button label="重试" size="small" text icon="pi pi-refresh" @click="load()" />
+        </div>
         <Transition name="view-fade" mode="out-in">
           <FeedView v-if="store.view === 'feed'" key="feed" />
           <FriendsView v-else-if="store.view === 'friends'" key="friends" />
@@ -198,9 +321,11 @@ async function refresh() {
           <WeeklyReportView v-else-if="store.view === 'report'" key="report" />
           <ModerationView v-else-if="store.view === 'moderation'" key="moderation" />
           <ToolsView v-else-if="store.view === 'tools'" key="tools" />
+          <SettingsView v-else-if="store.view === 'settings'" key="settings" />
           <OpenView v-else-if="store.view === 'open'" key="open" />
           <PlaceholderView v-else :view="store.view" key="placeholder" />
         </Transition>
+        </template>
       </main>
 
       <aside v-if="!store.isMobile" class="rightbar">
@@ -268,6 +393,21 @@ async function refresh() {
 </template>
 
 <style scoped>
+.load-error-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 12px 0;
+  padding: 8px 12px;
+  border: 1px solid var(--border-soft);
+  border-left: 3px solid #e5484d;
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 13px;
+}
+.load-error-banner i { color: #e5484d; }
+.load-error-banner span { flex: 1; }
 .header-bell-dot { position: absolute; top: 2px; right: 2px; min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px; background: var(--danger); color: #fff; font-size: 9px; font-weight: 700; line-height: 16px; text-align: center; box-sizing: border-box; }
 .to-top { position: fixed; right: 18px; bottom: 76px; z-index: 50; width: 38px; height: 38px; border-radius: 50%; border: 1px solid var(--border); background: var(--surface-3); color: var(--text); cursor: pointer; display: flex; align-items: center; justify-content: center; box-shadow: 0 4px 14px rgba(0,0,0,0.35); transition: transform 0.12s, border-color 0.12s; }
 .to-top:hover { border-color: var(--accent); transform: translateY(-1px); }
@@ -279,4 +419,11 @@ async function refresh() {
 .drawer-group:first-child { margin-top: 0; }
 /* 移动端好友抽屉：RightBar 撑满并内部滚动（rb-inner 自带 height:100% + overflow-y:auto） */
 :deep(.friends-drawer .p-drawer-content) { padding: 0; overflow: hidden; }
+/* 首次进入时的鉴权裸探测占位（issue #213）：未启用鉴权时一闪而过，启用时过渡到登录门 */
+.auth-probe { min-height: 100vh; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--text-dim); font-size: 13px; }
+
+.render-err { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 40px 16px; color: var(--text); text-align: center; }
+.render-err i { font-size: 26px; color: #e5484d; }
+.render-err small { color: var(--text-dim); max-width: 560px; word-break: break-word; }
+.render-err-actions { display: flex; gap: 8px; margin-top: 6px; }
 </style>

@@ -31,6 +31,15 @@ const WS_PROXY = process.env.VRC_MONITOR_WS_PROXY
 const RECONNECT_DELAYS = [1, 2, 4, 8, 16, 30, 60];
 const HEARTBEAT_INTERVAL = 30_000;  // 30 秒 ping
 const HEARTBEAT_TIMEOUT = 10_000;   // 10 秒等 pong
+// issue #247：应用层静默阈值 —— 超过该时长没有任何 WS 消息 ⇒ 视为半死连接并主动重连
+// 默认 60 分钟：下界取审核方实测合法静默尾部 1645s=27.4min（数百好友），上界取 issue #247 病例的 75min ⇒ 判别带 (27min, 75min]；60min 同时满足并留约 2.2x 余量。注意：24 好友规模的部署实测合法静默最长可达 157.8min（见 AGENTS.md）——那类部署请用 VRC_MONITOR_WS_SILENT_RECONNECT_MS 显式调大（本仓库自用部署即取 3 小时）。
+// 可用 VRC_MONITOR_WS_SILENT_RECONNECT_MS 覆盖：调用时读取，空/非数字/非正数回落默认
+const SILENT_RECONNECT_DEFAULT_MS = 60 * 60 * 1000;
+function silentReconnectMs() {
+  const raw = process.env.VRC_MONITOR_WS_SILENT_RECONNECT_MS;
+  const n = Number(raw);
+  return (raw !== undefined && String(raw).trim() !== '' && Number.isFinite(n) && n > 0) ? n : SILENT_RECONNECT_DEFAULT_MS;
+}
 const MAX_RECONNECT_ATTEMPTS = 0;   // 0 = 无限重试
 
 export class WsManager {
@@ -50,6 +59,7 @@ export class WsManager {
     this.lastToken = null;
     this.connectedAt = null;
     this.disconnectedAt = null;
+    this.lastMessageAt = null;     // 最近一次收到 WS 消息（或连接成功）的时刻，issue #247
     this.status = 'idle';          // idle | connecting | connected | reconnecting | error
     this.eventLog = [];            // 最近 100 条事件（debug）
     this._reconnectScheduled = false;  // 防止重复调度重连
@@ -67,6 +77,9 @@ export class WsManager {
       disconnectedAt: this.disconnectedAt,
       uptime: this.connectedAt ? Math.floor((Date.now() - this.connectedAt) / 1000) : 0,
       lastToken: this.lastToken ? `***${this.lastToken.slice(-6)}` : null,
+      // issue #247：外部可据此判断「连着但没消息」（silentForSec 持续增长即异常）
+      lastMessageAt: this.lastMessageAt ? new Date(this.lastMessageAt).toISOString() : null,
+      silentForSec: this.lastMessageAt ? Math.floor((Date.now() - this.lastMessageAt) / 1000) : null,
     };
   }
 
@@ -80,9 +93,13 @@ export class WsManager {
 
   /** 停止连接 */
   stop() {
+    this.lastMessageAt = null;   // issue #247 审核 💡2：停服后不应再输出持续增长的 silentForSec
     this.shouldReconnect = false;
     this._clearTimers();
     if (this.ws) {
+      // issue #247 评审 RED：close 事件是异步派发的 —— 手动停止后若不摘掉 handler，迟到的 close
+      // 会触发 _onClose ⇒ _scheduleReconnect，多排一次 _connect ⇒ 两条连接同时存活、事件双投。
+      try { this.ws.removeAllListeners(); } catch {}
       try { this.ws.close(1000, 'Manual stop'); } catch {}
       this.ws = null;
     }
@@ -109,6 +126,7 @@ export class WsManager {
       return;
     }
 
+    const connectStartedAt = Date.now();
     try {
       // 1. 确保认证有效（需要 OTP 时自动获取）
       try {
@@ -116,13 +134,13 @@ export class WsManager {
       } catch (authErr) {
         // 自动 2FA 通道：邮箱 OTP（otpFetcher）或 TOTP（api.totpFetcher，配置 totp_secret 后启用）
         if (authErr.needsOtp && (this.otpFetcher || this.api.totpFetcher)) {
-          log.info('⚠️ 认证需要 2FA，尝试自动获取...');
+          log.info('[警告] 认证需要 2FA，尝试自动获取...');
           try {
             await this.api.ensureAuthWithAutoOtp(this.otpFetcher);
           } catch (otpErr) {
             if (otpErr.needsTotp) {
               ctx.serverState.needsTotp = true;
-              log.info('🔑 账号需要 TOTP 验证码：自动登录未成功，可调用 MCP 工具 submit_totp 提交');
+              log.info('[认证] 账号需要 TOTP 验证码：自动登录未成功，可调用 MCP 工具 submit_totp 提交');
               notifier.notifyAuth('needsTotp', '账号需要 TOTP 验证码，服务暂停——请调用 submit_totp 提交当前验证码');
             } else {
               notifier.notifyAuth('reauthFailed', `WS 重连自动认证失败：${otpErr.message}`);
@@ -188,10 +206,13 @@ export class WsManager {
       }
 
       // 设置事件处理器（如果是直连成功，open 事件已被 inline listener 消费，需要标记）
-      this.ws.on('open', () => this._onOpen());
-      this.ws.on('message', (data) => this._onMessage(data));
-      this.ws.on('close', (code, reason) => this._onClose(code, reason));
-      this.ws.on('error', (err) => this._onError(err));
+      // issue #247 评审 RED：捕获本 socket 引用并加陈旧判别 —— 只有它仍是当前 ws 时才处理事件，
+      // 避免「已被替换掉的旧连接」继续往 event-pipeline 灌事件（实测会导致事件双投）。
+      const sock = this.ws;
+      sock.on('open', () => { if (this.ws === sock) this._onOpen(); });
+      sock.on('message', (data) => { if (this.ws === sock) this._onMessage(data); });
+      sock.on('close', (code, reason) => { if (this.ws === sock) this._onClose(code, reason); });
+      sock.on('error', (err) => { if (this.ws === sock) this._onError(err); });
 
       // 如果直连已成功但 open 事件已被消费，手动触发 _onOpen
       if (connectedDirectly && this.ws.readyState === WebSocket.OPEN) {
@@ -199,17 +220,19 @@ export class WsManager {
       }
 
     } catch (err) {
-      log.error(`连接失败: ${err.message}`);
+      log.error(`连接失败: ${err.message}（耗时 ${Date.now() - connectStartedAt}ms，已重试 ${this.attempt} 次）`);
       this._scheduleReconnect();
     }
   }
 
   _onOpen() {
+    // issue #247：连接成功即开始静默计时 —— 否则「连上后一条消息都没来过」这一形态永远检测不到
+    this.lastMessageAt = Date.now();   // issue #247：连接成功即开始计时（否则「连上就静默」永远检测不到）
     const lastAttempt = this.attempt; // 归零前记录本次成功前的重连次数（审核建议）
     this.attempt = 0;
     this.connectedAt = new Date();
     this._setStatus('connected');
-    log.info(`✅ 已连接 (${this.connectedAt.toISOString().slice(11, 19)})`);
+    log.info(`[成功] 已连接 (${this.connectedAt.toISOString().slice(11, 19)})`);
     recordOpsLog('ws', 'info', lastAttempt > 0
       ? 'WebSocket 已连接（重连成功，第 ' + lastAttempt + ' 次尝试）'
       : 'WebSocket 已连接（首次连接）');
@@ -219,6 +242,7 @@ export class WsManager {
   }
 
   _onMessage(data) {
+    this.lastMessageAt = Date.now();   // issue #247：任何消息都刷新静默计时
     const raw = data.toString();
     
     // 记录到事件日志（最近 100 条）
@@ -255,14 +279,15 @@ export class WsManager {
         this.onEvent(event);
       }
     } catch (err) {
-      log.error(`解析消息失败: ${err.message}`);
+      log.error(`解析消息失败: ${err.message}`, { stack: err.stack, raw: String(raw || '').slice(0, 100) });
     }
   }
 
   _onClose(code, reason) {
     this.disconnectedAt = new Date();
+    this.lastMessageAt = null;   // 评审 2：断开后 silentForSec 不应继续增长（与 stop() 对称）
     const reasonStr = reason ? reason.toString() : '无';
-    log.info(`⚠️ 断开: code=${code}, reason=${reasonStr}`);
+    log.info(`[警告] 断开: code=${code}, reason=${reasonStr}`);
     recordOpsLog('ws', 'warn', 'WebSocket 断开 code=' + code + '（' + reasonStr + '），将自动重连');
 
     this._clearTimers();
@@ -275,16 +300,34 @@ export class WsManager {
   }
 
   _onError(err) {
-    log.error(`❌ 错误: ${err.message}`);
+    log.error(`[失败] 错误: ${err.message}`);
   }
 
   // ── 心跳 ──
 
+  /**
+   * issue #247：应用层静默检测（抽成方法以便单测）。
+   * 上面的 ping/pong 只覆盖 TCP/WS 层 —— 对端只要正常回 pong，即使一条应用消息都不推，
+   * 心跳也永不判死（半死连接）。故在此加「消息静默超时」判据。
+   * @returns {boolean} true 表示已触发重连（调用方应停止本轮后续动作）
+   */
+  _checkSilent() {
+    if (this.status !== 'connected' || !this.lastMessageAt) return false;
+    const limit = silentReconnectMs();
+    if (Date.now() - this.lastMessageAt <= limit) return false;
+    const mins = Math.round(limit / 60000);
+    log.info('[警告] WS 应用层静默超过 ' + mins + ' 分钟（ping/pong 正常但无事件）⇒ 主动重连');
+    try { recordOpsLog('ws', 'warn', 'WS 静默超时（' + mins + ' 分钟无消息），主动重连'); } catch {}
+    this.lastMessageAt = Date.now();   // 先刷新，避免重连期间重复触发
+    void this.forceReconnect().catch(() => {});
+    return true;
+  }
   _startHeartbeat() {
     this._clearHeartbeat();
     this._pongReceived = true;
 
     this.heartbeatTimer = setInterval(() => {
+      if (this._checkSilent()) return;   // issue #247：应用层静默 ⇒ 已触发重连
       if (this.ws?.readyState === WebSocket.OPEN) {
         this._pongReceived = false;
         this.ws.ping();
@@ -292,7 +335,7 @@ export class WsManager {
         // 设置 pong 超时
         this.heartbeatTimeout = setTimeout(() => {
           if (!this._pongReceived) {
-            log.info('⚠️ 心跳超时，主动断开');
+            log.info('[警告] 心跳超时，主动断开');
             try { this.ws.terminate(); } catch {}
           }
         }, HEARTBEAT_TIMEOUT);
@@ -337,7 +380,7 @@ export class WsManager {
     const cooldownMs = isRateLimited ? 300_000 : 120_000;
     this.authCooldownUntil = Date.now() + cooldownMs;
     const secs = Math.round(cooldownMs / 1000);
-    log.info(`🔒 认证失败，冷却 ${secs} 秒后重试${isRateLimited ? ' (限流)' : ''}`);
+    log.info(`[认证] 认证失败，冷却 ${secs} 秒后重试${isRateLimited ? ' (限流)' : ''}`);
     recordOpsLog('ws', 'warn', '认证失败，冷却 ' + secs + ' 秒后重试' + (isRateLimited ? '（限流）' : ''));
   }
 
@@ -354,7 +397,7 @@ export class WsManager {
     const delay = RECONNECT_DELAYS[Math.min(this.attempt - 1, RECONNECT_DELAYS.length - 1)];
     this._setStatus('reconnecting');
 
-    log.info(`🔄 将在 ${delay} 秒后重连 (第 ${this.attempt} 次)...`);
+    log.info(`[重连] 将在 ${delay} 秒后重连 (第 ${this.attempt} 次)...`);
     recordOpsLog('ws', 'info', '将在 ' + delay + ' 秒后重连（第 ' + this.attempt + ' 次）');
     
     this.reconnectTimer = setTimeout(() => {
