@@ -190,7 +190,8 @@ export async function handleGetWorldName({ worldId, forceRefresh }) {
   }
   // 调 API
   const prev = storage.getWorldName(worldId);
-  const r = await api._request('GET', `/worlds/${worldId}`);
+  const r = await worldQueryFast(() => api._request('GET', `/worlds/${worldId}`));
+  if (r.status === 429) { _worldQuery429Until = Date.now() + 60000; throw new Error('API error: 429 (rate limited)'); }
   if (r.status !== 200) throw new Error(`API error: ${r.status}`);
   const w = r.data;
   const result = {
@@ -491,7 +492,7 @@ export async function handleGetWorldImage({ worldId, size = 512 } = {}) {
     imageUrl = cached?.image_url || cached?.imageUrl || '';
   } catch (_) { /* 缓存读失败就回落 API */ }
   if (!imageUrl) {
-    const r = await ctx.rateLimiter.execute(() => api._request('GET', `/worlds/${id}`));
+    const r = await worldQueryFast(() => api._request('GET', `/worlds/${id}`));
     if (r.status !== 200) throw new Error(`API error: ${r.status}`);
     imageUrl = r.data?.imageUrl || r.data?.thumbnailImageUrl || '';
   }
@@ -536,6 +537,25 @@ export async function handleGetWorldImage({ worldId, size = 512 } = {}) {
     contentType,
     dataUrl: `data:${contentType};base64,${buf.toString('base64')}`,
   };
+}
+// ── 世界查询快速通道 ──
+// 全局 rateLimiter 的最小间隔是 2.6s（防封的保守值），但世界详情查询是低频、只读、
+// 且是交互路径（摇地图/看封面）——排 2.6s 的队让它比裸调 API（实测 0.5s）慢一个量级。
+// 这里给世界查询单独一条串行通道：最小间隔 1.2s + 429 自动退避，不占用主队列。
+let _worldQueryChain = Promise.resolve();
+let _lastWorldQueryAt = 0;
+let _worldQuery429Until = 0;
+function worldQueryFast(fn, minGapMs = 1200) {
+  const run = async () => {
+    const now = Date.now();
+    const due = Math.max(_lastWorldQueryAt + minGapMs, _worldQuery429Until);
+    if (due > now) await new Promise((r) => setTimeout(r, due - now));
+    _lastWorldQueryAt = Date.now();
+    return fn();
+  };
+  const p = _worldQueryChain.then(run, run);
+  _worldQueryChain = p.then(() => {}, () => {});
+  return p;
 }
 // ── MCP 自声明工具表 ──
 export const tools = [
