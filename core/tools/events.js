@@ -2,6 +2,8 @@
  * 事件历史 handler — 事件查询 / 世界名 / 世界备注 / 世界历史 / 周报
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
 import { ctx, log } from '../server-context.js';
 import { resolveWorldNames } from '../world-names.js';
 
@@ -478,21 +480,54 @@ export async function handleGetWeeklyReport({ days = 7 }) {
 }
 
 export async function handleGetWorldImage({ worldId, size = 512 } = {}) {
-  const { api } = ctx;
+  const { api, storage } = ctx;
   const id = String(worldId || '').trim();
   if (!id.startsWith('wrld_')) throw new Error('worldId must start with wrld_');
   const w = Math.max(64, Math.min(1024, Number(size) || 512));
-  const r = await api._request('GET', `/worlds/${id}`);
-  if (r.status !== 200) throw new Error(`API error: ${r.status}`);
-  const imageUrl = r.data?.imageUrl || r.data?.thumbnailImageUrl || '';
+  // 优先用本地 world_cache 里已有的 image_url（省一次 4s 级的 /worlds 查询）
+  let imageUrl = '';
+  try {
+    const cached = storage.getWorldName(id);
+    imageUrl = cached?.image_url || cached?.imageUrl || '';
+  } catch (_) { /* 缓存读失败就回落 API */ }
+  if (!imageUrl) {
+    const r = await ctx.rateLimiter.execute(() => api._request('GET', `/worlds/${id}`));
+    if (r.status !== 200) throw new Error(`API error: ${r.status}`);
+    imageUrl = r.data?.imageUrl || r.data?.thumbnailImageUrl || '';
+  }
   if (!imageUrl) return { worldId: id, found: false, reason: 'world has no image' };
   // .../1/file -> .../512/file（VRChat 图片按尺寸分流）
   // 原图 URL 形如 /api/1/file/{fileId}/{ver}/file；缩略图要用 /api/1/image/{fileId}/{ver}/{size}
+  // 原图 /api/1/file/{fileId}/{ver}/file → 缩略图 /api/1/image/{fileId}/{ver}/{size}
   const sized = String(imageUrl)
     .replace(/\/api\/1\/file\/([^/]+)\/(\d+)\/file$/, `/api/1/image/$1/$2/${w}`)
     .replace(/\/api\/1\/image\/([^/]+)\/(\d+)\/\d+$/, `/api/1/image/$1/$2/${w}`);
-  const buf = await api.downloadFile(sized);
-  const contentType = buf.contentType || 'image/jpeg';
+  // 磁盘缓存：同一张图同一尺寸只下载一次（world-shaker / 前端反复请求时秒回）
+  const fileId = (String(imageUrl).match(/file_[0-9a-f-]{36}/) || [''])[0];
+  const cacheDir = path.join(process.env.VRC_MONITOR_DIR || process.cwd(), 'data', 'cache', 'world-images');
+  let buf = null;
+  let contentType = 'image/jpeg';
+  if (fileId) {
+    for (const ext of ['png', 'jpg', 'jpeg', 'webp']) {
+      const cp = path.join(cacheDir, `${fileId}_${w}.${ext}`);
+      if (fs.existsSync(cp)) {
+        buf = fs.readFileSync(cp);
+        contentType = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
+        break;
+      }
+    }
+  }
+  if (!buf) {
+    buf = await api.downloadFile(sized);
+    contentType = buf.contentType || 'image/jpeg';
+    if (fileId) {
+      try {
+        fs.mkdirSync(cacheDir, { recursive: true });
+        const ext = contentType.includes('png') ? 'png' : contentType.includes('webp') ? 'webp' : 'jpg';
+        fs.writeFileSync(path.join(cacheDir, `${fileId}_${w}.${ext}`), buf);
+      } catch (_) { /* 缓存写失败不影响返回 */ }
+    }
+  }
   return {
     worldId: id,
     found: true,
@@ -835,6 +870,6 @@ export const tools = [
       },
       "required": ["worldId"]
     },
-    handler: async (args) => ctx.rateLimiter.execute(() => handleGetWorldImage(args), { taskTimeoutMs: 60000 })
+    handler: async (args) => handleGetWorldImage(args)  // 内部只对 /worlds 查询限流，图片下载不排队
   }
 ];
