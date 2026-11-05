@@ -41,6 +41,7 @@
 
 ## 已知坑（速查，详见 skill）
 
+- **服务进程用 node v22 启动**（PATH 里的 `C:/Users/Windows/AppData/Local/hermes/node/node.exe`）：Hermes 插件 `vrc_start` 会改用自带 node v26（`hermes/tools/node-26.7.0-*`），与现有 `better-sqlite3` 预编译二进制 ABI 风险未实测 ⇒ **别用插件托管**。手动启动的进程 `vrc_restart`/`vrc_stop` 也管不到（health probe 杀不掉，6s 后中止，2026-11-05 实测），要重启直接 `powershell Stop-Process -Id <pid> -Force` 再 `node start-monitor.js`。
 - 查 MCP 走 HTTP 直调时响应是 **SSE 格式**（`data: {...}` 行，剥前缀再 json.loads）
 - 中文查询必须 Python urllib UTF-8 发（git-bash curl 中文乱码）
 - 服务代码改完：`node --check` → `vrc_restart` → 确认新 PID → 看 `monitor.log`
