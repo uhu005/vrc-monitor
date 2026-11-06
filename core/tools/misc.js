@@ -68,13 +68,14 @@ export function handleGetServerStatus() {
   };
 }
 
-export async function handleScanNewWorlds({ days = 7, dryRun = false }) {
+export async function handleScanNewWorlds({ days = 7, dryRun = false, maxFetch = 200 }) {
   const { storage, api, rateLimiter, serverState } = ctx;
-  if (!days || days < 1 || days > 30) days = 7;
+  if (!days || days < 1 || days > 120) days = 7;
+  maxFetch = Math.max(100, Math.min(4000, Number(maxFetch) || 200));
   const selfUserId = serverState.authUser?.id;
   if (!selfUserId) throw new Error('Not authenticated');
 
-  const { fresh } = await fetchFreshWorlds(api, rateLimiter, { days, maxFetch: 200 });
+  const { fresh } = await fetchFreshWorlds(api, rateLimiter, { days, maxFetch });
 
   const visitedRows = storage.query(
     `SELECT DISTINCT world_id FROM events

@@ -8,12 +8,17 @@ export default function register(api) {
         "days": {
           "type": "number",
           "default": 7,
-          "description": "Lookback window in days (1-30, default 7)"
+          "description": "Lookback window in days (1-120, default 7)"
         },
         "dryRun": {
           "type": "boolean",
           "default": false,
           "description": "Report only, do not write to DB"
+        },
+        "maxFetch": {
+          "type": "number",
+          "default": 200,
+          "description": "Max candidate worlds to fetch from the API (100-4000, default 200). Raise when backfilling a long window."
         }
       }
     },

@@ -56,6 +56,14 @@
 
 ## 会话日志
 
+- **2026-11-06（凌晨）**：围绕「摇地图」做了一批提速与修复，外加独立版立项。
+  ① **世界详情查询提速**：原 `get_world_name`/`get_world_image` 的世界查询排在全局 rateLimiter（2.6s 间隔）里，摇图/看封面要排队；新增 `worldQueryFast`（独立串行通道，1.2s 最小间隔 + 429 退避 60s），实测查询 **2.6s → 0.3s**。commit `905efeb`（`core/tools/events.js`），npm test 542/542。
+  ② **`scan_new_worlds` 扩容**：`days` 上限 30 → **120**，新增 `maxFetch` 参数（默认 200，可拉到 4000），用于补历史窗口。用它补了 **9-04~11-05 的 970 个**新发布-推荐世界，`world_kb` 1317 → **2287**（未逛 2252）。
+  ③ **每日追补 cron 复活**：任务 `vrc-new-worlds-tracker`（每天 09:00）**从 9-04 升级后连续失败 62 次**，报错 `can't open file 'F:\softrc-monitoretch-otp.py'`——脚本还是老的 `new-worlds-tracker.mjs` 那套，引用了升级后已挪到 `scripts/` 且已废弃的文件。重写为 `hermes/scripts/vrc_scan_new_worlds.py`（先查 `/health` 认证态，再调 MCP `scan_new_worlds`），cron 任务已指向新脚本，手动跑通（+186 个）。
+  ④ **摇地图（本地版 `F:/work/vrc-world-shaker`）对齐新池子**：池子默认从 VRCX「新地图」分组切到 **vrc-mcp 自有 `world_kb`**（VRCX 只作备份/同步目标）；新增标签筛选（36 个 author_tag）、排除项（恐怖/游戏/睡觉/成人，无标签世界不误杀）、已评价面板。
+  ⑤ **独立版立项**：`F:/work/vrc-world-shaker-standalone`（自带登录 + API + 本地库，不依赖 vrc-monitor/VRCX），已打包 `桌面or hermes\摇地图-独立版\摇地图.exe`。细节与踩坑见该目录 `STATUS.md`。
+  ⑥ 顺带核实：VRCX `cookies` 表是 base64 JSON 明文，可直接拿 auth cookie 调 API（0.5s 级）——独立版据此绕开 vrc-monitor。
+
 - **2026-11-05（下午）**：新增 MCP 工具 **`get_world_image`**（世界封面图 base64 data URL，64-1024px）。背景：world-shaker（`F:/work/vrc-world-shaker`）直接 `<img>` 加载 VRChat 图片全部 403 —— **VRChat 图片端点需要认证**（用文件里的 auth_cookie 调也 401，服务内存 cookie 才有效），只能由服务代下载。工具数 128→129（安全模式下对外 110→111）。踩坑：原图 URL 是 `/api/1/file/{fileId}/{ver}/file`，缩略图必须换成 `/api/1/image/{fileId}/{ver}/{size}`，拼成 `/file/{size}/file` 会 404 且卡满 112s 超时。文档同步：AGENTS 工具清单 + skill `vrc-monitor-agent` 增行。
 
 - **2026-11-05（上午，续）**：启用 **安全模式**（`.env` 加 `VRC_MONITOR_SAFE_MODE=true`，旧文件备份 `.env.bak-beforesafe-20261105`）→ 重启后 **工具 128→110**：移除并拦截 18 个破坏性工具（删好友/删照片/删画廊图/退群/拒绝好友请求/隐藏通知/移出待逛与关注/取消收藏/移动或清空收藏分组/移除 X 博主 + v3.4.0 新增的 `set_group_announcement`、`delete_group_announcement`、`update_group_post`、`delete_group_post`）。验证：`tools/list`=110 且 18 个全部不在列表；直接 `tools/call remove_friend` 被拦截并返回中文提示（日志 `工具调用失败 [remove_friend]: 🔒 安全模式已启用`）；查询/开图/发帖/兑换等 110 个正常保留；auth=true / ws connected / 在线 67 不变。**要临时恢复破坏性能力：`.env` 改 `false` 后重启服务**。
